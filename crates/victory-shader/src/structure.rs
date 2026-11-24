@@ -255,6 +255,107 @@ impl Bools {
         })
     }
 
+    /// The `Bool` representing `atom` if it exists in this table.
+    pub(crate) fn var_bool(&self, atom: Atom) -> Option<Bool> {
+        let &v = self.ids.get(&atom)?;
+        self.unique.get(&(v, Bool::FALSE, Bool::TRUE)).copied()
+    }
+
+    /// Whether some lane can satisfy every `(b, holds)` of `all` at once,
+    /// enforcing equivalence groups over atoms (`(atom, group, inverted)`)
+    /// and checking `leaf_ok` on any surviving leaf assignment.
+    pub(crate) fn meet_with_facts(
+        &self,
+        all: &[(Bool, bool)],
+        equiv: &[(Atom, usize, bool)],
+        groups_len: usize,
+        leaf_ok: impl Fn(&[(Atom, bool)]) -> bool,
+    ) -> bool {
+        let mut var_equiv = Map::default();
+        for &(atom, group, inv) in equiv {
+            if let Some(&v) = self.ids.get(&atom) {
+                var_equiv.insert(v, (group, inv));
+            }
+        }
+        let mut budget = MAX_MEET;
+        let mut groups = vec![None; groups_len];
+        let mut assigned = Vec::new();
+        self.meet_facts_in(
+            all.to_vec(),
+            &mut budget,
+            &var_equiv,
+            &mut groups,
+            &mut assigned,
+            &leaf_ok,
+        )
+    }
+
+    fn meet_facts_in<F: Fn(&[(Atom, bool)]) -> bool>(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        var_equiv: &Map<u32, (usize, bool)>,
+        groups: &mut [Option<bool>],
+        assigned: &mut Vec<(Atom, bool)>,
+        leaf_ok: &F,
+    ) -> bool {
+        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
+        if all.iter().any(fails) {
+            return false;
+        }
+        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        if *budget == 0 {
+            return true;
+        }
+        if all.is_empty() {
+            return leaf_ok(assigned);
+        }
+        *budget -= 1;
+        let top = |b: Bool| self.nodes[b.0 as usize].0;
+        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
+        let atom = self.atoms[v as usize];
+        let track_atom = matches!(atom, Atom::Lane(_));
+
+        let values = match var_equiv.get(&v).copied() {
+            Some((g, inv)) => match groups[g] {
+                Some(gval) => [Some(gval ^ inv), None],
+                None => [Some(false), Some(true)],
+            },
+            None => [Some(false), Some(true)],
+        };
+
+        for value in values.into_iter().flatten() {
+            let set_group = match var_equiv.get(&v).copied() {
+                Some((g, inv)) if groups[g].is_none() => {
+                    groups[g] = Some(value ^ inv);
+                    Some(g)
+                }
+                _ => None,
+            };
+            let next = all
+                .iter()
+                .map(|&(b, holds)| {
+                    let (lo, hi) = self.split(b, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect();
+            if track_atom {
+                assigned.push((atom, value));
+            }
+            let ok = self.meet_facts_in(next, budget, var_equiv, groups, assigned, leaf_ok);
+            if track_atom {
+                assigned.pop();
+            }
+            if let Some(g) = set_group {
+                groups[g] = None;
+            }
+            if ok {
+                return true;
+            }
+        }
+        false
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -314,6 +415,162 @@ impl Bools {
     }
 }
 
+/// Non-mutating overlay over [`Bools`] for building path conditions in
+/// lowering without mutating [`Structured`]. Caps extra nodes and falls back
+/// to `Bool::TRUE` (conservatively reachable) on overflow.
+pub(crate) struct BoolSet<'a> {
+    base: &'a Bools,
+    extra: Vec<(u32, Bool, Bool)>,
+    unique: Map<(u32, Bool, Bool), Bool>,
+    memo: Map<(Bool, Bool, Bool), Bool>,
+    forget_memo: Map<(Bool, usize), Bool>,
+    overflow: bool,
+}
+
+const MAX_OVERLAY_NODES: usize = 1 << 16;
+
+impl<'a> BoolSet<'a> {
+    pub(crate) fn new(base: &'a Bools) -> Self {
+        BoolSet {
+            base,
+            extra: Vec::new(),
+            unique: Map::default(),
+            memo: Map::default(),
+            forget_memo: Map::default(),
+            overflow: false,
+        }
+    }
+
+    fn node(&self, b: Bool) -> (u32, Bool, Bool) {
+        let base_len = self.base.nodes.len();
+        let idx = b.0 as usize;
+        if idx < base_len {
+            self.base.nodes[idx]
+        } else {
+            self.extra[idx - base_len]
+        }
+    }
+
+    fn mk(&mut self, v: u32, lo: Bool, hi: Bool) -> Bool {
+        if self.overflow {
+            return Bool::TRUE;
+        }
+        if lo == hi {
+            return lo;
+        }
+        let base_len = self.base.nodes.len();
+        if (lo.0 as usize) < base_len
+            && (hi.0 as usize) < base_len
+            && let Some(&b) = self.base.unique.get(&(v, lo, hi))
+        {
+            return b;
+        }
+        if let Some(&b) = self.unique.get(&(v, lo, hi)) {
+            return b;
+        }
+        if self.extra.len() >= MAX_OVERLAY_NODES {
+            self.overflow = true;
+            return Bool::TRUE;
+        }
+        let b = Bool((base_len + self.extra.len()) as u32);
+        self.extra.push((v, lo, hi));
+        self.unique.insert((v, lo, hi), b);
+        b
+    }
+
+    fn split(&self, b: Bool, v: u32) -> (Bool, Bool) {
+        match self.node(b) {
+            (bv, lo, hi) if bv == v => (lo, hi),
+            _ => (b, b),
+        }
+    }
+
+    fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::TRUE;
+        }
+        if f == Bool::TRUE || g == h {
+            return g;
+        }
+        if f == Bool::FALSE {
+            return h;
+        }
+        if (g, h) == (Bool::TRUE, Bool::FALSE) {
+            return f;
+        }
+        if let Some(&r) = self.memo.get(&(f, g, h)) {
+            return r;
+        }
+        let top = |b: Bool| self.node(b).0;
+        let v = top(f).min(top(g)).min(top(h));
+        let ((f0, f1), (g0, g1), (h0, h1)) = (self.split(f, v), self.split(g, v), self.split(h, v));
+        let lo = self.ite(f0, g0, h0);
+        let hi = self.ite(f1, g1, h1);
+        let r = self.mk(v, lo, hi);
+        self.memo.insert((f, g, h), r);
+        r
+    }
+
+    pub(crate) fn and(&mut self, a: Bool, b: Bool) -> Bool {
+        self.ite(a, b, Bool::FALSE)
+    }
+
+    pub(crate) fn or(&mut self, a: Bool, b: Bool) -> Bool {
+        self.ite(a, Bool::TRUE, b)
+    }
+
+    pub(crate) fn not(&mut self, a: Bool) -> Bool {
+        match a {
+            Bool::FALSE if !self.overflow => Bool::TRUE,
+            Bool::TRUE if !self.overflow => Bool::FALSE,
+            _ => self.ite(a, Bool::FALSE, Bool::TRUE),
+        }
+    }
+
+    /// Existentially quantifies atoms born at `from` or later (loop back edges).
+    pub(crate) fn forget(&mut self, b: Bool, from: usize) -> Bool {
+        if self.overflow {
+            return Bool::TRUE;
+        }
+        let (v, lo, hi) = self.node(b);
+        if v == TERMINAL {
+            return b;
+        }
+        if let Some(&r) = self.forget_memo.get(&(b, from)) {
+            return r;
+        }
+        let lo = self.forget(lo, from);
+        let hi = self.forget(hi, from);
+        let r = if self.base.born[v as usize] >= from {
+            self.or(lo, hi)
+        } else {
+            self.mk(v, lo, hi)
+        };
+        self.forget_memo.insert((b, from), r);
+        r
+    }
+
+    /// Condition under which a lane takes edge `q -> b`.
+    pub(crate) fn edge(&mut self, st: &Structured, q: usize, b: usize) -> Bool {
+        let mut c = st.reach[q];
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = st.exits[q]
+            && taken != not_taken
+        {
+            let branch = if b == taken { when } else { self.not(when) };
+            c = self.and(c, branch);
+        }
+        c
+    }
+
+    pub(crate) fn sat(&mut self, a: Bool, b: Bool) -> bool {
+        self.overflow || self.and(a, b) != Bool::FALSE
+    }
+}
+
 /// How a lane leaves a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneExit {
@@ -345,6 +602,9 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Lane masks not derived from EXEC or VALU results (constants, opaque
+    /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
+    pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -626,6 +886,7 @@ impl<'a> Lanes<'a> {
         }
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
                 .keys()

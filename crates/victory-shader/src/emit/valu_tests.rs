@@ -2051,3 +2051,153 @@ fn run_output_cases(
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+#[test]
+fn reachability_overwritten_missing_phis_match_on_host_and_warp() {
+    // 1. Correlated overwrite of a missing descriptor word (`s13`) across two joins:
+    //    when s0 == 0: load s[12:15], read UAV via raw buffer_load_dword, then overwrite s13 = 29;
+    //    when s0 != 0: set s13 = 17, skip overwrite. Result v0 = s13.
+    let desc_word_shader = build_valu_cs(&[
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0xBE8D_0391, // s_mov_b32 s13, 17
+        0xBF82_0004, // s_branch +4
+        s_load_dwordx4(12, 4)[0],
+        s_load_dwordx4(12, 4)[1],
+        0xE030_0000,
+        0x8003_0506, // buffer_load_dword v5, v6, s[12:15], 0
+        0xBF84_0001, // s_cbranch_scc0 +1 (skip overwrite only when s0 != 0)
+        0xBE8D_039D, // s_mov_b32 s13, 29
+        vop1(0x001, 0, sgpr(13)),
+    ]);
+    // 2. Correlated overwrite of an unknown-stride buffer_load_dword (`v5` -> Missing) across two joins:
+    //    when s0 == 0: load with idxen (stride = 0 in build_valu_cs -> unknown stride), then overwrite v5 = 29;
+    //    when s0 != 0: v5 = 17, skip overwrite. Result v0 = v5.
+    let unknown_stride_shader = build_valu_cs(&[
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0x7E0A_0291, // v_mov_b32 v5, 17
+        0xBF82_0004, // s_branch +4
+        s_load_dwordx4(12, 4)[0],
+        s_load_dwordx4(12, 4)[1],
+        0xE030_2000,
+        0x8003_0506, // buffer_load_dword v5, v6, s[12:15], 0 idxen (unknown stride)
+        0xBF84_0001, // s_cbranch_scc0 +1 (skip overwrite only when s0 != 0)
+        0x7E0A_029D, // v_mov_b32 v5, 29
+        vop1(0x001, 0, vgpr(5)),
+    ]);
+    // 3. Loop-invariant infeasible s_memtime phi (latch uses VCC to preserve SCC):
+    //    when s0 == 0: loop runs s_memtime -> s13, then overwrites s13 = 29 after loop;
+    //    when s0 != 0: loop keeps s13 = 17, skips overwrite after loop.
+    let loop_shader = build_valu_cs(&[
+        0xBE8D_0391, // s_mov_b32 s13, 17
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF84_0003, // s_cbranch_scc0 +3
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0xBE8D_0306, // s_mov_b32 s13, s6
+        0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7
+        0x7D88_0E82, // v_cmp_gt_u32 vcc_lo, 2, v7
+        0xBF87_FFF9, // s_cbranch_vccnz -7
+        0xBF84_0001, // s_cbranch_scc0 +1
+        0xBE8D_039D, // s_mov_b32 s13, 29
+        vop1(0x001, 0, sgpr(13)),
+    ]);
+
+    let cases = [([0, 0, 0, 0], 29u32), ([1, 0, 0, 0], 17u32)];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    for (name, shader) in [
+        ("desc_word", &desc_word_shader),
+        ("unknown_stride", &unknown_stride_shader),
+        ("loop_memtime", &loop_shader),
+    ] {
+        run_cases(shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend} {name} s0={}: got {got}, want {want}",
+                inp[0]
+            );
+        });
+    }
+}
+#[test]
+fn scalar_buffer_loads_read_a_uav_through_its_table() {
+    // The UAV is the one `build_valu_cs` stores to: write root constant 0
+    // to its dword 0, read it back with a scalar buffer load, and store
+    // that.
+    let body = [
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xF420_0304,
+        0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+        0x7E00_020C, // v_mov_b32 v0, s12
+    ];
+    let shader = build_valu_cs(&body);
+    let cases = [[0x1234_5678, 0, 0, 0], [0xDEAD_BEEF, 0, 0, 0]];
+    run_cases(&shader, &cases, |backend, _, inp, got| {
+        assert_eq!(got, inp[0], "{backend}: read back {got:#010x}");
+    });
+}
+
+#[test]
+fn v_cmp_16bit_ignores_vop3_op_sel() {
+    // v_cmp_lt_f16_e64 s6, v1, v2 (VOP3 encoding of VOPC 0x0c9), op_sel:[1,0];
+    // then v_cndmask_b32_e64 v0, 0, 1, s6.
+    let [mut hi0, hi1] = vop3(0x0c9, 6, vgpr(1), vgpr(2), 0);
+    hi0 |= 1 << 11; // op_sel[0] = high half, which RDNA2 ignores here
+    let f16_hi = build_valu_cs(&[
+        hi0,
+        hi1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // The same compare with op_sel clear, as a control.
+    let f16_lo = build_valu_cs(&[
+        vop3(0x0c9, 6, vgpr(1), vgpr(2), 0)[0],
+        vop3(0x0c9, 6, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // v_cmp_lt_u16_e64 with op_sel:[1,0] (VOPC 0x0a9).
+    let [mut hi0, hi1] = vop3(0x0a9, 6, vgpr(1), vgpr(2), 0);
+    hi0 |= 1 << 11;
+    let u16_hi = build_valu_cs(&[
+        hi0,
+        hi1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+
+    // Low halves decide: 1.0 < 1.5 true; 2.0 < 1.5 false. In the second
+    // case honouring op_sel (high half 1.0) would wrongly say true.
+    let f16_inputs = [
+        [0x4000_3C00, 0x0000_3E00, 0, 0],
+        [0x3C00_4000, 0x0000_3E00, 0, 0],
+    ];
+    let f16_wants = [1u32, 0u32];
+    for (name, shader) in [("op_sel high", &f16_hi), ("op_sel low", &f16_lo)] {
+        run_cases(shader, &f16_inputs, |backend, i, inp, got| {
+            let want = f16_wants[i];
+            assert_eq!(
+                got, want,
+                "{backend}: v_cmp_lt_f16({name}) ({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    // u16: low 9 < 5 is false; honouring op_sel (high half 1) would say true.
+    let u16_inputs = [[0x0001_0009, 0x0000_0005, 0, 0]];
+    let u16_wants = [0u32];
+    run_cases(&u16_hi, &u16_inputs, |backend, i, inp, got| {
+        let want = u16_wants[i];
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_lt_u16(op_sel high) ({:#010x}, {:#010x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+}
