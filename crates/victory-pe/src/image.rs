@@ -410,6 +410,7 @@ mod tests {
         std::fs::read(std::env::current_exe().unwrap()).unwrap()
     }
 
+    #[cfg(windows)]
     #[test]
     #[cfg_attr(not(windows), ignore = "parses the test binary as a PE image")]
     fn parses_own_test_binary() {
@@ -430,6 +431,7 @@ mod tests {
         assert!(info.tls.is_some());
     }
 
+    #[cfg(windows)]
     #[test]
     #[cfg_attr(not(windows), ignore = "parses the test binary as a PE image")]
     fn rva_to_file_offset_maps_entry_point() {
@@ -439,6 +441,7 @@ mod tests {
         assert!(off < data.len());
     }
 
+    #[cfg(windows)]
     #[test]
     #[cfg_attr(not(windows), ignore = "parses the test binary as a PE image")]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
@@ -460,6 +463,7 @@ mod tests {
         assert!(ImageInfo::parse(&truncated).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     #[cfg_attr(not(windows), ignore = "parses the test binary as a PE image")]
     fn rejects_iat_outside_image() {

@@ -175,8 +175,10 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     #[cfg_attr(not(windows), ignore = "parses the test binary as a PE image")]
     fn patches_own_test_binary() {
@@ -205,6 +207,7 @@ mod tests {
         assert_eq!(prepared.bytes.len(), original.len());
     }
 
+    #[cfg(windows)]
     #[test]
     #[cfg_attr(not(windows), ignore = "parses the test binary as a PE image")]
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
@@ -275,6 +278,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     #[cfg_attr(not(windows), ignore = "parses the test binary as a PE image")]
     fn file_name_is_stable_per_build() {

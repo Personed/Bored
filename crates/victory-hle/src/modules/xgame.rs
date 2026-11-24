@@ -88,6 +88,11 @@ extern "system" fn launch_new_game(
         "XLaunchNewGame",
         Box::new(move || super::lifecycle::relaunch(command)),
     );
+    #[cfg(not(windows))]
+    {
+        let _ = &command;
+        tracing::info!("XLaunchNewGame: not implemented on this host; the title ends");
+    }
     loop {
         std::thread::park();
     }

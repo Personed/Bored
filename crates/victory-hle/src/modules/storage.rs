@@ -174,9 +174,15 @@ static VTABLE: Methods<8> = Methods([
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
+    #[cfg(windows)]
     use crate::modules::xgameruntime::method;
 
+    /// The drive-over-folder mount is a Windows-only path (the virtual
+    /// drives themselves live in the `files` module), so this test runs
+    /// on Windows only.
+    #[cfg(windows)]
     #[test]
     #[cfg_attr(not(windows), ignore = "the title's file calls are Windows-only")]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {

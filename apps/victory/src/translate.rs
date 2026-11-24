@@ -165,6 +165,12 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    // The validator and the host checks are Windows-only; on other hosts
+    // they are skipped with a note instead of failing.
+    let validate_requested = validate;
+    let pipelines_requested = pipelines;
+    let validate = validate && cfg!(windows);
+    let pipelines = pipelines && cfg!(windows);
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -173,9 +179,13 @@ pub fn run(
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
+    } else if validate_requested {
+        println!("validator    skipped (Windows only)");
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
+    } else if pipelines_requested {
+        println!("host pipelines skipped (Windows only)");
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -276,22 +286,29 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
-        let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
-                }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
-                _ => "not emitted".to_owned(),
-            };
-            println!("pair {v} + {p}: {made}");
+        // The host check is Windows-only: without a host device the
+        // pairs are not checked at all.
+        #[cfg(windows)]
+        {
+            let host = Host::new(false).map_err(anyhow::Error::msg)?;
+            let kept = lock(&kept);
+            let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+            for (v, p) in &pairs {
+                let made = match (find(v), find(p)) {
+                    (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+                        host.mesh_pipeline(vs, ps)
+                    } else {
+                        host.pipeline(vs, ps)
+                    }
+                    .map(|_| "pipeline created".to_owned())
+                    .unwrap_or_else(|e| e),
+                    _ => "not emitted".to_owned(),
+                };
+                println!("pair {v} + {p}: {made}");
+            }
         }
+        #[cfg(not(windows))]
+        println!("host pipelines skipped (Windows only)");
     }
     let mut lines = t.lines;
     lines.sort();
