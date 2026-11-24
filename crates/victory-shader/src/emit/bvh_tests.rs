@@ -608,7 +608,7 @@ mod gpu {
                     )
                     .unwrap_or_else(|e| panic!("{label}: {e}"));
                 TEST_MEMORY.set(None);
-                let got = &out[2];
+                let got = &out[0];
                 for (lane, (node, r)) in cases.iter().enumerate() {
                     let want = intersect(&bvh, *node, r, sort, ij);
                     let g = &got[4 * lane..4 * lane + 4];
