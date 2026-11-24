@@ -2298,7 +2298,7 @@ fn pr1084_blob_pipeline() {
         };
         match host.compute_pipeline(&cs) {
             Ok(_) => eprintln!("{label}: pipeline OK"),
-            Err(e) => eprintln!("{label}: {e}"),
+            Err(e) => panic!("{label}: pr-1084 blob rejected: {e}"),
         }
     }
 }
