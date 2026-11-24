@@ -21,7 +21,9 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on one machine: Windows 11, AMD RX 6700 XT; and on Linux under
+Proton Experimental: CachyOS, AMD RX 9070 XT (see
+[docs/linux-proton.md](docs/linux-proton.md)).
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -46,19 +48,43 @@ What each part does today and what it still needs:
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
+Community reports show the Windows-target build running on Linux under
+Wine/Proton with vkd3d-proton. This is experimental; see
+[Linux + Wine/Proton](docs/linux-wine.md) for the reported setup and caveats.
+The project does not currently build as a native Linux application; cross-build
+the Windows executable and run it under Wine/Proton instead.
+
+Windows requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
+
+Under Wine or Proton, indirect execution also needs DXC's `dxcompiler.dll` (with
+its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile the indirect-argument
+clamp. It is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
+`dxil.dll` that shader validation finds, then the executable's folder and System32.
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
+On Linux, enter the Nix development shell and build the Windows executable:
+
+```sh
+nix-shell
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+./scripts/run-ge-proton.sh
+```
+
+The launch helper defaults to the supplied game path and uses an installed
+GE-Proton release; pass a different executable path to override it.
+
+On Windows, run the workspace tests and install the asset-policy hook:
+
 ```powershell
+cargo test --workspace                   # needs no game data
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
@@ -84,6 +110,19 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+### Linux (Proton)
+
+VIctory also runs on Linux under Proton Experimental, built with
+`cargo-xwin`, and gets as far there as on Windows: see
+[docs/linux-proton.md](docs/linux-proton.md) and `scripts/proton-run.sh`.
+
+Tests on a Linux host, under Wine: `cargo xtask wine-test` cross-builds the
+Windows test binaries (clang-cl, lld-link and llvm-lib on `PATH`, the MSVC CRT
+and Windows SDK from `xwin splat --output ~/.xwin`) and runs them in a Wine
+prefix of their own under `target/`. `--vkd3d-proton <dir>` puts that
+folder's `d3d12.dll` and `d3d12core.dll` into the prefix (Wine's own D3D12
+has no shader model 6.6); arguments after `--` go to `cargo test`.
 
 ## Commands
 
