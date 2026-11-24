@@ -534,7 +534,6 @@ impl State {
                     }
                 }
             }
-<<<<<<< HEAD
             // The address map and the descriptor words belong to the view
             // heap: without them the shader would read nothing it expects.
             let heap = (self.heaps[0] != 0)
@@ -1479,7 +1478,6 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
-<<<<<<< HEAD
 #[cfg(test)]
 mod tests {
     use super::*;
