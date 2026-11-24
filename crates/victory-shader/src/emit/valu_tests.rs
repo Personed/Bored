@@ -947,7 +947,6 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
-<<<<<<< HEAD
 /// VOP2 `op vdst, src0, vsrc1`.
 const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
@@ -2209,7 +2208,6 @@ fn v_cmp_16bit_ignores_vop3_op_sel() {
         );
     });
 }
-=======
 /// A select whose mask is a plain SGPR (here a root constant), so the
 /// structure pass does not follow it: this lane takes its own bit of the
 /// number. Inline 0 and -1 masks pick src0 and src1 in every lane.
@@ -2234,4 +2232,3 @@ fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
         });
     }
 }
->>>>>>> pr-1084

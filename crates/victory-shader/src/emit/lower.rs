@@ -380,6 +380,35 @@ fn unsupported(offset: usize, what: Why) -> ShaderError {
 /// atomic operation code.
 const ATOMIC_LOOP: u32 = u32::MAX - 1;
 
+/// Why dword `rel` of a GFX10 image (`image`) or buffer descriptor has no
+/// value when the program reads it as a number: what the dword holds.
+/// `None` past the descriptor.
+fn descriptor_field(image: bool, rel: u32) -> Option<Why> {
+    Some(match (image, rel) {
+        (true, 0) => "an image descriptor's address read as data",
+        (true, 5) => "an image descriptor's array pitch or mip limits read as data",
+        (true, 6) => "an image descriptor's compression fields read as data",
+        (true, 7) => "an image descriptor's metadata address read as data",
+        (false, 0) => "a buffer descriptor's address read as data",
+        (false, 1) => "a buffer descriptor's stride or high address read as data",
+        (false, 3) => "a buffer descriptor's format or swizzle read as data",
+        _ => return None,
+    })
+}
+
+/// Why a scalar memory instruction other than a load of dwords has no
+/// value here, named by what it is.
+fn smem_reason(name: &str) -> Why {
+    match name {
+        "s_memtime" | "s_memrealtime" => "a timestamp read as data",
+        "s_get_waveid_in_workgroup" => "a wave's index in its group read as data",
+        "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => "a scalar cache instruction",
+        n if n.contains("_store_") => "a scalar memory store",
+        n if n.starts_with("s_scratch_load") => "a scalar scratch load",
+        _ => "a scalar memory read as data",
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>) -> Self {
         let p = x.p;
@@ -3544,7 +3573,9 @@ impl<'a> Lower<'a> {
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
+    // stops the program. So does reading any dword of a descriptor that
+    // scalar buffer loads use first; its reasons name the dword and the
+    // view's kind.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -3552,7 +3583,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err(smem_reason(inst.name()));
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -3560,30 +3591,48 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(smem_reason(inst.name())),
         };
         // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        let uses: Vec<(Site, u8)> = self
             .x
             .res
             .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
+            .filter_map(|d| {
                 d.source.leaves().into_iter().find_map(|l| match *l {
                     Source::Loaded { load, first } if load == site => Some((d.site, first)),
                     _ => None,
                 })
-            });
+            })
+            .collect();
         // A load read only for its numbers (sizes for a mip level, say):
         // another load of the same entry, used as a resource, tells its kind.
-        let Some((at, first)) = use_at.or_else(|| self.same_entry_use(site)) else {
-            // No access names it: the console words are all there is.
-            let words = self.descriptor_words(site, count)?;
-            for (k, x) in words.into_iter().enumerate() {
-                self.write(inst, Reg::S(code + k as u8), x, None);
+        let Some((at, first)) = uses
+            .first()
+            .copied()
+            .or_else(|| self.same_entry_use(site))
+        else {
+            if let Ok(words) = self.descriptor_words(site, count) {
+                // No access names it: the console words are all there is.
+                for (k, x) in words.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
             }
-            return Ok(());
+            // A load through a root view's address reads that buffer's
+            // memory, not a descriptor.
+            let root_view = self
+                .scalar
+                .get(&site)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::Descriptor);
+            return Err(if root_view {
+                "a root view's memory read with scalar loads"
+            } else {
+                "a descriptor read only as data"
+            });
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -3627,7 +3676,43 @@ impl<'a> Lower<'a> {
                 }
                 ((11 | u, 0), None)
             }
-            _ => return Err("a scalar memory read as data"),
+            Fields::Smem { .. } => {
+                // Scalar buffer loads (`s_buffer_load_dword*`) read through
+                // it first. Each dword gets the reason for what it holds,
+                // as an error here would give every dword one reason.
+                let vector_later = uses[1..].iter().any(|&(s, _)| {
+                    matches!(
+                        self.x.p.blocks[s.0].insts[s.1].fields,
+                        Fields::Image { .. } | Fields::Buffer { .. }
+                    )
+                });
+                let records = match used.map(|u| (u.kind, u.stride)) {
+                    _ if vector_later => {
+                        "a descriptor read as data, used by scalar loads before a vector access"
+                    }
+                    Some((ResourceType::Srv, 0)) => {
+                        "a scalar-loaded raw buffer's record count read as data"
+                    }
+                    Some((ResourceType::Srv, _)) => {
+                        "a scalar-loaded structured buffer's record count read as data"
+                    }
+                    Some((ResourceType::Cbv, _)) => {
+                        "a scalar-loaded constant buffer's record count read as data"
+                    }
+                    _ => "a scalar-loaded buffer's record count read as data",
+                };
+                for k in 0..count {
+                    let why = match k.wrapping_sub(u32::from(first)) {
+                        2 => records,
+                        _ => "a scalar-loaded buffer's address or format read as data",
+                    };
+                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        self.vals.insert(v, Val::Missing(why));
+                    }
+                }
+                return Ok(());
+            }
+            _ => return Err("a descriptor read as data by an unknown access"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -3697,7 +3782,8 @@ impl<'a> Lower<'a> {
                 (None, Some(c)) => self.write(inst, Reg::S(code + k as u8), c[k as usize], None),
                 (None, None) => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        let why = descriptor_field(image.is_some(), rel).unwrap_or(OTHER);
+                        self.vals.insert(v, Val::Missing(why));
                     }
                 }
             }
@@ -3768,7 +3854,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err(smem_reason(inst.name()));
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -3776,7 +3862,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(smem_reason(inst.name())),
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
@@ -9228,7 +9314,7 @@ mod tests {
         let Err(crate::ShaderError::Unsupported { what, .. }) = run(&words) else {
             panic!("live loop back-edge missing value must refuse");
         };
-        assert_eq!(what, "a scalar memory read as data");
+        assert_eq!(what, "a timestamp read as data");
     }
 
     #[test]
@@ -9410,8 +9496,263 @@ mod tests {
                 vec![],
                 false,
             ),
-            "a scalar memory read as data",
+            "a timestamp read as data",
         );
+    }
+
+    /// The names `words` decode to, to check hand-written encodings.
+    fn names(words: &[u32]) -> Vec<&'static str> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        p.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter().map(|i| i.name()))
+            .collect()
+    }
+
+    /// The reason a program stops, or `None` if it translates.
+    fn refusal(r: Result<Lowered, crate::ShaderError>) -> Option<&'static str> {
+        match r {
+            Ok(_) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// A descriptor table at s0 whose first entry is a buffer of `kind`
+    /// and `stride`.
+    fn buffer_table(kind: ResourceType, stride: u32) -> (Vec<RootParam>, Vec<UsedResource>) {
+        let used = UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        (vec![root(RootType::Table, 0, 0)], vec![used])
+    }
+
+    #[test]
+    fn scalar_loaded_buffer_descriptors_read_as_data_name_the_dword_and_kind() {
+        // A buffer descriptor that scalar buffer loads read through, one
+        // of whose dwords is also stored as a number.
+        let program = |word: u32| {
+            vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0xF420_0304,
+                0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+                word,        // v_mov_b32 v1, s10 (dword 2) or s8 (dword 0)
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let (dword2, dword0) = (0x7E02_020A, 0x7E02_0208);
+        assert_eq!(
+            names(&program(dword2)),
+            [
+                "s_mov_b32",
+                "s_mov_b32",
+                "s_load_dwordx4",
+                "s_buffer_load_dword",
+                "v_mov_b32",
+                "ds_write_b32",
+                "s_endpgm"
+            ]
+        );
+        let cases = [
+            (
+                ResourceType::Srv,
+                0,
+                "a scalar-loaded raw buffer's record count read as data",
+            ),
+            (
+                ResourceType::Srv,
+                16,
+                "a scalar-loaded structured buffer's record count read as data",
+            ),
+            (
+                ResourceType::Cbv,
+                0,
+                "a scalar-loaded constant buffer's record count read as data",
+            ),
+            (
+                ResourceType::Uav,
+                0,
+                "a scalar-loaded buffer's record count read as data",
+            ),
+        ];
+        for (kind, stride, want) in cases {
+            let (layout, used) = buffer_table(kind, stride);
+            let got = refusal(lower_with(&program(dword2), layout.clone(), used.clone()));
+            assert_eq!(got, Some(want), "{kind:?}, stride {stride}");
+            assert_eq!(
+                refusal(lower_with(&program(dword0), layout, used)),
+                Some("a scalar-loaded buffer's address or format read as data"),
+                "{kind:?}, stride {stride}"
+            );
+        }
+        // The same descriptor also read by a vector load later: the record
+        // count has a host value once that use decides the view.
+        let mut words = program(dword2);
+        words.splice(
+            6..6,
+            [
+                0xE030_0000,
+                0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0
+            ],
+        );
+        assert!(names(&words).contains(&"buffer_load_dword"));
+        let (layout, used) = buffer_table(ResourceType::Srv, 0);
+        assert_eq!(
+            refusal(lower_with(&words, layout, used)),
+            Some("a descriptor read as data, used by scalar loads before a vector access")
+        );
+    }
+
+    #[test]
+    fn scalar_memory_that_is_no_descriptor_names_what_it_reads() {
+        // Each value stored to LDS, so that the program needs it.
+        let program = |op: [u32; 2], sgpr: u32| {
+            vec![
+                op[0],
+                op[1],
+                0x7E02_0200 | sgpr, // v_mov_b32 v1, s<sgpr>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let cases = [
+            ([0xF490_0180, 0], "s_memtime", "a timestamp read as data"),
+            (
+                [0xF494_0180, 0],
+                "s_memrealtime",
+                "a timestamp read as data",
+            ),
+            (
+                [0xF4A8_0180, 0],
+                "s_get_waveid_in_workgroup",
+                "a wave's index in its group read as data",
+            ),
+        ];
+        for (op, name, want) in cases {
+            let words = program(op, 6);
+            assert_eq!(names(&words)[0], name);
+            assert_eq!(
+                refusal(lower_with(&words, vec![], vec![])),
+                Some(want),
+                "{name}"
+            );
+        }
+        // A load through a root view's address (s[0:1]) reads that
+        // buffer's memory; one from a table with no use reads a descriptor.
+        let root_view = program([0xF400_0180, 0xFA00_0000], 6); // s_load_dword s6, s[0:1], null
+        assert_eq!(names(&root_view)[0], "s_load_dword");
+        assert_eq!(
+            refusal(lower_with(
+                &root_view,
+                vec![root(RootType::Descriptor, 0, 0)],
+                vec![]
+            )),
+            Some("a root view's memory read with scalar loads")
+        );
+        let mut table = vec![0xBE84_0300, 0xBE85_0380]; // s_mov_b32 s4, s0; s_mov_b32 s5, 0
+        table.extend(program([0xF400_0182, 0xFA00_0000], 6)); // s_load_dword s6, s[4:5], null
+        assert_eq!(names(&table)[2], "s_load_dword");
+        assert_eq!(
+            refusal(lower_with(
+                &table,
+                vec![root(RootType::Table, 0, 0)],
+                vec![]
+            )),
+            Some("a descriptor read only as data")
+        );
+    }
+
+    #[test]
+    fn descriptor_dwords_read_as_data_name_what_they_hold() {
+        // An image descriptor that a sample uses and a buffer descriptor
+        // that a load uses, one dword of each stored as a number. Dwords
+        // the translation rebuilds from the host view translate.
+        let image = |sgpr: u32| {
+            vec![
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0301,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[2:3], null
+                0xBE84_0301, // s_mov_b32 s4, s1
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xF09C_0F08,
+                0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+                0x7E02_0200 | sgpr, // v_mov_b32 v1, s<sgpr>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(names(&image(12))[8], "image_sample_lz");
+        for (dword, want) in [
+            (0, Some("an image descriptor's address read as data")),
+            (2, None),
+            (
+                5,
+                Some("an image descriptor's array pitch or mip limits read as data"),
+            ),
+            (
+                6,
+                Some("an image descriptor's compression fields read as data"),
+            ),
+            (
+                7,
+                Some("an image descriptor's metadata address read as data"),
+            ),
+        ] {
+            let (layout, used) = texture_tables();
+            let got = refusal(lower_with(&image(12 + dword), layout, used));
+            assert_eq!(got, want, "image dword {dword}");
+        }
+        let buffer = |sgpr: u32| {
+            vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0xE030_0000,
+                0x8002_0100,        // buffer_load_dword v1, off, s[8:11], 0
+                0x7E02_0200 | sgpr, // v_mov_b32 v1, s<sgpr>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(names(&buffer(8))[3], "buffer_load_dword");
+        for (dword, want) in [
+            (0, Some("a buffer descriptor's address read as data")),
+            (
+                1,
+                Some("a buffer descriptor's stride or high address read as data"),
+            ),
+            (2, None),
+            (
+                3,
+                Some("a buffer descriptor's format or swizzle read as data"),
+            ),
+        ] {
+            let (layout, used) = buffer_table(ResourceType::Srv, 0);
+            let got = refusal(lower_with(&buffer(8 + dword), layout, used));
+            assert_eq!(got, want, "buffer dword {dword}");
+        }
     }
 
     #[test]
