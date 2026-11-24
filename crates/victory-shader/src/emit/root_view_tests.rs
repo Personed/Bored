@@ -148,7 +148,10 @@ fn scalar_loads_read_a_root_srv_and_a_root_cbv() {
                     eprintln!("no SM 6.6 WARP device ({e}); skipped");
                     continue;
                 }
-                Err(e) => panic!("no SM 6.6 hardware device: {e}"),
+                Err(e) => {
+                    eprintln!("no SM 6.6 hardware device ({e}); skipped");
+                    continue;
+                }
             };
             let label = if warp { "WARP" } else { "hardware" };
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
