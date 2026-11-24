@@ -12,13 +12,15 @@
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
 //!
-//! All library calls are serialised: the interface does not promise that
-//! stores, loads and serialising may overlap.
+//! Stores and serialising are serialised. Loads run outside that lock on a
+//! reference of the library's own: vkd3d-proton keeps no compiled code in its
+//! library, so there a load is a whole compile and holding the lock would make
+//! the workers wait for one another.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -47,12 +49,17 @@ struct Library {
     stored: HashSet<String>,
 }
 
-// SAFETY: D3D12 objects are free-threaded; every call is made under the
-// mutex that holds the library.
+// SAFETY: D3D12 pipeline libraries are internally synchronised except for
+// same-name loads, which `LOADS` serialises; stores and serialising are under
+// the mutex that holds the library.
 unsafe impl Send for Library {}
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
+/// Loads of the same pipeline serialise (the host documents that one as not
+/// thread-safe); loads of different pipelines may overlap.
+static LOADS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -154,10 +161,23 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(
-        &library.lock().unwrap_or_else(|e| e.into_inner()).library,
-        PCWSTR(wide.as_ptr()),
-    ) {
+    // A load can be a whole compile under vkd3d-proton, whose library keeps
+    // no compiled code; do not hold the store/serialise lock across it. The
+    // host requires only same-name loads to serialise, so those get a lock of
+    // their own and different pipelines still load in parallel.
+    let handle = library
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .library
+        .clone();
+    let same = LOADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(name.to_owned())
+        .or_default()
+        .clone();
+    let _same = same.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(pso) = load(&handle, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
