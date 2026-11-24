@@ -335,7 +335,6 @@ pub fn emit(
     })
 }
 
-<<<<<<< HEAD
 fn build_static_samplers(samplers: &[[u32; 4]], cmp_samplers: &[bool]) -> Vec<StaticSampler> {
     samplers
         .iter()
@@ -350,7 +349,8 @@ fn build_static_samplers(samplers: &[[u32; 4]], cmp_samplers: &[bool]) -> Vec<St
             s
         })
         .collect()
-=======
+}
+
 /// Per-element interpolation modes from a console container's `PSV0` part,
 /// keyed by `(allocated, row, col, unallocated_kind)`.
 fn psv_interps(
@@ -400,7 +400,6 @@ fn psv_interps(
         out.insert(key, e[13]);
     }
     Some(out)
->>>>>>> pr-1208
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
