@@ -1906,23 +1906,67 @@ mod tests {
             flags,
         };
         // B5G5R5A1_UNORM (86) with ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS (5):
-        // PC refuses typed UAV on this format; dropping UAV lets the host copy succeed.
+        // the flag must survive exactly when the host reports typed-UAV
+        // support for the format and be dropped otherwise.
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(86),
+            ..Default::default()
+        };
+        // SAFETY: plain feature query into our struct.
+        let host = crate::host::host().unwrap();
+        let typed_uav = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0;
         let b5g5r5a1 = host_texture(&make(86, 5), 0, std::ptr::null())
-            .expect("B5G5R5A1_UNORM texture should be created without UAV flag");
+            .expect("B5G5R5A1_UNORM texture should be created");
         // SAFETY: live D3D12 resource.
         let d = unsafe { b5g5r5a1.GetDesc() };
-        assert_eq!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
+        assert_eq!(
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0,
+            if typed_uav {
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
+            } else {
+                0
+            }
+        );
         assert_ne!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0, 0);
 
         // B4G4R4A4_UNORM (115) with ALLOW_RENDER_TARGET (1) and a non-null
-        // clear value: dropping RENDER_TARGET must also omit pOptimizedClearValue
-        // so CreateCommittedResource succeeds without id=815.
+        // clear value: the flag must survive exactly when the host reports
+        // render-target support for the format and be dropped otherwise.
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(115),
+            ..Default::default()
+        };
+        // SAFETY: plain feature query into our struct.
+        let render_target = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0;
         let clear = [115u32, 0, 0, 0, 0];
         let b4g4r4a4 = host_texture(&make(115, 1), 0, clear.as_ptr().cast())
-            .expect("B4G4R4A4_UNORM texture should succeed with clear value dropped");
+            .expect("B4G4R4A4_UNORM texture should succeed");
         // SAFETY: live D3D12 resource.
         let bd = unsafe { b4g4r4a4.GetDesc() };
-        assert_eq!(bd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0, 0);
+        assert_eq!(
+            bd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0,
+            if render_target {
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+            } else {
+                0
+            }
+        );
 
         // R8G8B8A8_TYPELESS (27) with flags=5 must keep ALLOW_UNORDERED_ACCESS.
         let typeless = host_texture(&make(27, 5), 0, std::ptr::null())
