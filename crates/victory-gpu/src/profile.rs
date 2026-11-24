@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, GetThreadContext, RtlLookupFunctionEntry, RtlVirtualUnwind, SYMBOL_INFO,
-    SymFromAddr, SymInitialize, SymSetOptions,
+    CONTEXT, GetThreadContext, RtlLookupFunctionEntry, RtlVirtualUnwind, SYMBOL_INFO, SymFromAddr,
+    SymInitialize, SymSetOptions,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -110,7 +110,10 @@ fn thread_name(handle: HANDLE, tid: u32) -> String {
 }
 
 fn cpu_100ns(handle: HANDLE) -> u64 {
-    let mut t: [FILETIME; 4] = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let mut t: [FILETIME; 4] = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
     // SAFETY: an open thread handle and four time structures.
     unsafe {
         GetThreadTimes(handle, &mut t[0], &mut t[1], &mut t[2], &mut t[3]);
@@ -181,19 +184,30 @@ fn symbolize(addr: u64) -> String {
         RtlLookupFunctionEntry(addr, &mut base, std::ptr::null_mut());
         let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         VirtualQuery(addr as *const _, &mut info, size_of_val(&info));
-        let region = if base != 0 { base } else { info.AllocationBase as u64 };
+        let region = if base != 0 {
+            base
+        } else {
+            info.AllocationBase as u64
+        };
         let mut path = [0u16; 260];
         let n = GetModuleFileNameW(region as *mut _, path.as_mut_ptr(), 260) as usize;
         let module = String::from_utf16_lossy(&path[..n]);
         let module = module.rsplit('\\').next().unwrap_or("").to_string();
-        let module = if module.is_empty() { format!("{region:#x}") } else { module };
+        let module = if module.is_empty() {
+            format!("{region:#x}")
+        } else {
+            module
+        };
         let mut buf = vec![0u8; size_of::<SYMBOL_INFO>() + 256];
         let sym = buf.as_mut_ptr().cast::<SYMBOL_INFO>();
         (*sym).SizeOfStruct = size_of::<SYMBOL_INFO>() as u32;
         (*sym).MaxNameLen = 255;
         let mut displacement = 0u64;
         if SymFromAddr(GetCurrentProcess(), addr, &mut displacement, sym) != 0 {
-            let name = std::slice::from_raw_parts((*sym).Name.as_ptr().cast::<u8>(), (*sym).NameLen as usize);
+            let name = std::slice::from_raw_parts(
+                (*sym).Name.as_ptr().cast::<u8>(),
+                (*sym).NameLen as usize,
+            );
             let name = String::from_utf8_lossy(name);
             let short: String = name.chars().take(90).collect();
             return format!("{module}!{short}+{displacement:#x}");
@@ -211,7 +225,11 @@ fn run(period: Duration) {
     let me = unsafe { GetCurrentThreadId() };
     let mut threads: HashMap<u32, Tracked> = HashMap::new();
     let mut cache = HashMap::new();
-    let (mut refreshed, mut second, mut reported) = (Instant::now() - Duration::from_secs(9), Instant::now(), Instant::now());
+    let (mut refreshed, mut second, mut reported) = (
+        Instant::now() - Duration::from_secs(9),
+        Instant::now(),
+        Instant::now(),
+    );
     let mut tick = 0u64;
     tracing::info!(period_ms = period.as_millis() as u64, "profiler started");
     loop {
@@ -234,20 +252,27 @@ fn run(period: Duration) {
                 }
                 // SAFETY: opening a thread of our process.
                 let handle = unsafe {
-                    OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid)
+                    OpenThread(
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                        0,
+                        tid,
+                    )
                 };
                 if handle.is_null() {
                     continue;
                 }
-                threads.insert(tid, Tracked {
-                    handle,
-                    name: thread_name(handle, tid),
-                    last_cpu_100ns: cpu_100ns(handle),
-                    cpu_ms_second: BUSY_MS,
-                    cpu_ms_report: 0,
-                    samples: 0,
-                    stacks: HashMap::new(),
-                });
+                threads.insert(
+                    tid,
+                    Tracked {
+                        handle,
+                        name: thread_name(handle, tid),
+                        last_cpu_100ns: cpu_100ns(handle),
+                        cpu_ms_second: BUSY_MS,
+                        cpu_ms_report: 0,
+                        samples: 0,
+                        stacks: HashMap::new(),
+                    },
+                );
             }
         }
         if second.elapsed() >= Duration::from_secs(1) {
@@ -271,7 +296,8 @@ fn run(period: Duration) {
         if reported.elapsed() >= REPORT {
             let secs = reported.elapsed().as_secs_f64();
             reported = Instant::now();
-            let mut list: Vec<&mut Tracked> = threads.values_mut().filter(|t| t.samples > 0).collect();
+            let mut list: Vec<&mut Tracked> =
+                threads.values_mut().filter(|t| t.samples > 0).collect();
             list.sort_by_key(|t| std::cmp::Reverse((t.cpu_ms_report, t.samples)));
             for t in list.into_iter().take(10) {
                 tracing::info!(

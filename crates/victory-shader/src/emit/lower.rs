@@ -5787,14 +5787,8 @@ impl<'a> Lower<'a> {
                     args.push(self.s.m.i32(code));
                     args.extend(cs);
                     args.push(value);
-                    self.s.op(
-                        self.cur,
-                        "atomicBinOp.i64",
-                        Attr::NoUnwind,
-                        i64t,
-                        78,
-                        &args,
-                    )
+                    self.s
+                        .op(self.cur, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &args)
                 };
                 let res = self.end_guarded(at, &[(op_res, old)])[0];
                 if cache.glc {
@@ -7363,7 +7357,11 @@ mod tests {
         let container = crate::Container::parse(&l.dxil).unwrap();
         let features = container.part(crate::FourCC::SFI0).unwrap();
         let sfi0 = u64::from_le_bytes(features.data.try_into().unwrap());
-        assert_ne!(sfi0 & 0x8000, 0, "64-bit image atomic must declare INT64 feature");
+        assert_ne!(
+            sfi0 & 0x8000,
+            0,
+            "64-bit image atomic must declare INT64 feature"
+        );
         assert_ne!(
             sfi0 & 0x40_0000,
             0,

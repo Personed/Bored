@@ -1442,7 +1442,10 @@ fn nt_write_virtual_memory() -> Option<NtWrite> {
         unsafe {
             let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
             let f = GetProcAddress(ntdll, c"NtWriteVirtualMemory".as_ptr().cast())?;
-            Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, NtWrite>(f))
+            Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                NtWrite,
+            >(f))
         }
     })
 }
@@ -1470,11 +1473,16 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             match nt {
                 // STATUS_SUCCESS only: a partial copy is a failure here too.
                 Some(call) => {
-                    call(GetCurrentProcess() as isize, at as _, from.cast(), n, &mut done) == 0
+                    call(
+                        GetCurrentProcess() as isize,
+                        at as _,
+                        from.cast(),
+                        n,
+                        &mut done,
+                    ) == 0
                 }
                 None => {
-                    WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done)
-                        != 0
+                    WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0
                 }
             }
         }

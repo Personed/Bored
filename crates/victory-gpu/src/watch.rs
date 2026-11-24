@@ -722,19 +722,23 @@ mod tests {
         B.store(b, Ordering::Relaxed);
         set_alias_lookup(lookup);
         // A copy of view `a` takes the block and guards it (and `b`).
-        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
-        assert_eq!(guard(a, a + BLOCK), Some(vec![]), "clean");
+        assert_eq!(guard(a, a + BLOCK, true), Some(vec![a / PAGE]));
+        assert_eq!(guard(a, a + BLOCK, true), Some(vec![]), "clean");
         // The title writes the page through `b`: `a` shows it written.
         // SAFETY: our view; the guard's handler opens it.
         unsafe { ((b + 8) as *mut u8).write_volatile(7) };
         // SAFETY: the same byte through the other view.
         assert_eq!(unsafe { ((a + 8) as *const u8).read_volatile() }, 7);
-        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]), "written through the alias");
+        assert_eq!(
+            guard(a, a + BLOCK, true),
+            Some(vec![a / PAGE]),
+            "written through the alias"
+        );
         // And the other way round: a kernel write into `a` opens `b`.
-        assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
-        assert_eq!(guard(b, b + BLOCK), Some(vec![]));
+        assert_eq!(guard(b, b + BLOCK, true), Some(vec![b / PAGE]));
+        assert_eq!(guard(b, b + BLOCK, true), Some(vec![]));
         writing(a + 16, 4);
-        assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
+        assert_eq!(guard(b, b + BLOCK, true), Some(vec![b / PAGE]));
         A.store(0, Ordering::Relaxed);
         B.store(0, Ordering::Relaxed);
         for v in [a, b] {
