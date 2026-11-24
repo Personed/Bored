@@ -2035,47 +2035,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// This lane's bit from a mask operand (`v_cndmask_b32` / `*_ci_u32`):
-    /// uses the tracked boolean when `structure` followed it, handles inline
-    /// `0`/`-1` constants, or tests this console lane's bit of the scalar
-    /// mask register (pair in wave64) when console lanes are active.
-    fn mask_cond(
-        &mut self,
-        inst: &Inst,
-        op: Option<&Operand>,
-        at: usize,
-        err: Why,
-    ) -> Result<V, Why> {
-        match op {
-            Some(&Operand::Const(128)) => Ok(self.s.m.bool(false)),
-            Some(&Operand::Const(193)) => Ok(self.s.m.bool(true)),
-            Some(&Operand::Scalar { code, .. }) => {
-                if let Some(m) = inst
-                    .read(Reg::S(code))
-                    .and_then(|v| self.x.st.masks.get(&v).copied())
-                {
-                    return self.boolean(m, at);
-                }
-                if !self.console_lanes {
-                    return Err(err);
-                }
-                let lo = inst.read(Reg::S(code)).ok_or(err)?;
-                let lo = self.i32_of(lo)?;
-                let hi = if self.x.native.wave64 {
-                    match inst.read(Reg::S(code + 1)) {
-                        Some(v) => Some(self.i32_of(v)?),
-                        None => Some(self.s.m.i32(0)),
-                    }
-                } else {
-                    None
-                };
-                self.s.flags |= flags::WAVE_OPS;
-                Ok(self.lane_bit(at, lo, hi))
-            }
-            _ => Err(err),
-        }
-    }
-
     /// The mask operand of a select or carry-in as a per-lane boolean: a
     /// tracked mask, this lane's bit of an untracked SGPR mask (console
     /// lanes only), or an inline constant.
