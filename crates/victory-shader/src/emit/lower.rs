@@ -22,6 +22,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+mod bvh;
+mod global;
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -35,6 +38,10 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    /// Reads title memory through the address map.
+    pub address_map: bool,
+    /// Reads descriptor words.
+    pub descriptor_words: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -360,8 +367,10 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+            matches!(
+                i.fields,
+                Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
+            ) && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
@@ -589,6 +598,17 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if self.is_global((b, i)) {
+            return if name.starts_with("global_load_") {
+                self.global_load(inst, b, i)
+            } else if name.starts_with("global_store_") {
+                self.global_store(inst, b, i)
+            } else if name.starts_with("global_atomic_") {
+                self.global_atomic(inst, b, i)
+            } else {
+                Err("a global access to title memory")
+            };
+        }
         let rest = name
             .strip_prefix("global_load_")
             .ok_or("a global memory write")?;
@@ -907,10 +927,14 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        let address_map = self.s.address_map.is_some();
+        let descriptor_words = self.s.descriptor_words.is_some();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            address_map,
+            descriptor_words,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2300,6 +2324,7 @@ impl<'a> Lower<'a> {
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
+            Fields::Image { .. } if name.starts_with("image_bvh") => self.bvh(inst, b, i),
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
@@ -2814,6 +2839,9 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if self.is_global(site) {
+            return self.global_smem(inst);
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -2962,7 +2990,12 @@ impl<'a> Lower<'a> {
                 })
             });
         let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+            // No access names it: the console words are all there is.
+            let words = self.descriptor_words(site, count)?;
+            for (k, x) in words.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -3054,11 +3087,15 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        // Fields the host view gives are rebuilt from it; the console's
+        // other words (addresses, formats) come from the descriptor words.
+        let console = self.descriptor_words(site, count).ok();
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
-                None => {
+            match (words.iter().find(|w| w.0 == rel), &console) {
+                (Some(&(_, x)), _) => self.write(inst, Reg::S(code + k as u8), x, None),
+                (None, Some(c)) => self.write(inst, Reg::S(code + k as u8), c[k as usize], None),
+                (None, None) => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                         self.vals.insert(v, Val::Missing(OTHER));
                     }

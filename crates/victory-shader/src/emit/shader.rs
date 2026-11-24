@@ -12,6 +12,14 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the address map is bound: `t0` in this space (a root SRV), when
+/// the shader reads title memory at addresses it computes
+/// ([`crate::resource::GLOBAL`]; see [`super::HostShader::address_map`]).
+pub const ADDRESS_MAP_SPACE: u32 = 2;
+/// Where the descriptor words are bound: `t0` in this space (a root SRV),
+/// when the shader reads descriptors as numbers beyond what host views
+/// tell (see [`super::HostShader::descriptor_words`]).
+pub const DESCRIPTOR_WORDS_SPACE: u32 = 3;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -67,6 +75,10 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// The address map's handle, once made ([`Shader::address_map_handle`]).
+    pub address_map: Option<V>,
+    /// The descriptor words' handle, once made.
+    pub descriptor_words: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -122,6 +134,8 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            address_map: None,
+            descriptor_words: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -238,6 +252,48 @@ impl Shader {
         h
     }
 
+    /// The handle of the address map (`t0` in [`ADDRESS_MAP_SPACE`], a raw
+    /// buffer), made in the entry block.
+    pub fn address_map_handle(&mut self) -> V {
+        if let Some(h) = self.address_map {
+            return h;
+        }
+        let h = self.space_handle(ADDRESS_MAP_SPACE);
+        self.address_map = Some(h);
+        h
+    }
+
+    /// The handle of the descriptor words (`t0` in
+    /// [`DESCRIPTOR_WORDS_SPACE`], a raw buffer), made in the entry block.
+    pub fn descriptor_words_handle(&mut self) -> V {
+        if let Some(h) = self.descriptor_words {
+            return h;
+        }
+        let h = self.space_handle(DESCRIPTOR_WORDS_SPACE);
+        self.descriptor_words = Some(h);
+        h
+    }
+
+    /// A raw buffer bound at `t0` in `space`, made in the entry block.
+    fn space_handle(&mut self, space: u32) -> V {
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(space), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -320,6 +376,8 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || self.address_map.is_some()
+            || self.descriptor_words.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -374,20 +432,32 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            // Raw buffers: root SRVs, then the address map.
+            let mut raw: Vec<(u32, u32)> = self
+                .root_srvs
+                .iter()
+                .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                .collect();
+            if self.address_map.is_some() {
+                raw.push((ADDRESS_MAP_SPACE, 0));
+            }
+            if self.descriptor_words.is_some() {
+                raw.push((DESCRIPTOR_WORDS_SPACE, 0));
+            }
+            if !raw.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (space, register)) in raw.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -396,8 +466,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }
