@@ -572,11 +572,12 @@ mod tests {
     #[test]
     fn host_written_clears_after_write_watched_memory_is_written() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let len = crate::watch::PAGE;
-        // SAFETY: a fresh write-watched allocation, freed at the end.
+        // SAFETY: a fresh write-watched allocation, kept (not freed: a reused
+        // address carries stale watch state into another test's first read).
         let ptr = unsafe {
             VirtualAlloc(
                 std::ptr::null(),
@@ -587,6 +588,9 @@ mod tests {
         } as *mut u8;
         assert!(!ptr.is_null());
         let key = ptr as usize;
+        // Drain watch state a reused address may carry from a freed
+        // allocation, so the snapshot below sees a clean slate.
+        let _ = crate::watch::writes(key, key + len, false);
         let state = host_write_state(ptr, len);
         assert!(matches!(state, HostWrite::Watched { .. }));
         {
@@ -605,8 +609,6 @@ mod tests {
         );
         assert!(!still_host_written(key));
         forget(key);
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
     }
 
     #[test]
