@@ -2245,5 +2245,3 @@ fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
         });
     }
 }
-
-
