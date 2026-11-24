@@ -114,7 +114,7 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
 
     let mut test = command(&cargo);
     test.args(["test", "--target", TARGET])
-        .env("VICTORY_HLE_PROBE", wine_path(&probe))
+        .env("VICTORY_HLE_PROBE_DLL", wine_path(&probe))
         .env(
             "WINEDEBUG",
             std::env::var_os("WINEDEBUG").unwrap_or_else(|| "-all".into()),
