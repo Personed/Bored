@@ -376,47 +376,53 @@ fn the_cases_cover_hits_misses_and_boxes() {
 #[cfg(windows)]
 mod gpu {
     use super::super::host::{Dispatch, Host, Root, View};
-    use super::super::{HostShader, address_map, lower, validator};
+    use super::super::lower::intersect::TEST_MEMORY;
+    use super::super::{HostShader, lower, validator};
     use super::*;
-    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
     use crate::{io, ir, resource, structure};
 
-    const RAYS: u64 = 0x1_0000_0000;
     const BVH: u64 = 0x2_0000_0100;
-    const OUT: u64 = 0x3_0000_0000;
 
-    /// Per lane: 12 dwords of ray at `s[0:1] + 48 * lane` (node, extent,
-    /// origin, direction, inverse direction), the intersection with the
-    /// descriptor `s[4:7]`, 4 dwords stored at `s[8:9] + 16 * lane` (the
-    /// output base is its own root argument: an address's base is the
-    /// first dword of a parameter).
+    /// Per lane: 12 dwords of ray at `48 * lane` of the record buffer
+    /// (node, extent, origin, direction, inverse direction), read through
+    /// the descriptor the table's SRV entry builds; the intersection with
+    /// the descriptor `s[16:19]`, 4 dwords stored at `16 * lane` through
+    /// the UAV entry's descriptor. An access whose address is title
+    /// memory lowers through the host's directory, which the test has no
+    /// copies for, so the reads and the write go through descriptors.
     /// `desc1`/`desc3` are the descriptor's flag dwords, written as
     /// literals like the console compiler does.
-    fn program(desc1: u32, desc3: u32) -> Vec<u32> {
-        // The pointers in s[0:1] and s[8:9] are title addresses: copies in
-        // VGPRs, so the loads and the store take no scalar base (which the
-        // address-as-computed lowering refuses).
-        let load = |vdst: u32, offset: u32| [0xDC38_8000 | offset, vdst << 24 | 125 << 16 | 30];
-        let mut w = vec![
-            0x7E3C_0200, // v_mov_b32 v30, s0
-            0x7E3E_0201, // v_mov_b32 v31, s1
-        ];
-        w.extend(load(2, 0)); // global_load_dwordx4 v[2:5], v30, off
-        w.extend(load(6, 16)); // ... v[6:9], offset:16
-        w.extend(load(10, 32)); // ... v[10:13], offset:32
-        w.extend([
-            0xBE85_03FF, // s_mov_b32 s5, desc1
-            desc1,
-            0xBE87_03FF, // s_mov_b32 s7, desc3
-            desc3,
-            0xF198_9F01, // image_bvh_intersect_ray v[14:17], v[2:12], s[4:7]
-            0x0001_0E02,
-            0x7E40_0208, // v_mov_b32 v32, s8
-            0x7E42_0209, // v_mov_b32 v33, s9
-            0xDC78_8000, // global_store_dwordx4 v32, v[14:17], off
-            0x007D_0E20,
+    fn program(desc0: u32, desc1: u32, desc3: u32) -> Vec<u32> {
+        let w = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x1602_00B0, // v_mul_u32_u24 v1, 48, v0
+            0xE038_1000,
+            0x0002_0201, // buffer_load_dwordx4 v[2:5], v1, s[8:11], 0 offen
+            0xE038_1010,
+            0x0002_0601, // buffer_load_dwordx4 v[6:9], v1, s[8:11], 0 offen offset:16
+            0xE038_1020,
+            0x0002_0A01, // buffer_load_dwordx4 v[10:13], v1, s[8:11], 0 offen offset:32
+            0xBE90_03FF,
+            desc0, // s_mov_b32 s16, desc0
+            0xBE91_03FF,
+            desc1,       // s_mov_b32 s17, desc1
+            0xBE92_03C1, // s_mov_b32 s18, -1
+            0xBE93_03FF,
+            desc3,       // s_mov_b32 s19, desc3
+            0xF198_9F01, // image_bvh_intersect_ray v[14:17], v[2:12], s[16:19]
+            0x0004_0E02,
+            0x3402_0084, // v_lshlrev_b32 v1, 4, v0
+            0xE078_1000,
+            0x0003_0E01, // buffer_store_dwordx4 v[14:17], v1, s[12:15], 0 offen
             0xBF81_0000, // s_endpgm
-        ]);
+        ];
         let names: Vec<_> =
             crate::gfx10::decode(&w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())
                 .expect("decode")
@@ -426,17 +432,20 @@ mod gpu {
         assert_eq!(
             names,
             [
-                "v_mov_b32",
-                "v_mov_b32",
-                "global_load_dwordx4",
-                "global_load_dwordx4",
-                "global_load_dwordx4",
+                "s_mov_b32",
+                "s_load_dwordx4",
+                "s_load_dwordx4",
+                "v_mul_u32_u24",
+                "buffer_load_dwordx4",
+                "buffer_load_dwordx4",
+                "buffer_load_dwordx4",
+                "s_mov_b32",
+                "s_mov_b32",
                 "s_mov_b32",
                 "s_mov_b32",
                 "image_bvh_intersect_ray",
-                "v_mov_b32",
-                "v_mov_b32",
-                "global_store_dwordx4",
+                "v_lshlrev_b32",
+                "buffer_store_dwordx4",
                 "s_endpgm"
             ]
         );
@@ -445,8 +454,19 @@ mod gpu {
 
     fn build(sort: bool, ij: bool) -> HostShader {
         let base = BVH >> 8;
+        let desc0 = base as u32;
         let desc1 = (base >> 32) as u32 & 0xFF | u32::from(sort) << 31;
         let desc3 = 0x88FF_FFFF | u32::from(ij) << 24;
+        let table = |kind, at| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
@@ -455,26 +475,26 @@ mod gpu {
                 RootParam {
                     root: RootType::Constants,
                     table_offset_dwords: 0,
-                    sgprs: 8,
+                    sgprs: 4,
                     base_register: 0,
                     user_data: 0,
                     slot: 0,
                 },
                 RootParam {
-                    root: RootType::Constants,
+                    root: RootType::Table,
                     table_offset_dwords: 0,
-                    sgprs: 2,
-                    base_register: 8,
-                    user_data: 8,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
                     slot: 1,
                 },
             ],
-            used: Vec::new(),
+            used: vec![table(ResourceType::Srv, 0), table(ResourceType::Uav, 8)],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 10 << 1,
+                rsrc2: 5 << 1,
                 threads: [32, 1, 1],
             }),
-            code: program(desc1, desc3)
+            code: program(desc0, desc1, desc3)
                 .iter()
                 .flat_map(|w| w.to_le_bytes())
                 .collect(),
@@ -546,26 +566,6 @@ mod gpu {
                 w
             })
             .collect();
-        let map = address_map::encode(&[
-            address_map::Range {
-                start: RAYS,
-                len: rays.len() as u32 * 4,
-                view: 0,
-                view_offset: 0,
-            },
-            address_map::Range {
-                start: BVH,
-                len: bvh.len() as u32 * 4,
-                view: 1,
-                view_offset: 0,
-            },
-            address_map::Range {
-                start: OUT,
-                len: 32 * 16,
-                view: 2,
-                view_offset: 0,
-            },
-        ]);
         let _one = super::super::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -579,50 +579,21 @@ mod gpu {
                 let (root, pso) = host
                     .compute_pipeline(&shader)
                     .unwrap_or_else(|e| panic!("{label}: {e}"));
-                let base = BVH >> 8;
-                let desc = [
-                    base as u32,
-                    (base >> 32) as u32 & 0xFF | u32::from(sort) << 31,
-                    u32::MAX,
-                    0x88FF_FFFF | u32::from(ij) << 24,
-                ];
-                let consts = [
-                    RAYS as u32,
-                    (RAYS >> 32) as u32,
-                    0,
-                    0,
-                    desc[0],
-                    desc[1],
-                    desc[2],
-                    desc[3],
-                    OUT as u32,
-                    (OUT >> 32) as u32,
-                ];
-                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-                for u in &shader.user_data {
-                    ud[u.index as usize] = consts[u.dword as usize];
-                }
+                // Heap slot 1 holds the nodes from title address BVH on.
+                TEST_MEMORY.set(Some((1, BVH)));
                 let out = host
                     .dispatch(
                         &root,
                         &pso,
                         &Dispatch {
-                            roots: vec![
-                                (0, Root::Constants(ud)),
-                                (
-                                    1,
-                                    Root::View {
-                                        srv: true,
-                                        data: map.clone(),
-                                    },
-                                ),
-                            ],
+                            roots: vec![(0, Root::Constants(vec![0; 5]))],
                             views: &[View::RawData(&rays), View::RawData(&bvh), View::RawUav(128)],
                             samplers: &[],
                             groups: [1, 1, 1],
                         },
                     )
                     .unwrap_or_else(|e| panic!("{label}: {e}"));
+                TEST_MEMORY.set(None);
                 let got = &out[2];
                 for (lane, (node, r)) in cases.iter().enumerate() {
                     let want = intersect(&bvh, *node, r, sort, ij);
