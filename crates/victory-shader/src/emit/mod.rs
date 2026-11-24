@@ -1165,12 +1165,12 @@ mod tests {
             })
         ));
         // s3 is uninitialized on entry and reads as zero, passing DXIL validation.
-        let out = try_emit(rsrc2, 3).unwrap();
+        let _out = try_emit(rsrc2, 3).unwrap();
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut out.dxil.clone()).unwrap();
+            v.validate(&mut _out.dxil.clone()).unwrap();
         }
         // Enabling SCRATCH_EN (bit 0) initializes s3 (scratch wave offset), so
         // s3 is refused again while s4 reads as zero.
@@ -1181,12 +1181,12 @@ mod tests {
                 ..
             })
         ));
-        let out = try_emit(rsrc2 | 1, 4).unwrap();
+        let _out = try_emit(rsrc2 | 1, 4).unwrap();
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut out.dxil.clone()).unwrap();
+            v.validate(&mut _out.dxil.clone()).unwrap();
         }
     }
 }
