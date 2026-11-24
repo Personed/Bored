@@ -5061,11 +5061,22 @@ impl<'a> Lower<'a> {
     /// op_sel (or an SDWA word select) picks the high half; inline float
     /// constants are f16 values here.
     fn half_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_src_with(inst, k, true)
+    }
+
+    /// [`Self::half_src`] for a 16-bit compare: RDNA2 ignores VOP3 `op_sel`
+    /// on `v_cmp_*`/`v_cmpx_*` over f16, u16 and i16, and reads the low half;
+    /// an SDWA word select still picks the half it names.
+    fn half_cmp_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_src_with(inst, k, false)
+    }
+
+    fn half_src_with(&mut self, inst: &Inst, k: usize, opsel: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let mut high = v.opsel >> k & 1 != 0;
+        let mut high = opsel && v.opsel >> k & 1 != 0;
         if let Some(sd) = v.sdwa {
             match sd.src_sel.get(k).copied().unwrap_or(6) {
                 4 => {}
@@ -5091,10 +5102,19 @@ impl<'a> Lower<'a> {
 
     /// An f16 source as an f32 (exact), with its abs/neg modifiers.
     fn half_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_fsrc_with(inst, k, true)
+    }
+
+    /// [`Self::half_fsrc`] for a 16-bit compare, which ignores `op_sel`.
+    fn half_cmp_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_fsrc_with(inst, k, false)
+    }
+
+    fn half_fsrc_with(&mut self, inst: &Inst, k: usize, opsel: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let h = self.half_src(inst, k)?;
+        let h = self.half_src_with(inst, k, opsel)?;
         let f32t = self.s.t.f32;
         let mut f = self
             .s
@@ -6292,7 +6312,7 @@ impl<'a> Lower<'a> {
             }
             "f32" | "f16" => {
                 let (a, b) = if ty == "f16" {
-                    (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
+                    (self.half_cmp_fsrc(inst, 0)?, self.half_cmp_fsrc(inst, 1)?)
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
@@ -6350,7 +6370,7 @@ impl<'a> Lower<'a> {
             }
             "u32" | "i32" | "u16" | "i16" => {
                 let (a, b) = if ty.ends_with("16") {
-                    let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                    let (mut a, mut b) = (self.half_cmp_src(inst, 0)?, self.half_cmp_src(inst, 1)?);
                     if ty == "i16" {
                         let k16 = self.s.m.i32(16);
                         for x in [&mut a, &mut b] {
