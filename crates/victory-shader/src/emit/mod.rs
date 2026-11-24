@@ -369,7 +369,9 @@ fn psv_interps(
     pos += 4;
     if res_cnt > 0 {
         let res_sz = u32_at(d, pos).ok()? as usize;
-        pos = pos.checked_add(4)?.checked_add(res_cnt.checked_mul(res_sz)?)?;
+        pos = pos
+            .checked_add(4)?
+            .checked_add(res_cnt.checked_mul(res_sz)?)?;
     }
     let str_len = u32_at(d, pos).ok()? as usize;
     pos = pos.checked_add(4)?.checked_add(str_len)?;
@@ -1327,6 +1329,7 @@ mod tests {
                     pack2: false,
                     row2: 0,
                 }],
+                rsrc2: 0,
                 input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],

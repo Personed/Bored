@@ -620,7 +620,10 @@ mod tests {
     fn load_error_has_no_trailing_nul() {
         let missing = std::path::Path::new(r"Z:\nonexistent\victory_missing_dxil_test.dll");
         let err = Validator::load(Some(missing)).err().unwrap();
-        assert!(!err.contains('\0'), "error string had trailing NUL: {err:?}");
+        assert!(
+            !err.contains('\0'),
+            "error string had trailing NUL: {err:?}"
+        );
         assert!(err.contains("victory_missing_dxil_test.dll"));
     }
 

@@ -429,7 +429,9 @@ mod tests {
                 StaticSampler::from_words([0, 0, 0, 0]),
             ],
             root_cbvs: vec![0, 1, 255],
-            root_srvs: Vec::new(),
+            root_srvs: vec![2],
+            address_map: true,
+            descriptor_words: true,
         }
     }
 

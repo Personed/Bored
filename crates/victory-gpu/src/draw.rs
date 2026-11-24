@@ -161,11 +161,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .min(if srv { 1 << 20 } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
-        crate::list::ensure_shadow_state(
-            list,
-            &shadow,
-            if srv { 0x40 | 0x80 } else { 0x1 },
-        );
+        crate::list::ensure_shadow_state(list, &shadow, if srv { 0x40 | 0x80 } else { 0x1 });
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
@@ -1586,6 +1582,7 @@ mod tests {
         assert_eq!(state.fresh_tables[&accepted_key], accepted_first);
         drop(state);
         crate::object::slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+    }
 }
 
 #[cfg(all(test, feature = "diagnostics"))]

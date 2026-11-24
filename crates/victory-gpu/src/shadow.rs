@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -422,7 +422,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let Some(host) = host() else { return None };
+        let host = host()?;
         let Some((buffer, data)) = host.shared_buffer(len.next_multiple_of(1 << 16)) else {
             tracing::warn!(
                 address = format_args!("{:#x}", key.0),
@@ -487,7 +487,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let Some(host) = host() else { return None };
+    let host = host()?;
     let Some((buffer, data)) = host.shared_buffer(len) else {
         tracing::warn!(
             address = format_args!("{start:#x}"),

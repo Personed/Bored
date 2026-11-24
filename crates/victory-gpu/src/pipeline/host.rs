@@ -1115,7 +1115,6 @@ mod tests {
         assert_eq!(ba, bb);
     }
 
-
     fn read_subobject<T>(
         state: &mut GraphicsState,
         kind: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,

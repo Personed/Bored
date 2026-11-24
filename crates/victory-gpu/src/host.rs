@@ -327,10 +327,8 @@ type Note = (String, Option<(u64, u64)>);
 
 type States =
     std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
-type ShadowStates = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::shadow::Shadow>),
->;
+type ShadowStates =
+    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::shadow::Shadow>)>;
 
 /// Whether GPU timestamp diagnostics are enabled (`VICTORY_GPU_TIMING`).
 #[cfg(feature = "diagnostics")]
@@ -539,6 +537,7 @@ impl Host {
             group.push(list.list.cast().ok());
 
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
             let list_started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -938,7 +937,10 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.shadow_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.shadow_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1026,9 +1028,7 @@ impl HostList {
     ) {
         let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let previous = states
-            .get(&key)
-            .map(|entry| entry.1);
+        let previous = states.get(&key).map(|entry| entry.1);
         states
             .entry(key)
             .and_modify(|entry| entry.1 = state)
@@ -1045,7 +1045,7 @@ impl HostList {
     /// Buffers decay to COMMON after a completed ExecuteCommandLists call.
     fn decay_shadows(&self) {
         let states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
-        for (_, (_, last, shadow)) in states.iter() {
+        for (_, last, shadow) in states.values() {
             tracing::debug!(
                 list = format_args!("{:#x}", self.list.as_raw() as usize),
                 resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),

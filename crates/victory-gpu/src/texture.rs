@@ -124,7 +124,11 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostWrite {
     /// Write-watched memory: the write-watch asking when the host copy happened.
-    Watched { start: usize, end: usize, asked: u64 },
+    Watched {
+        start: usize,
+        end: usize,
+        asked: u64,
+    },
     /// Non-watched memory (physical-page view): content hash at the host copy.
     Hashed {
         memory: usize,
@@ -589,7 +593,10 @@ mod tests {
             let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
             map.get_or_insert_with(HashMap::new).insert(key, state);
         }
-        assert!(still_host_written(key), "untouched memory stays host-written");
+        assert!(
+            still_host_written(key),
+            "untouched memory stays host-written"
+        );
         // SAFETY: committed page of ours.
         unsafe { ptr.write(0x42) };
         assert!(
