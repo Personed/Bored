@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use anyhow::Result;
 #[cfg(windows)]
 use anyhow::Context;
+use anyhow::Result;
 
 use crate::{Console, Unimplemented};
 

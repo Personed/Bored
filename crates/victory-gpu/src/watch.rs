@@ -81,7 +81,11 @@ fn allocation(at: usize) -> Option<Region> {
     let page = at / PAGE;
     // Known allocations first: under Wine VirtualQuery takes the same lock
     // the title's write faults do.
-    if let Some((_, &r)) = REGIONS.lock().unwrap_or_else(|e| e.into_inner()).range(..=page).next_back()
+    if let Some((_, &r)) = REGIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=page)
+        .next_back()
         && page < r.last
     {
         return Some(r);
@@ -143,7 +147,10 @@ fn allocation(at: usize) -> Option<Region> {
 static REGIONS: Mutex<BTreeMap<usize, Region>> = Mutex::new(BTreeMap::new());
 
 fn forget_region(base: usize) {
-    REGIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, r| r.base != base);
+    REGIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, r| r.base != base);
 }
 
 /// A submission begins: memory asked about from now on is asked of the
@@ -155,7 +162,11 @@ fn forget_region(base: usize) {
 /// in one submission keeps its dirty bit, so the next submission sees it.
 pub(crate) fn new_submission() {
     if on_wine() {
-        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked_now.clear();
+        JOURNAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .asked_now
+            .clear();
     }
 }
 
@@ -174,7 +185,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         j.asked += 1;
         return Some((
             j.asked,
-            j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
         ));
     }
     // Under Wine: view memory cannot be watched (straight to its guards),
@@ -209,7 +223,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         ok.then_some(count)
     };
     let mut asked = (kfirst, klast);
-    let mut answer = if mapped { None } else { ask(kfirst, klast, &mut j.found) };
+    let mut answer = if mapped {
+        None
+    } else {
+        ask(kfirst, klast, &mut j.found)
+    };
     if answer.is_none() && !mapped && (kfirst, klast) != (first, last) {
         // The allocation was not one watched range after all (or is gone):
         // just ours, and look it up again next time.
@@ -253,10 +271,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    let out = j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect();
+    let out = j
+        .written
+        .range(first..last)
+        .map(|(&p, &w)| (p, w))
+        .collect();
     Some((now, out))
 }
 
@@ -500,7 +519,12 @@ mod tests {
         }
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
-            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
         } as usize;
         assert_ne!(p, 0);
         // Kept, not freed: another test given this address would see the
@@ -511,10 +535,16 @@ mod tests {
         // SAFETY: committed pages of ours.
         unsafe { ((p + 8) as *mut u8).write(1) };
         let (_, same) = writes(p, p + 2 * PAGE, false).expect("watched");
-        assert_eq!(same, before, "answered from the journal within the submission");
+        assert_eq!(
+            same, before,
+            "answered from the journal within the submission"
+        );
         new_submission();
         let (now, next) = writes(p, p + 2 * PAGE, false).expect("watched");
-        assert!(next.contains(&(p / PAGE, now)), "the write shows in the next submission");
+        assert!(
+            next.contains(&(p / PAGE, now)),
+            "the write shows in the next submission"
+        );
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
@@ -549,14 +579,29 @@ mod tests {
             let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
             file.read(into).is_ok_and(|n| n == 13)
         };
-        assert!(!read(&mut file), "the kernel does not fault into our handler");
+        assert!(
+            !read(&mut file),
+            "the kernel does not fault into our handler"
+        );
         writing(view + 100, 13);
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
-        assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
-        assert_eq!(guard(view, view + 2 * BLOCK, false), Some((view / PAGE..view / PAGE + 1).collect()));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) },
+            b"from the disk"
+        );
+        assert_eq!(
+            guard(view, view + 2 * BLOCK, false),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
         title_memory_remapped(view, 2 * BLOCK);
     }
 

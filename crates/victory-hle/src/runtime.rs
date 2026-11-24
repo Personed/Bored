@@ -53,9 +53,7 @@ fn title_absolute(path: &Path) -> bool {
     if bytes.len() >= 2
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
-        && (bytes.len() == 2
-            || bytes[2] == b'\\'
-            || bytes[2] == b'/')
+        && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/')
     {
         return true;
     }
@@ -81,9 +79,7 @@ pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths
         .iter()
-        .find(|(_, p)| {
-            title_file_name(p).is_some_and(|n| n.eq_ignore_ascii_case(file))
-        })
+        .find(|(_, p)| title_file_name(p).is_some_and(|n| n.eq_ignore_ascii_case(file)))
         .map(|(b, _)| *b)
 }
 
@@ -190,9 +186,15 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .unwrap_or("");
         path.push(name);
         let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+        let body = [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&amp;", "&"),
+        ]
+        .iter()
+        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();

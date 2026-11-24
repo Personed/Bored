@@ -180,7 +180,10 @@ fn sign_dxc_bytecode(
     use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 
-    if bytes.get(4..20).is_some_and(|digest| digest.iter().any(|&b| b != 0)) {
+    if bytes
+        .get(4..20)
+        .is_some_and(|digest| digest.iter().any(|&b| b != 0))
+    {
         return Ok(());
     }
 
@@ -196,10 +199,14 @@ fn sign_dxc_bytecode(
         let validator = compiler.with_file_name("dxil.dll");
         validator.is_file().then_some(validator)
     };
-    let path = explicit.or_else(beside_compiler).or_else(Validator::default_path);
+    let path = explicit
+        .or_else(beside_compiler)
+        .or_else(Validator::default_path);
     Validator::load(path.as_deref())
         .and_then(|mut validator| validator.validate(bytes))
-        .map_err(|error| windows::core::Error::new(E_FAIL, format!("cannot sign DXC shader: {error}")))
+        .map_err(|error| {
+            windows::core::Error::new(E_FAIL, format!("cannot sign DXC shader: {error}"))
+        })
 }
 
 struct Clamp {
@@ -270,7 +277,10 @@ fn make() -> windows::core::Result<Clamp> {
     unsafe {
         let (bytes, root) = match &code {
             Some(code) => (
-                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()),
+                std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                ),
                 root_signature(device)?,
             ),
             None => (&fallback[..], device.CreateRootSignature(0, &fallback[..])?),
@@ -293,7 +303,10 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
     let uav = |register| D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
-            Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: register, RegisterSpace: 0 },
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+            },
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     };
@@ -301,7 +314,11 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
             Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 4,
+                },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
@@ -321,7 +338,8 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
         let mut blob: Option<ID3DBlob> = None;
         D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
-        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         device.CreateRootSignature(0, bytes)
     }
 }
@@ -438,19 +456,23 @@ mod tests {
             let heap = |kind, count| -> ID3D12DescriptorHeap {
                 // SAFETY: plain heap creation.
                 unsafe {
-                    host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: kind,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
+                    host.device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: kind,
+                            NumDescriptors: count,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
                 }
                 .unwrap()
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1024);
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 16);
             // SAFETY: an open list and shader-visible heaps it keeps alive.
-            unsafe { list.list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]) };
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())])
+            };
             list.keep(&views);
             list.keep(&samplers);
         }

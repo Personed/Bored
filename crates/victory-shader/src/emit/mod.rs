@@ -419,7 +419,9 @@ pub fn debug_ps(targets: u32) -> HostShader {
         s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
     };
     let z = load(&mut s, 2);
-    let unary = |s: &mut shader::Shader, op: u32, v| s.op(b, "unary.f32", Attr::ReadNone, s.t.f32, op, &[v]);
+    let unary = |s: &mut shader::Shader, op: u32, v| {
+        s.op(b, "unary.f32", Attr::ReadNone, s.t.f32, op, &[v])
+    };
     // DerivCoarseX, DerivCoarseY: depth changes slowly, so scale it up.
     let (dx, dy) = (unary(&mut s, 83, z), unary(&mut s, 84, z));
     let k = s.m.f32((-4096.0f32).to_bits());
@@ -776,8 +778,7 @@ mod tests {
             let c = super::Container::parse(&bytes).unwrap();
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
             let st = crate::structure::structure(&p).unwrap();
-            let res =
-                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
