@@ -104,7 +104,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
         return hr;
     }
-    put(out, request)
+    super::xgameruntime::put(out, request)
 }
 
 #[cfg(windows)]

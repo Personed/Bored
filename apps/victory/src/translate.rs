@@ -11,7 +11,7 @@ use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
 #[cfg(windows)]
 use victory_shader::emit::validator::Validator;
-use victory_shader::emit::{self};
+use victory_shader::emit;
 
 /// A no-op validator for hosts without the Windows DLL: every call fails,
 /// so the CLI reports it skipped.
