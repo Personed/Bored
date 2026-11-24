@@ -75,7 +75,10 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+pub mod address_map;
 mod bitcode;
+#[cfg(test)]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -97,7 +100,9 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -156,6 +161,17 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// The shader reads title memory at addresses it computes (pointers
+    /// it loads, a BVH it walks): the host binds the address map as a
+    /// root SRV, `t0` in [`ADDRESS_MAP_SPACE`]. See [`address_map`] for
+    /// its layout.
+    pub address_map: bool,
+    /// The shader reads descriptors as numbers (a buffer's address, say):
+    /// the host binds the console words of the view heap's descriptors, 32
+    /// bytes per slot as the console lays them out, as a root SRV, `t0` in
+    /// [`DESCRIPTOR_WORDS_SPACE`]. A slot whose words the host cannot give
+    /// reads zero.
+    pub descriptor_words: bool,
 }
 
 impl HostShader {
@@ -308,6 +324,8 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        address_map: l.address_map,
+        descriptor_words: l.descriptor_words,
     })
 }
 
@@ -482,6 +500,8 @@ pub fn debug_ps(targets: u32) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        address_map: false,
+        descriptor_words: false,
     }
 }
 
@@ -662,6 +682,8 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            address_map: false,
+            descriptor_words: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -672,6 +694,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                address_map: false,
+                descriptor_words: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
