@@ -3566,8 +3566,14 @@ impl<'a> Lower<'a> {
             None => vec![(2, field(self, 0))],
         };
         // Fields the host view gives are rebuilt from it; the console's
-        // other words (addresses, formats) come from the descriptor words.
-        let console = self.descriptor_words(site, count).ok();
+        // other words (addresses, formats) come from the descriptor words,
+        // when those are already bound for this program.
+        let console = self
+            .s
+            .descriptor_words
+            .is_some()
+            .then(|| self.descriptor_words(site, count).ok())
+            .flatten();
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match (words.iter().find(|w| w.0 == rel), &console) {
@@ -6439,18 +6445,6 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            if inst.name().starts_with("v_interp_p1") {
-                let dst = match &inst.fields {
-                    Fields::Vintrp { dst, .. } => *dst,
-                    Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
-                    _ => unreachable!(),
-                };
-                if let Operand::Vector { reg, .. } = dst {
-                    let z = self.s.m.i32(0);
-                    self.write(inst, Reg::V(reg), z, None);
-                }
-                return Ok(());
-            }
             return Err("the first half of an interpolation");
         };
         let (attribute, mode) = match interp {
