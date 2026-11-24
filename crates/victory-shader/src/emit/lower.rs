@@ -7403,12 +7403,12 @@ mod tests {
                 slot: 0,
             }]
         };
-        let l = lower_with(&words, layout(), used()).unwrap();
+        let _l = lower_with(&words, layout(), used()).unwrap();
         #[cfg(windows)]
         if let Ok(mut v) = crate::emit::validator::Validator::load(
             crate::emit::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut l.dxil.clone()).unwrap();
+            v.validate(&mut _l.dxil.clone()).unwrap();
         }
     }
 
