@@ -1993,7 +1993,8 @@ mod tests {
         let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
-        let l = super::lower::lower(&super::lower::Parts {
+        // Everything below runs only under Windows (validator + host dispatch).
+        let _l = super::lower::lower(&super::lower::Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -2006,7 +2007,8 @@ mod tests {
             crumbs: None,
         })
         .unwrap();
-        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        let mut dxil = _l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -2018,14 +2020,14 @@ mod tests {
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
                 dxil,
-                user_data: l.user_data,
+                user_data: _l.user_data,
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
-                root_cbvs: l.root_cbvs,
-                root_srvs: l.root_srvs,
+                root_cbvs: _l.root_cbvs,
+                root_srvs: _l.root_srvs,
                 address_map: false,
                 descriptor_words: false,
-                root_uavs: l.root_uavs,
+                root_uavs: _l.root_uavs,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();

@@ -80,7 +80,7 @@ impl Op {
 /// 2k and 2k+1, then two such pairs side by side, and so on up to the two halves of the
 /// wave. Sums joined only that way form the balanced tree over the lanes in their order,
 /// whichever of the two a lane adds to the other (the addition is commutative).
-fn buddies(a: u64, b: u64) -> bool {
+pub(super) fn buddies(a: u64, b: u64) -> bool {
     let n = a.count_ones();
     if n != b.count_ones() || !n.is_power_of_two() || n == 64 {
         return false;

@@ -190,7 +190,7 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     /// Scalar loads of one descriptor the code keeps per lane in VGPRs
-    /// ([`Tracer::lane_copies`]): they read one address, so their dwords
+    /// (`Tracer::lane_copies`): they read one address, so their dwords
     /// stand in for each other.
     pub lane_copied: Vec<Site>,
     pub waterfall: Waterfall,
