@@ -219,7 +219,7 @@ fn apply_victory_patches(
         // Save the old bytes for logging
         let old_bytes = bytes[*rva as usize..*rva as usize + new_bytes.len()].to_vec();
         // Apply the patch
-        let _ = bytes[*rva as usize..*rva as usize + new_bytes.len()].copy_from_slice(new_bytes);
+        bytes[*rva as usize..*rva as usize + new_bytes.len()].copy_from_slice(new_bytes);
         // Log the patch application
         let old_hex = old_bytes
             .iter()

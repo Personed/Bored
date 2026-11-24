@@ -1454,6 +1454,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                address_map: false,
+                descriptor_words: false,
             },
             used,
         });

@@ -22,6 +22,8 @@ use crate::structure::{Atom, Bool, BoolSet, LaneExit, Structured};
 
 type Why = &'static str;
 
+type HandleKey = (usize, Site, u8, bool, u32, u32);
+
 mod bvh;
 mod global;
 
@@ -199,8 +201,8 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
-    handle_deps: HashMap<(usize, Site, u8, bool, u32, u32), Vec<ReadDep>>,
+    handles: HashMap<HandleKey, V>,
+    handle_deps: HashMap<HandleKey, Vec<ReadDep>>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -8931,6 +8933,7 @@ mod tests {
                 layout: vec![root(RootType::Constants, 0, 0)],
                 used: vec![],
                 io: StageIo::Ps {
+                    rsrc2: 0,
                     inputs: vec![crate::native::PsInput {
                         usage: crate::native::Usage::Generic,
                         row: 0,

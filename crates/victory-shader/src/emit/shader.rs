@@ -759,6 +759,8 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            address_map: false,
+            descriptor_words: false,
         };
         if let Ok(host) = Host::new(false) {
             host.compute_pipeline(&hs).unwrap();
