@@ -1,9 +1,9 @@
 //! Turns a title's image into something the Windows loader maps but does
 //! not run. Pure byte manipulation, so it is testable on any host.
 
+use tracing;
 use victory_pe::layout::{self, dir, dll_flags, file_flags};
 use victory_pe::{ImageInfo, PeError};
-use tracing;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareError {
@@ -134,7 +134,8 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
         return out;
     };
-    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4)) else {
+    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
+    else {
         return out;
     };
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
@@ -143,7 +144,8 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let (mut at, end) = (start as usize, start as usize + size as usize);
     while at + 8 <= end {
         let (Some(page), Some(block)) =
-            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4)) else {
+            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
+        else {
             break;
         };
         let block = block as usize;
@@ -204,7 +206,10 @@ fn parse_victory_patch(env_val: &str) -> Vec<(String, u32, Vec<u8>)> {
 
 /// Applies a list of VICTORY_PATCH entries to the image bytes.
 /// Each patch is logged via `tracing::info!` with module, rva, old bytes, new bytes.
-fn apply_victory_patches(bytes: &mut [u8], patches: &[(String, u32, Vec<u8>)]) -> Result<(), PrepareError> {
+fn apply_victory_patches(
+    bytes: &mut [u8],
+    patches: &[(String, u32, Vec<u8>)],
+) -> Result<(), PrepareError> {
     for (module, rva, new_bytes) in patches {
         // Verify the RVA is within the file bounds
         if *rva as usize >= bytes.len() {
@@ -216,8 +221,16 @@ fn apply_victory_patches(bytes: &mut [u8], patches: &[(String, u32, Vec<u8>)]) -
         // Apply the patch
         let _ = bytes[*rva as usize..*rva as usize + new_bytes.len()].copy_from_slice(new_bytes);
         // Log the patch application
-        let old_hex = old_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
-        let new_hex = new_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+        let old_hex = old_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join("");
+        let new_hex = new_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join("");
         tracing::info!(target: "victory-loader", "VICTORY_PATCH: module={}, rva={:#x}, old_bytes=[{}], new_bytes=[{}]", module, rva, old_hex, new_hex);
     }
     Ok(())

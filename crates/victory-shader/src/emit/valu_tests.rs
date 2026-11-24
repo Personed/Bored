@@ -2139,6 +2139,9 @@ fn scalar_buffer_loads_read_a_uav_through_its_table() {
     let cases = [[0x1234_5678, 0, 0, 0], [0xDEAD_BEEF, 0, 0, 0]];
     run_cases(&shader, &cases, |backend, _, inp, got| {
         assert_eq!(got, inp[0], "{backend}: read back {got:#010x}");
+    });
+}
+
 #[test]
 fn v_cmp_16bit_ignores_vop3_op_sel() {
     // v_cmp_lt_f16_e64 s6, v1, v2 (VOP3 encoding of VOPC 0x0c9), op_sel:[1,0];

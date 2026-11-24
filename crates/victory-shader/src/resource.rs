@@ -1160,8 +1160,7 @@ impl<'a> Tracer<'a> {
         match &inst.fields {
             Fields::Sop { src, .. } => src.iter().all(uniform_op),
             Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
-                f.src.iter().all(uniform_op)
-                    && self.valu_reads_uniform(inst, self.guarded(v))
+                f.src.iter().all(uniform_op) && self.valu_reads_uniform(inst, self.guarded(v))
             }
             _ => false,
         }

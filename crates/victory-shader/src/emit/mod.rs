@@ -87,6 +87,8 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod image_atomic_tests;
 mod lower;
+#[cfg(all(test, windows))]
+mod root_view_tests;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -95,8 +97,6 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
-#[cfg(all(test, windows))]
-mod root_view_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -858,7 +858,14 @@ mod tests {
         let void = s.t.void;
         for ch in 0..4u8 {
             let c = s.m.i8(ch);
-            s.op(s.entry, "storeOutput.f32", super::bitcode::Attr::NoUnwind, void, 5, &[id, row, c, zero]);
+            s.op(
+                s.entry,
+                "storeOutput.f32",
+                super::bitcode::Attr::NoUnwind,
+                void,
+                5,
+                &[id, row, c, zero],
+            );
         }
         s.m.terminate(s.entry, super::bitcode::Term::Ret);
         let mut c = s.finish();

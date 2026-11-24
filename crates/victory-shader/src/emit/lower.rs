@@ -8408,11 +8408,11 @@ mod tests {
             0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
             0x8500_80C1,    // s_cselect_b32 s0, -1, 0
             0xD501_0001,
-            0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
+            0x0001_0080, // v_cndmask_b32 v1, 0, 1, s0
             0xD501_0002,
-            0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
+            0x0201_02C1, // v_cndmask_b32 v2, 1, v1, -1
             0xD834_0000,
-            0x0000_0200,    // ds_write_b32 v0, v2
+            0x0000_0200, // ds_write_b32 v0, v2
             S_ENDPGM,
         ];
         lowers(&words, 0x8001).unwrap();
@@ -8661,7 +8661,6 @@ mod tests {
             slot: 0,
         }];
         lower_with(&words, layout, used).unwrap();
-
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

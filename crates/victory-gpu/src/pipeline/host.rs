@@ -177,7 +177,8 @@ impl GraphicsState {
                         clean_rasterizer(data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned())
                 }
                 11 => {
-                    self.depth = clean_depth(data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned())
+                    self.depth =
+                        clean_depth(data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned())
                 }
                 21 => {
                     // shortcut: the depth bounds test is dropped (the host
@@ -816,18 +817,30 @@ fn mesh_pipeline(
     // SAFETY: `Stream` is plain-old-data; zeroing clears padding inside
     // `Sub<T>` so D3D12's pipeline library desc comparison is deterministic.
     let mut stream: Stream = unsafe { std::mem::zeroed() };
-    stream.root = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw());
+    stream.root = Sub(
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+        root.as_raw(),
+    );
     stream.ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
     stream.ps = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
     stream.blend = Sub(
         D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
         host_blend(&g.blend, &g.targets),
     );
-    stream.mask = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask);
+    stream.mask = Sub(
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+        g.sample_mask,
+    );
     stream.raster = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer);
     stream.depth = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth);
-    stream.targets = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets);
-    stream.dsv = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format);
+    stream.targets = Sub(
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+        g.targets,
+    );
+    stream.dsv = Sub(
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+        g.depth_format,
+    );
     stream.samples = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples);
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of::<Stream>(),
@@ -959,7 +972,6 @@ fn clean_depth(d: D3D12_DEPTH_STENCIL_DESC) -> D3D12_DEPTH_STENCIL_DESC {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,8 +1067,14 @@ mod tests {
         // SAFETY: inspecting raw bytes of plain-old-data structs.
         let (ba, bb) = unsafe {
             (
-                std::slice::from_raw_parts((&raw const a).cast::<u8>(), size_of::<D3D12_DEPTH_STENCIL_DESC>()),
-                std::slice::from_raw_parts((&raw const b).cast::<u8>(), size_of::<D3D12_DEPTH_STENCIL_DESC>()),
+                std::slice::from_raw_parts(
+                    (&raw const a).cast::<u8>(),
+                    size_of::<D3D12_DEPTH_STENCIL_DESC>(),
+                ),
+                std::slice::from_raw_parts(
+                    (&raw const b).cast::<u8>(),
+                    size_of::<D3D12_DEPTH_STENCIL_DESC>(),
+                ),
             )
         };
         assert_eq!(ba, bb);
