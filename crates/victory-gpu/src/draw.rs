@@ -529,7 +529,9 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.root == victory_shader::emit::BREADCRUMB_ROOT => self.breadcrumb_slot(),
+                        None if u.root == victory_shader::emit::BREADCRUMB_ROOT => {
+                            self.breadcrumb_slot()
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }

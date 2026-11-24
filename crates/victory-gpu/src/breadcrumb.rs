@@ -75,11 +75,16 @@ pub(crate) fn clear() {
 
 /// Remembers that `name`'s pipeline uses the shader of `container`.
 pub(crate) fn note_stage(container: &[u8], name: &str) {
-    let Some(digest) = container.get(4..20).and_then(|d| <&[u8; 16]>::try_from(d).ok()) else {
+    let Some(digest) = container
+        .get(4..20)
+        .and_then(|d| <&[u8; 16]>::try_from(d).ok())
+    else {
         return;
     };
     let mut stages = stages().lock().unwrap_or_else(|e| e.into_inner());
-    let names = stages.entry(victory_shader::emit::breadcrumb_slot(digest)).or_default();
+    let names = stages
+        .entry(victory_shader::emit::breadcrumb_slot(digest))
+        .or_default();
     if !names.iter().any(|n| n == name) {
         names.push(name.to_owned());
     }
@@ -92,17 +97,22 @@ fn summarize(words: &[u32], stages: &BTreeMap<u32, Vec<String>>) -> Vec<String> 
         .iter()
         .enumerate()
         .filter(|&(_, &count)| count > 0)
-        .map(|(i, &count)| (count, i / BREADCRUMB_LOOPS as usize, i % BREADCRUMB_LOOPS as usize))
+        .map(|(i, &count)| {
+            (
+                count,
+                i / BREADCRUMB_LOOPS as usize,
+                i % BREADCRUMB_LOOPS as usize,
+            )
+        })
         .collect();
     loops.sort_unstable_by(|a, b| b.cmp(a));
     loops
         .into_iter()
         .take(REPORTED)
         .map(|(count, slot, n)| {
-            let names = stages.get(&(slot as u32)).map_or_else(
-                || "a shader not seen".to_owned(),
-                |names| names.join(" | "),
-            );
+            let names = stages
+                .get(&(slot as u32))
+                .map_or_else(|| "a shader not seen".to_owned(), |names| names.join(" | "));
             format!("loop {n} of slot {slot} ran {count} iterations ({names})")
         })
         .collect()

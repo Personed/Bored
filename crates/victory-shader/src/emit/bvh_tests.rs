@@ -460,6 +460,7 @@ mod gpu {
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
+            crumbs: None,
             mesh_stride: 0,
         })
         .expect("lower");

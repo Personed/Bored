@@ -429,6 +429,7 @@ mod tests {
         Psv {
             stage,
             flag: false,
+            validator18: false,
             inputs: &[],
             outputs: &[],
             prims: &[],
@@ -757,6 +758,7 @@ mod tests {
             bindings: &[],
             threads: [0; 3],
             wave_size: None,
+            validator18: false,
         });
         let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         let info_sz = u32_at(0) as usize;

@@ -2047,17 +2047,14 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match op {
             Some(&Operand::Scalar { code, .. }) => {
-                if let Some(m) = inst
-                    .read(Reg::S(code))
-                    .and_then(|m| {
-                        self.x
-                            .st
-                            .masks
-                            .get(&m)
-                            .or_else(|| self.x.st.other.get(&m))
-                            .copied()
-                    })
-                {
+                if let Some(m) = inst.read(Reg::S(code)).and_then(|m| {
+                    self.x
+                        .st
+                        .masks
+                        .get(&m)
+                        .or_else(|| self.x.st.other.get(&m))
+                        .copied()
+                }) {
                     return self.boolean(m, at);
                 }
                 if !self.console_lanes {
@@ -3595,18 +3592,7 @@ impl<'a> Lower<'a> {
             .collect();
         // A load read only for its numbers (sizes for a mip level, say):
         // another load of the same entry, used as a resource, tells its kind.
-        let Some((at, first)) = uses
-            .first()
-            .copied()
-            .or_else(|| self.same_entry_use(site))
-        else {
-            if let Ok(words) = self.descriptor_words(site, count) {
-                // No access names it: the console words are all there is.
-                for (k, x) in words.into_iter().enumerate() {
-                    self.write(inst, Reg::S(code + k as u8), x, None);
-                }
-                return Ok(());
-            }
+        let Some((at, first)) = uses.first().copied().or_else(|| self.same_entry_use(site)) else {
             // A load through a root view's address reads that buffer's
             // memory, not a descriptor.
             let root_view = self
@@ -3614,11 +3600,17 @@ impl<'a> Lower<'a> {
                 .get(&site)
                 .and_then(|a| self.x.native.layout.get(a.param))
                 .is_some_and(|p| p.root == RootType::Descriptor);
-            return Err(if root_view {
-                "a root view's memory read with scalar loads"
-            } else {
-                "a descriptor read only as data"
-            });
+            if root_view {
+                return Err("a root view's memory read with scalar loads");
+            }
+            if let Ok(words) = self.descriptor_words(site, count) {
+                // No access names it: the console words are all there is.
+                for (k, x) in words.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
+            return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -3655,12 +3647,6 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
-            }
-            Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                ((11 | u, 0), None)
             }
             Fields::Smem { .. } => {
                 // Scalar buffer loads (`s_buffer_load_dword*`) read through
@@ -8248,15 +8234,31 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         // The largest count of the lanes that take the back edge (unsigned max).
         let (k, u) = (self.s.m.i8(3), self.s.m.i8(1));
-        let count = self.s.op(c, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[count, k, u]);
-        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        let count = self.s.op(
+            c,
+            "waveActiveOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            119,
+            &[count, k, u],
+        );
+        let first = self
+            .s
+            .op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
         let guarded = self.begin_guarded(Some(first));
         let c = self.cur;
         // A raw buffer UAV (`atomicMax`, operation 7, at the word's byte offset).
         let h = self.s.heap_handle(c, index, false, false, (11 | 0x1000, 0));
         let at = self.s.m.i32((slot * super::BREADCRUMB_LOOPS + n) * 4);
         let (op, unused) = (self.s.m.i32(7), self.s.m.undef(i32t));
-        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, op, at, unused, unused, count]);
+        self.s.op(
+            c,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, op, at, unused, unused, count],
+        );
         self.end_guarded(guarded, &[]);
     }
 
@@ -8681,7 +8683,10 @@ mod tests {
             vgprs: 256,
             layout: vec![root(RootType::Constants, 0, 0)],
             used: vec![],
-            io: StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | 2 << 1, threads: [1, 1, 1] }),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [1, 1, 1],
+            }),
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
@@ -8706,7 +8711,12 @@ mod tests {
     #[test]
     fn breadcrumbs_add_a_loop_store_and_one_user_data_dword() {
         let plain = counted_loop(None);
-        assert!(plain.user_data.iter().all(|u| u.root != crate::emit::BREADCRUMB_ROOT));
+        assert!(
+            plain
+                .user_data
+                .iter()
+                .all(|u| u.root != crate::emit::BREADCRUMB_ROOT)
+        );
         let crumbs = counted_loop(Some(7));
         // The store (and the heap handle it goes through) are in the module.
         assert!(crumbs.dxil.len() > plain.dxil.len());
@@ -9340,7 +9350,7 @@ mod tests {
         let through_two_joins = reason(&words);
         assert_eq!(
             through_two_joins,
-            Some("a descriptor's address or format read as data")
+            Some("a buffer descriptor's stride or high address read as data")
         );
         words[13] = 0xBF82_0001; // skip the overwrite unconditionally: one join
         assert_eq!(through_two_joins, reason(&words));
@@ -9477,6 +9487,7 @@ mod tests {
                 outputs,
                 prims: vec![],
                 mesh_stride: 0,
+                crumbs: None,
             })
         };
         // Overwritten on the s0 != 0 branch: p1 never reaches exp.
@@ -9937,28 +9948,19 @@ mod tests {
             );
         }
         // A load through a root view's address (s[0:1]) reads that
-        // buffer's memory; one from a table with no use reads a descriptor.
+        // buffer's memory (`root_view_smem` lowers it); one from a table
+        // with no use reads a descriptor.
         let root_view = program([0xF400_0180, 0xFA00_0000], 6); // s_load_dword s6, s[0:1], null
         assert_eq!(names(&root_view)[0], "s_load_dword");
-        assert_eq!(
-            refusal(lower_with(
-                &root_view,
-                vec![root(RootType::Descriptor, 0, 0)],
-                vec![]
-            )),
-            Some("a root view's memory read with scalar loads")
-        );
+        lower_with(&root_view, vec![root(RootType::Descriptor, 0, 0)], vec![])
+            .expect("a root view's memory read by scalar loads lowers");
+        // A table load with no resource use reads the bound descriptor
+        // words (ray tracing reads them for GPU addresses).
         let mut table = vec![0xBE84_0300, 0xBE85_0380]; // s_mov_b32 s4, s0; s_mov_b32 s5, 0
         table.extend(program([0xF400_0182, 0xFA00_0000], 6)); // s_load_dword s6, s[4:5], null
         assert_eq!(names(&table)[2], "s_load_dword");
-        assert_eq!(
-            refusal(lower_with(
-                &table,
-                vec![root(RootType::Table, 0, 0)],
-                vec![]
-            )),
-            Some("a descriptor read only as data")
-        );
+        lower_with(&table, vec![root(RootType::Table, 0, 0)], vec![])
+            .expect("a descriptor read only as data gets the bound words");
     }
 
     #[test]
@@ -10176,6 +10178,7 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                crumbs: None,
             })
             .unwrap();
             let sfi0 = crate::dxbc::Container::parse(&emitted.dxil)

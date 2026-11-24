@@ -715,7 +715,6 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     1
 }
 
-
 fn view_run(physical: &Physical, at: usize, max_len: usize) -> Option<(Slice, usize)> {
     let (&base, &(size, ref s)) = physical
         .views
@@ -734,7 +733,6 @@ fn view_run(physical: &Physical, at: usize, max_len: usize) -> Option<(Slice, us
         pages * PAGE,
     ))
 }
-
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
@@ -764,8 +762,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
             let Some((next, extra)) = view_run(&physical, next_at, len - k - run) else {
                 break;
             };
-            if Arc::ptr_eq(&next.section, &first.section)
-                && next.index == first.index + run / PAGE
+            if Arc::ptr_eq(&next.section, &first.section) && next.index == first.index + run / PAGE
             {
                 run += extra;
             } else {
@@ -779,7 +776,6 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     }
     true
 }
-
 
 fn coalesce_placeholders(base: usize, len: usize) {
     let Some(target_end) = base.checked_add(len) else {
@@ -828,7 +824,6 @@ fn coalesce_placeholders(base: usize, len: usize) {
         );
     }
 }
-
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
@@ -1257,7 +1252,6 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
-
 
     #[test]
     fn remapping_split_placeholders_and_coalesced_aliases() {

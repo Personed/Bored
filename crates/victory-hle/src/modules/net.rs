@@ -1090,7 +1090,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn connect_by_list_falls_back_to_connect() {
         // Also starts Winsock for the raw calls below.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1131,7 +1130,10 @@ mod tests {
                 std::ptr::null_mut(),
             ),
             0
-=======
+        );
+    }
+
+    #[test]
     fn sockaddrs_are_read_by_family_and_length() {
         assert_eq!(
             socket_addr(v4(HOME, 8080).as_ptr(), 16),
@@ -1167,15 +1169,15 @@ mod tests {
         assert_eq!(
             socket_addr(storage.as_ptr(), 128),
             Some(SocketAddr::from((HOME, 80)))
->>>>>>> pr-1213
         );
     }
 
     #[test]
-<<<<<<< HEAD
     fn only_loopback_is_reachable() {
         // Also starts Winsock for the raw calls below.
-=======
+    }
+
+    #[test]
     fn raw_addresses_are_read_by_family() {
         assert_eq!(
             raw_ip(HOME.as_ptr().cast(), 4, i32::from(AF_INET)),
@@ -1375,7 +1377,6 @@ mod tests {
     #[test]
     fn connects_are_vetted_by_address() {
         up();
->>>>>>> pr-1213
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -2376,46 +2377,26 @@ mod tests {
                 named.name
             );
         }
-<<<<<<< HEAD
-        // Every override names a real export of its DLL, but for those with
-        // a fallback of our own (Wine lacks them).
-        const OPTIONAL: [&str; 3] = [
+        // Every override names a real export of its DLL. Some exports the
+        // HLE supplies itself (Wine lacks them; WinHttpGetProxySettingsEx is
+        // absent even from Windows 10's winhttp.dll): skip each only when
+        // the host really lacks it.
+        const FALLBACK: &[&str] = &[
             "WSAConnectByList",
             "GetAddrInfoExA",
             "WinHttpGetProxySettingsEx",
         ];
-        for e in m
-            .exports
-            .iter()
-            .filter(|e| !e.name.starts_with('#') && !OPTIONAL.contains(&e.name))
-        {
-            let dll = if e.name.starts_with("WinHttp") {
-=======
-        // Every override names a real export of its DLL. Some exports only
-        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
-        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
-        // them only when the host really lacks them.
-        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
         for entry in net.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if entry.name.starts_with("WinHttp") {
->>>>>>> pr-1213
                 "winhttp.dll"
             } else {
                 "ws2_32.dll"
             };
-<<<<<<< HEAD
-            assert!(
-                crate::host::function(dll, e.name).is_some(),
-                "{dll} lacks {}",
-                e.name
-            );
-=======
             let present = crate::host::function(dll, entry.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&entry.name) {
+            if !present && FALLBACK.contains(&entry.name) {
                 continue;
             }
             assert!(present, "{dll} lacks {}", entry.name);
->>>>>>> pr-1213
         }
     }
 }

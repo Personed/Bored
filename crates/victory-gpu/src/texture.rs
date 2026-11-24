@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use victory_formats::texture::{Error, Layout};
+#[cfg(test)]
+use victory_formats::texture::Error;
+use victory_formats::texture::Layout;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
@@ -445,8 +447,7 @@ impl Staging {
             }
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             // SAFETY: the upload buffer is mapped for exactly this range.
-            let linear =
-                unsafe { std::slice::from_raw_parts_mut(self.data, self.size) };
+            let linear = unsafe { std::slice::from_raw_parts_mut(self.data, self.size) };
             if let Err(e) = self.layout.detile(
                 tiled,
                 mip,

@@ -392,9 +392,7 @@ impl Bools {
             if let Some(&r) = memo.get(&(a, b)) {
                 return r;
             }
-            let v = bools.nodes[a.0 as usize]
-                .0
-                .min(bools.nodes[b.0 as usize].0);
+            let v = bools.nodes[a.0 as usize].0.min(bools.nodes[b.0 as usize].0);
             let ((a0, a1), (b0, b1)) = (bools.split(a, v), bools.split(b, v));
             let r = check(bools, a0, b0, memo) && check(bools, a1, b1, memo);
             memo.insert((a, b), r);
@@ -462,7 +460,11 @@ impl Bools {
             if lo != Bool::FALSE {
                 can_false[v] = true;
                 let lo_var = self.nodes[lo.0 as usize].0;
-                let end = if lo_var == TERMINAL { n } else { lo_var as usize };
+                let end = if lo_var == TERMINAL {
+                    n
+                } else {
+                    lo_var as usize
+                };
                 if v + 1 < end {
                     skip_diff[v + 1] += 1;
                     skip_diff[end] -= 1;
@@ -472,7 +474,11 @@ impl Bools {
             if hi != Bool::FALSE {
                 can_true[v] = true;
                 let hi_var = self.nodes[hi.0 as usize].0;
-                let end = if hi_var == TERMINAL { n } else { hi_var as usize };
+                let end = if hi_var == TERMINAL {
+                    n
+                } else {
+                    hi_var as usize
+                };
                 if v + 1 < end {
                     skip_diff[v + 1] += 1;
                     skip_diff[end] -= 1;

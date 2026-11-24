@@ -125,7 +125,9 @@ impl WorkQueue {
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        self.urgent.pop_front().or_else(|| self.background.pop_front())
+        self.urgent
+            .pop_front()
+            .or_else(|| self.background.pop_front())
     }
 }
 
@@ -183,7 +185,10 @@ fn start(p: &Arc<Pending>, urgent: bool) {
         p.urgent.store(true, Ordering::Release);
     }
     if !p.queued.swap(true, Ordering::AcqRel) {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        PEAK.fetch_max(
+            WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
         if ensure_workers() {
             let (lock, ready) = &WORK;
             let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());

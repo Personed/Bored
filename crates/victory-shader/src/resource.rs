@@ -4413,7 +4413,9 @@ pub(crate) mod tests {
         );
         assert!(waterfall(&w64_inline, true).is_ok());
     }
-    fn joined_descriptor_redundant_partial_write() {
+
+    #[test]
+    fn joined_descriptor_redundant_partial_write_w16() {
         // After the if/else join of WATERFALL_JOINED_WAVE32, re-writing v4
         // with s24 under the same lane < 16 predicate leaves every lane's
         // descriptor unchanged.

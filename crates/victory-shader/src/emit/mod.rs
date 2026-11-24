@@ -1084,6 +1084,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            crumbs: None,
         })
         .expect("lower");
         let shader = super::HostShader {
@@ -1421,6 +1422,7 @@ mod tests {
             bindings: &[],
             threads: [0; 3],
             wave_size: None,
+            validator18: false,
         });
         let bytes = crate::dxbc::build(&[
             (super::FourCC::ISG1, &isg1),

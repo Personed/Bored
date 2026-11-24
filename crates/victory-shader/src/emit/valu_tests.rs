@@ -172,7 +172,11 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
-fn run_cases(shader: &HostShader, cases: &[[u32; 4]], check: impl FnMut(&str, usize, [u32; 4], u32)) {
+fn run_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
     run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
 }
 
@@ -1991,6 +1995,7 @@ fn build_test_cs(body: &[u32], compute: ComputeIo, result_store: &[u32]) -> Host
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        crumbs: None,
     })
     .expect("lower");
 
@@ -2219,7 +2224,12 @@ fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
     let hw = &[("hardware", false)];
     run_cases_on(
         &from_sgpr,
-        &[[10, 20, 0, 0], [10, 20, 0, 1], [10, 20, 0, 2], [10, 20, 0, !0]],
+        &[
+            [10, 20, 0, 0],
+            [10, 20, 0, 1],
+            [10, 20, 0, 2],
+            [10, 20, 0, !0],
+        ],
         hw,
         |label, i, inp, got| {
             let want = if inp[3] & 1 != 0 { inp[1] } else { inp[0] };

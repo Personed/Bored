@@ -890,11 +890,11 @@ mod tests {
         let mut s = Shader::new(false);
         s.threads = Some([32, 1, 1]);
         s.wave_size = Some(32);
-        s.samplers = 1;
+        s.samplers = vec![false];
         let block = s.entry;
         let index = s.m.i32(0);
         let texture = s.heap_handle(block, index, false, false, (2, 1033));
-        let sampler = s.sampler_handle(block, 0);
+        let sampler = s.sampler_handle(block, 0, false);
         let zero = s.m.f32(0);
         let fu = s.m.undef(s.t.f32);
         let iu = s.m.undef(s.t.i32);
@@ -916,11 +916,11 @@ mod tests {
             let mut s = Shader::new(false);
             s.threads = Some([32, 1, 1]);
             s.wave_size = Some(32);
-            s.samplers = 1;
+            s.samplers = vec![false];
             let block = s.entry;
             let index = s.m.i32(0);
             let texture = s.heap_handle(block, index, false, false, (2, 1033));
-            let sampler = s.sampler_handle(block, 0);
+            let sampler = s.sampler_handle(block, 0, false);
             let zero = s.m.f32(0);
             let fu = s.m.undef(s.t.f32);
             let iu = s.m.undef(s.t.i32);
