@@ -565,8 +565,8 @@ mod tests {
         let input = signature(&elements, true);
         let output = signature(&elements, false);
         let rows = [
-            [0, 184, 8, 0, 2, 1, 0x0203, 0],
             [0, 168, 7, 0, 3, 1, 0x040c, 0],
+            [0, 184, 8, 0, 2, 1, 0x0203, 0],
             [0, 174, 0, 64, 3, 2, 0x0f0f, 0],
             [0, 174, 1, 64, 3, 3, 0x0f0f, 0],
             [0, 190, 0, 65, 3, u32::MAX, 0x0101, 0],
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(words(&output[..8]), [5, 8]);
         assert_eq!(&input[168..], b"COLOR\0SV_Target\0COLOR\0SV_Depth\0");
         assert_eq!(&output[168..], &input[168..]);
-        for (i, (row, output_mask)) in rows.into_iter().zip([0x0d, 0x0b, 0, 0, 0x0e]).enumerate() {
+        for (i, (row, output_mask)) in rows.into_iter().zip([0x0b, 0x0d, 0, 0, 0x0e]).enumerate() {
             let start = 8 + 32 * i;
             assert_eq!(words(&input[start..start + 32]), row);
             let mut expected = row;
@@ -648,16 +648,16 @@ mod tests {
         assert_eq!(&bytes[28..40], &[1, 0, 0, 0, 1, 1, 0, 1, 9, 0, 0, 0]);
         assert_eq!(
             words(&bytes[52..112]),
-            [2, 24, 1, 6, 9, 9, 14, 0, 2, 7, 2, 2, 13, 0, 8]
+            [2, 24, 1, 6, 9, 9, 14, 0, 2, 7, 2, 2, 13, 0, 12]
         );
-        assert_eq!(&bytes[112..120], b"\0COLOR\0\0");
-        assert_eq!(words(&bytes[120..132]), [1, 3, 16]);
+        assert_eq!(&bytes[112..124], b"\0COLOR\0OR\0\0\0");
+        assert_eq!(words(&bytes[124..136]), [1, 3, 16]);
         assert_eq!(
-            words(&bytes[132..164]),
-            [1, 0, 0x0052_0001, 0x0203, 4, 0, 0x0051_0801, 3]
+            words(&bytes[136..168]),
+            [1, 0, 0x0052_0001, 0x0203, 7, 0, 0x0051_0801, 3]
         );
         assert_eq!(
-            words(&bytes[164..]),
+            words(&bytes[168..]),
             [u32::MAX, 3, u32::MAX, 3, u32::MAX, 3, 0, 0]
         );
     }
