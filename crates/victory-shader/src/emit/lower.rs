@@ -8509,6 +8509,7 @@ mod tests {
         ) {
             v.validate(&mut _l.dxil.clone()).unwrap();
         }
+    }
 
     #[test]
     fn a_descriptor_read_only_as_data_takes_the_kind_of_its_entrys_use() {
