@@ -1912,8 +1912,8 @@ mod tests {
             Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(86),
             ..Default::default()
         };
-        // SAFETY: plain feature query into our struct.
         let host = crate::host::host().unwrap();
+        // SAFETY: plain feature query into our struct.
         let typed_uav = unsafe {
             host.device.CheckFeatureSupport(
                 D3D12_FEATURE_FORMAT_SUPPORT,
