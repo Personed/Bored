@@ -18,6 +18,8 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Structured};
 
+mod uniform;
+
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
@@ -342,6 +344,10 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// Memo of [`Tracer::uniform`] per value.
     uniform_memo: std::cell::RefCell<Vec<Option<bool>>>,
+    /// Per value: whether a phi is uniform, settled on first use
+    /// ([`uniform`] module).
+    phi_ok: std::cell::RefCell<Option<Vec<bool>>>,
+    regions: std::cell::OnceCell<uniform::Regions>,
 }
 
 /// VALU operations whose result is uniform when their operands are: the
@@ -425,6 +431,8 @@ impl<'a> Tracer<'a> {
             lanes,
             rpo,
             uniform_memo: std::cell::RefCell::new(vec![None; n]),
+            phi_ok: std::cell::RefCell::new(None),
+            regions: std::cell::OnceCell::new(),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -1127,10 +1135,13 @@ impl<'a> Tracer<'a> {
         if let Some(reg) = self.inputs[v.0 as usize] {
             return matches!(reg, Reg::S(_));
         }
+        if self.phis[v.0 as usize].is_some() {
+            return self.phi_uniform(v);
+        }
         let Some(inst) = self.def(v) else {
             return false;
         };
-        if inst.name() == "v_readfirstlane_b32" {
+        if matches!(inst.name(), "v_readfirstlane_b32" | "v_readlane_b32") {
             return true;
         }
         let uniform_op = |op: &Operand| match *op {
@@ -1144,7 +1155,10 @@ impl<'a> Tracer<'a> {
         };
         match &inst.fields {
             Fields::Sop { src, .. } => src.iter().all(uniform_op),
-            Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => f.src.iter().all(uniform_op),
+            Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
+                f.src.iter().all(uniform_op)
+                    && self.valu_reads_uniform(inst, self.guarded(v))
+            }
             _ => false,
         }
     }
@@ -2208,6 +2222,65 @@ pub(crate) mod tests {
             ShaderError::Unsupported {
                 // the s_load_dword, at byte 44
                 offset: 44,
+                what: "an address read from the first lane of a per-lane value"
+            }
+        );
+    }
+
+    /// A table in the code read in a loop whose counter (v7) the exit test
+    /// compares with `limit`: the console compiler's form for a lookup table
+    /// walked at a uniform index. Assembled with llvm-mc for gfx1030, wave32.
+    fn code_table_loop(compare: u32) -> Vec<u32> {
+        vec![
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x3402_0E82, // loop: v_lshlrev_b32 v1, 2, v7
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7
+            compare,
+            0xBF87_FFF3, // s_cbranch_vccnz loop
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn a_loop_counter_with_a_uniform_exit_indexes_a_code_table() {
+        // v_cmp_gt_i32 vcc_lo, 5, v7
+        let r = track_words(&code_table_loop(0x7D08_0E85), &[], HwStage::Cs);
+        let (_, a) = r
+            .scalar
+            .iter()
+            .find(|s| s.1.param == CODE)
+            .expect("the code table load is traced");
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some(), "the counter stays a computed term");
+    }
+
+    #[test]
+    fn a_loop_counter_with_a_per_lane_exit_is_refused_by_name() {
+        // v_cmp_gt_u32 vcc_lo, v0, v7: lanes leave at their own count.
+        let code: Vec<u8> = code_table_loop(0x7D88_0F00)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the s_load_dword, at byte 48
+                offset: 48,
                 what: "an address read from the first lane of a per-lane value"
             }
         );
