@@ -2245,3 +2245,10 @@ fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
         });
     }
 }
+
+#[test]
+fn dump_cndmask_dxil() {
+    let s = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), sgpr(3)));
+    eprintln!("{s:#?}");
+    std::fs::write(std::env::var("DUMP").unwrap(), &s.dxil).unwrap();
+}
