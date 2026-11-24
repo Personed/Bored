@@ -1,4 +1,4 @@
-﻿# Compatibility investigation: Grand Theft Auto VI
+# Compatibility investigation: Grand Theft Auto VI
 
 **Status:** Experimental; not confirmed playable
 **Last updated:** 2026-11-24

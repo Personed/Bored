@@ -1,4 +1,4 @@
-﻿# D3D12 debugging notes
+# D3D12 debugging notes
 
 This document records diagnostic procedures and observations from the
 experimental VIctory compatibility investigation.
