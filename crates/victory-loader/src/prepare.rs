@@ -185,7 +185,7 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 
 /// Simple hex decoder for VICTORY_PATCH bytes (no external `hex` crate needed).
 /// Parses a VICTORY_PATCH environment variable value.
-/// Format: "<module basename>:<rva hex>:<hex bytes>"
+/// Format: `<module basename>:<rva hex>:<hex bytes>`
 /// Multiple patches can be specified by setting the env var multiple times
 /// or using a separator (here we support space-separated multiple entries).
 fn parse_victory_patch(env_val: &str) -> Vec<(String, u32, Vec<u8>)> {
