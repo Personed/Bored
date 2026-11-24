@@ -6,7 +6,7 @@
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
 use super::host::{Dispatch, Host, Root, View};
-use super::{HostShader, lower, validator};
+use super::{HostShader, UserData, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -2252,7 +2252,38 @@ fn pr1084_blob_pipeline() {
     let cs = HostShader {
         stage: HwStage::Cs,
         dxil: bytes,
-        user_data: vec![],
+        user_data: vec![
+            UserData {
+                index: 0,
+                slot: 0,
+                root: RootType::Constants,
+                dword: 0,
+            },
+            UserData {
+                index: 1,
+                slot: 0,
+                root: RootType::Constants,
+                dword: 1,
+            },
+            UserData {
+                index: 2,
+                slot: 0,
+                root: RootType::Constants,
+                dword: 2,
+            },
+            UserData {
+                index: 3,
+                slot: 0,
+                root: RootType::Constants,
+                dword: 3,
+            },
+            UserData {
+                index: 4,
+                slot: 1,
+                root: RootType::Table,
+                dword: 0,
+            },
+        ],
         samplers: vec![],
         static_samplers: vec![],
         root_cbvs: vec![],
