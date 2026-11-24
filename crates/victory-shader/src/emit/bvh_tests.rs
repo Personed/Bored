@@ -375,7 +375,7 @@ fn the_cases_cover_hits_misses_and_boxes() {
 
 #[cfg(windows)]
 mod gpu {
-    use super::super::host::{Dispatch, Host, Root, View};
+    use super::super::host::{Dispatch, Host, Root, Stride, View};
     use super::super::lower::intersect::TEST_MEMORY;
     use super::super::{HostShader, lower, validator};
     use super::*;
@@ -489,7 +489,11 @@ mod gpu {
                     slot: 1,
                 },
             ],
-            used: vec![table(ResourceType::Srv, 0), table(ResourceType::Uav, 8)],
+            used: vec![
+                table(ResourceType::Srv, 0),
+                table(ResourceType::Srv, 4),
+                table(ResourceType::Uav, 8),
+            ],
             io: StageIo::Cs(ComputeIo {
                 rsrc2: 5 << 1,
                 threads: [32, 1, 1],
@@ -587,7 +591,17 @@ mod gpu {
                         &pso,
                         &Dispatch {
                             roots: vec![(0, Root::Constants(vec![0; 5]))],
-                            views: &[View::RawData(&rays), View::RawData(&bvh), View::RawUav(128)],
+                            views: &[
+                                View::Buffer {
+                                    data: &rays,
+                                    stride: Stride::Raw,
+                                },
+                                View::Buffer {
+                                    data: &bvh,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(128),
+                            ],
                             samplers: &[],
                             groups: [1, 1, 1],
                         },
