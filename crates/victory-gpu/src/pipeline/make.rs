@@ -32,7 +32,7 @@ pub(crate) struct Pending {
     urgent: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
-    /// whether a draw has used it yet.
+    /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
 }
@@ -167,15 +167,16 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    // A still-pending pipeline was requested by the title too. Prewarm it
+    // on the next launch, even if this run never got to use it.
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        super::library::note_used(&p.key);
+    }
     if p.made.get().is_none() {
         start(p, true);
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-    }
-    made
+    p.made.get()?.as_ref()
 }
 
 /// Queues `p` for the workers, once; urgent draws jump ahead of early
@@ -329,6 +330,21 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn pending_pipeline_is_recorded_for_the_next_launch() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.key = "pending-pipeline-test".to_owned();
+        // A worker already has the job: ready() does not requeue it, just
+        // records the request and waits out the frame's budget.
+        p.queued.store(true, Ordering::Relaxed);
+        let p = Arc::new(p);
+
+        assert!(!super::super::library::wanted_early(&p.key));
+        assert!(ready(&p).is_none());
+        assert!(p.made.get().is_none());
+        assert!(super::super::library::wanted_early(&p.key));
     }
 
     #[test]
