@@ -562,11 +562,11 @@ mod gpu {
         let rays: Vec<u32> = cases
             .iter()
             .flat_map(|(node, r)| {
-                let mut w = vec![*node, r.extent.to_bits()];
+                // The operand's pointer is a qword.
+                let mut w = vec![*node, 0, r.extent.to_bits()];
                 w.extend(f3(r.origin));
                 w.extend(f3(r.dir));
                 w.extend(f3(r.inv));
-                w.push(0);
                 w
             })
             .collect();
