@@ -2220,8 +2220,10 @@ fn v_cmp_16bit_ignores_vop3_op_sel() {
 #[test]
 fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
     // v_cndmask_b32_e64 v0, v1, v2, <mask> (VOP3 0x101); s3 holds the mask.
+    // The lane bit comes out of waveGetLaneIndex; some adapters reject a
+    // wave-ops compute pipeline, so WARP (a full SM 6.6 device) is the check.
     let from_sgpr = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), sgpr(3)));
-    let hw = &[("hardware", false)];
+    let hw = &[("warp", true)];
     run_cases_on(
         &from_sgpr,
         &[
