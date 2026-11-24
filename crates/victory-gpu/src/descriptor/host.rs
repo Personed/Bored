@@ -13,6 +13,15 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Number of shader-visible descriptor slots retaining a host resource.
+#[cfg(feature = "diagnostics")]
+static KEPT_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kept_slots() -> usize {
+    KEPT_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -256,6 +265,22 @@ impl HostHeap {
     }
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let retained = self
+                .kept
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count();
+            KEPT_SLOTS.fetch_sub(retained, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// A plain point sampler at `at`.
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
@@ -406,6 +431,15 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
+            #[cfg(feature = "diagnostics")]
+            if slot.is_some() != resource.is_some() {
+                use std::sync::atomic::Ordering::Relaxed;
+                if resource.is_some() {
+                    KEPT_SLOTS.fetch_add(1, Relaxed);
+                } else {
+                    KEPT_SLOTS.fetch_sub(1, Relaxed);
+                }
+            }
             *slot = resource;
         }
     }

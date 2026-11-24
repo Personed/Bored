@@ -403,6 +403,21 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     }
 }
 
+/// Moves a shadow buffer to the state required by its next GPU use.
+#[cfg(windows)]
+pub(crate) fn ensure_shadow_state(
+    list: &crate::host::HostList,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    state: u32,
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    if let Some((buffer, before)) = list.transition_shadow(shadow, state) {
+        let barrier = crate::host::transition(&buffer, State(before as i32), State(state as i32));
+        // SAFETY: an open list and a live shadow buffer.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+}
+
 #[cfg(windows)]
 const COPY_DEST: u32 = 0x400;
 #[cfg(windows)]

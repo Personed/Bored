@@ -1190,6 +1190,21 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The number and estimated allocation size of placed textures retained by the cache.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_texture_cache_stats() -> (usize, u64) {
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .fold((0, 0), |(count, bytes), &(_, words)| {
+            // SAFETY: the cache key stores the original 56-byte resource description.
+            let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+            let size = footprint(&desc).map_or(0, |info| info.size);
+            (count + 1, bytes.saturating_add(size))
+        })
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

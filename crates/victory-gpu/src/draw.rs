@@ -161,6 +161,11 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .min(if srv { 1 << 20 } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
+        crate::list::ensure_shadow_state(
+            list,
+            &shadow,
+            if srv { 0x40 | 0x80 } else { 0x1 },
+        );
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
@@ -399,6 +404,7 @@ impl State {
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 continue;
             };
+            crate::list::ensure_shadow_state(list, &shadow, 0x1);
             shadow.refresh(list, v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -417,6 +423,7 @@ impl State {
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 return false;
             };
+            crate::list::ensure_shadow_state(list, &shadow, 0x2);
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1236,10 +1243,17 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // The clamp writes the argument shadow as UAV, then leaves it
+        // in INDIRECT_ARGUMENT for ExecuteIndirect.
+        crate::list::ensure_shadow_state(list, &args, 0x8);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
+        }
+        list.note_shadow_state(&args, 0x200);
+        if let Some((shadow, _)) = &counter {
+            crate::list::ensure_shadow_state(list, shadow, 0x200);
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1254,6 +1268,7 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &args.buffer);
+            list.note_shadow_state(&args, 0x8);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1284,6 +1299,7 @@ impl State {
             )
         };
         crate::indirect::done(list, &args.buffer);
+        list.note_shadow_state(&args, 0x8);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1340,10 +1356,23 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    let range = match view {
+        View::Constant(address, size) => Some((*address, u64::from(*size))),
+        _ => crate::descriptor::host::buffer_range(view),
+    };
+    if let Some((address, len)) = range
         && len > 0
         && let Some(shadow) = crate::shadow::find(address, len)
     {
+        let state = match u.kind {
+            ResourceType::Cbv => 0x1,
+            ResourceType::Srv => SHADER_RESOURCE,
+            ResourceType::Uav => UNORDERED_ACCESS,
+            ResourceType::Other(_) | ResourceType::Sampler => 0,
+        };
+        if state != 0 {
+            crate::list::ensure_shadow_state(list, &shadow, state);
+        }
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
