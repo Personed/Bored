@@ -8075,8 +8075,9 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, make_zero, sign, signed_q);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
-                let r = self.s.m.select(c, d_nan, d_qnan, r);
+                // denom's NaN quiets over num's (the hardware's priority).
                 let r = self.s.m.select(c, n_nan, n_qnan, r);
+                let r = self.s.m.select(c, d_nan, d_qnan, r);
                 let rf = self.as_float(r);
                 float(self, rf)
             }
@@ -10441,7 +10442,9 @@ impl<'a> Lower<'a> {
                 return Err("image atomic data");
             };
             let width = if wide { 2 } else { 1 };
-            let vals = self.vgprs(inst, data, if compare { 2 * width } else { width })?;
+            // fcmpswap's loop compares against a second data dword.
+            let pair = compare || (code == ATOMIC_LOOP && op == "fcmpswap");
+            let vals = self.vgprs(inst, data, if pair { 2 * width } else { width })?;
             let (ty, component) = if wide {
                 self.s.flags |= flags::INT64
                     | flags::ATOMIC_INT64_ON_TYPED_RESOURCE
@@ -10462,6 +10465,20 @@ impl<'a> Lower<'a> {
                 original
             };
             let h = self.handle(site, src, false, (kind | 0x1000, component))?;
+            if code == ATOMIC_LOOP {
+                // No DXIL operation: emulate with a compare-and-swap loop.
+                let old = match inst.read(Reg::V(reg)) {
+                    Some(v) if cache.glc => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                };
+                let at = self.begin_guarded(guard);
+                let r = self.atomic_loop(h, &cs, op, &vals);
+                let r = self.end_guarded(at, &[(r, old)])[0];
+                if cache.glc {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
+                return Ok(());
+            }
             let mut args = vec![h];
             let (intrinsic, opcode) = if compare {
                 let comparand = if wide {

@@ -388,7 +388,9 @@ mod gpu {
     /// Per lane: 12 dwords of ray at `s[0:1] + 48 * lane` (node, extent,
     /// origin, direction, inverse direction), the intersection with the
     /// descriptor `s[4:7]`, 4 dwords stored at `s[2:3] + 16 * lane`.
-    fn program() -> Vec<u32> {
+    /// `desc1`/`desc3` are the descriptor's flag dwords, written as
+    /// literals like the console compiler does.
+    fn program(desc1: u32, desc3: u32) -> Vec<u32> {
         let load = |vdst: u32, offset: u32| [0xDC38_8000 | offset, vdst << 24 | 1];
         let mut w = vec![
             0x1602_00B0, // v_mul_u32_u24 v1, 48, v0
@@ -397,6 +399,10 @@ mod gpu {
         w.extend(load(6, 16)); // ... v[6:9], offset:16
         w.extend(load(10, 32)); // ... v[10:13], offset:32
         w.extend([
+            0xBE85_03FF, // s_mov_b32 s5, desc1
+            desc1,
+            0xBE87_03FF, // s_mov_b32 s7, desc3
+            desc3,
             0xF198_9F01, // image_bvh_intersect_ray v[14:17], v[2:12], s[4:7]
             0x0001_0E02,
             0x3402_0084, // v_lshlrev_b32 v1, 4, v0
@@ -417,6 +423,8 @@ mod gpu {
                 "global_load_dwordx4",
                 "global_load_dwordx4",
                 "global_load_dwordx4",
+                "s_mov_b32",
+                "s_mov_b32",
                 "image_bvh_intersect_ray",
                 "v_lshlrev_b32",
                 "global_store_dwordx4",
@@ -426,7 +434,10 @@ mod gpu {
         w
     }
 
-    fn build() -> HostShader {
+    fn build(sort: bool, ij: bool) -> HostShader {
+        let base = BVH >> 8;
+        let desc1 = (base >> 32) as u32 & 0xFF | u32::from(sort) << 31;
+        let desc3 = 0x88FF_FFFF | u32::from(ij) << 24;
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
@@ -444,7 +455,10 @@ mod gpu {
                 rsrc2: 8 << 1,
                 threads: [32, 1, 1],
             }),
-            code: program().iter().flat_map(|w| w.to_le_bytes()).collect(),
+            code: program(desc1, desc3)
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect(),
         };
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         let st = structure::structure(&p).expect("structure");
@@ -495,7 +509,6 @@ mod gpu {
 
     #[test]
     fn bvh_intersection_matches_the_model_on_the_gpu() {
-        let shader = build();
         let (bvh, ..) = scene();
         let cases = cases();
         let rays: Vec<u32> = cases
@@ -537,10 +550,11 @@ mod gpu {
                 eprintln!("no SM 6.6 {label} device; skipped");
                 continue;
             };
-            let (root, pso) = host
-                .compute_pipeline(&shader)
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
             for (sort, ij) in [(true, true), (false, false)] {
+                let shader = build(sort, ij);
+                let (root, pso) = host
+                    .compute_pipeline(&shader)
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
                 let base = BVH >> 8;
                 let desc = [
                     base as u32,
