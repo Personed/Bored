@@ -238,6 +238,10 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Stack of each pipeline worker: room for the driver's shader compiler,
+/// which runs on it (reserved address space; committed only as used).
+const PIPELINE_STACK: usize = 64 << 20;
+
 /// Starts the pipeline workers (half the logical processors, 2 to 8) once.
 fn ensure_workers() -> bool {
     static WORKERS: OnceLock<bool> = OnceLock::new();

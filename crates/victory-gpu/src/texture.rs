@@ -360,7 +360,8 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, end, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            let before = last.asked;
+            if before != 0 && written.iter().all(|&(_, w)| w <= before) {
                 return 0;
             }
             last.asked = now;
@@ -461,6 +462,7 @@ impl Staging {
     }
 }
 
+#[cfg(test)]
 fn detile_plane(
     layout: &Layout,
     mips: u32,

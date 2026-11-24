@@ -51,6 +51,29 @@ pub(crate) struct HostHeap {
     words: Option<(ID3D12Resource, usize, u64)>,
 }
 
+/// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
+/// device-removed reports: a shader indexing a heap past its end faults.
+static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
+
+/// For device-removed reports: where host GPU address `va` lies against
+/// the host descriptor heaps.
+pub(crate) fn near_heaps(va: u64) -> String {
+    let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = String::new();
+    for &(start, bytes, step, sampler) in ranges.iter() {
+        let kind = if sampler { "sampler" } else { "view" };
+        let place = if va < start {
+            format!("{:#x} below", start - va)
+        } else if va < start + bytes {
+            format!("inside, slot {}", (va - start) / step)
+        } else {
+            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
+        };
+        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
+    }
+    text
+}
+
 /// A GFX10 buffer descriptor's dword 3 for raw access: X Y Z W selects, a
 /// 32-bit float format, raw out-of-range checking, resource level 1. The
 /// address and size in dwords 0 to 2 are what programs read.
