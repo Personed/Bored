@@ -404,11 +404,11 @@ mod gpu {
             0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
             0x1602_00B0, // v_mul_u32_u24 v1, 48, v0
             0xE038_1000,
-            0x0002_0201, // buffer_load_dwordx4 v[2:5], v1, s[8:11], 0 offen
+            0x8002_0201, // buffer_load_dwordx4 v[2:5], v1, s[8:11], 0 offen
             0xE038_1010,
-            0x0002_0601, // buffer_load_dwordx4 v[6:9], v1, s[8:11], 0 offen offset:16
+            0x8002_0601, // buffer_load_dwordx4 v[6:9], v1, s[8:11], 0 offen offset:16
             0xE038_1020,
-            0x0002_0A01, // buffer_load_dwordx4 v[10:13], v1, s[8:11], 0 offen offset:32
+            0x8002_0A01, // buffer_load_dwordx4 v[10:13], v1, s[8:11], 0 offen offset:32
             0xBE90_03FF,
             desc0, // s_mov_b32 s16, desc0
             0xBE91_03FF,
@@ -420,7 +420,7 @@ mod gpu {
             0x0004_0E02,
             0x3402_0084, // v_lshlrev_b32 v1, 4, v0
             0xE078_1000,
-            0x0003_0E01, // buffer_store_dwordx4 v[14:17], v1, s[12:15], 0 offen
+            0x8003_0E01, // buffer_store_dwordx4 v[14:17], v1, s[12:15], 0 offen
             0xBF81_0000, // s_endpgm
         ];
         let names: Vec<_> =
@@ -562,11 +562,11 @@ mod gpu {
         let rays: Vec<u32> = cases
             .iter()
             .flat_map(|(node, r)| {
-                // The operand's pointer is a qword.
-                let mut w = vec![*node, 0, r.extent.to_bits()];
+                let mut w = vec![*node, r.extent.to_bits()];
                 w.extend(f3(r.origin));
                 w.extend(f3(r.dir));
                 w.extend(f3(r.inv));
+                w.push(0);
                 w
             })
             .collect();
