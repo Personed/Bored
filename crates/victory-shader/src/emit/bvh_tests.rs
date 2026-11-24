@@ -420,7 +420,7 @@ mod gpu {
             0x0004_0E02,
             0x3402_0084, // v_lshlrev_b32 v1, 4, v0
             0xE078_1000,
-            0x8003_0E01, // buffer_store_dwordx4 v[14:17], v1, s[12:15], 0 offen
+            0x8003_0201, // DIAGNOSTIC buffer_store_dwordx4 v[2:5], v1, s[12:15], 0 offen
             0xBF81_0000, // s_endpgm
         ];
         let names: Vec<_> =
