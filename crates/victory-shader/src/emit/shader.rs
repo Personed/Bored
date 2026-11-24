@@ -67,10 +67,9 @@ pub(crate) struct Shader {
     pub mesh: Option<Mesh>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
-    /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
-    pub samplers: u32,
-    /// Bit n: immediate sampler n is a comparison sampler.
-    pub cmp_samplers: u64,
+    /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`]: `true` when
+    /// the sampler is a comparison sampler.
+    pub samplers: Vec<bool>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -130,8 +129,7 @@ impl Shader {
             prims: Vec::new(),
             mesh: None,
             user_data: 0,
-            samplers: 0,
-            cmp_samplers: 0,
+            samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             address_map: None,
@@ -294,9 +292,9 @@ impl Shader {
         h
     }
 
-    /// The handle of immediate sampler `n` (a comparison sampler when its
-    /// bit in `cmp_samplers` is set).
-    pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
+    /// The handle of immediate sampler `n` (a comparison sampler when
+    /// `comparison` is set).
+    pub fn sampler_handle(&mut self, block: usize, n: u32, comparison: bool) -> V {
         let bind = [
             self.m.i32(n),
             self.m.i32(n),
@@ -313,11 +311,7 @@ impl Shader {
             217,
             &[bind, i, f],
         );
-        let cmp = if self.cmp_samplers >> n & 1 != 0 {
-            0x8000
-        } else {
-            0
-        };
+        let cmp = if comparison { 0x8000 } else { 0 };
         self.annotate(block, h, 14 | cmp, 0)
     }
 
@@ -373,7 +367,7 @@ impl Shader {
             s.m.md_value(c)
         };
         if self.user_data > 0
-            || self.samplers > 0
+            || !self.samplers.is_empty()
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || self.address_map.is_some()
@@ -474,13 +468,14 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut samplers = None;
-            if self.samplers > 0 {
+            if !self.samplers.is_empty() {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for n in 0..self.samplers {
-                    let kind = (self.cmp_samplers >> n & 1) as u32;
+                for n in 0..self.samplers.len() {
+                    let kind = u32::from(self.samplers[n]);
+                    let n = n as u32;
                     let ops = vec![
                         Some(i32c(&mut self, n)),
                         Some(self.m.md_value(u)),
