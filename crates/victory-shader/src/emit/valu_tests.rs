@@ -2245,3 +2245,29 @@ fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
         });
     }
 }
+
+#[test]
+fn pr1084_blob_pipeline() {
+    let bytes = include_bytes!("pr1084_cndmask.dxil").to_vec();
+    let cs = HostShader {
+        stage: HwStage::Cs,
+        dxil: bytes,
+        user_data: vec![],
+        samplers: vec![],
+        static_samplers: vec![],
+        root_cbvs: vec![],
+        root_srvs: vec![],
+        address_map: false,
+        descriptor_words: false,
+    };
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no {label} device");
+            continue;
+        };
+        match host.compute_pipeline(&cs) {
+            Ok(_) => eprintln!("{label}: pipeline OK"),
+            Err(e) => eprintln!("{label}: {e}"),
+        }
+    }
+}
