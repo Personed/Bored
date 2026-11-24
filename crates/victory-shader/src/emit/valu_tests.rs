@@ -1749,3 +1749,56 @@ fn signed_scalar_add_sub_scc_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn scalar_add_i32_scc_controls_branch() {
+    run_signed_scc_cases(
+        "s_add_i32",
+        &[sop2(0x02, 6, 0, 1)],
+        &[(i32::MAX, 1), (i32::MIN, -1), (-1, 1), (8, 5)],
+        i32::overflowing_add,
+    );
+}
+
+#[test]
+fn scalar_sub_i32_scc_controls_branch() {
+    run_signed_scc_cases(
+        "s_sub_i32",
+        &[sop2(0x03, 6, 0, 1)],
+        &[(i32::MIN, 1), (i32::MAX, -1), (0, 1), (-8, -3)],
+        i32::overflowing_sub,
+    );
+}
+
+#[test]
+fn scalar_addk_i32_scc_controls_branch() {
+    for imm in [-1i16, 1] {
+        let addk_s6 = 0xB000_0000 | 0x0F << 23 | 6 << 16 | u32::from(imm as u16);
+        run_signed_scc_cases(
+            "s_addk_i32",
+            &[s_mov_b32(6, 0), addk_s6],
+            &[(i32::MIN, 0), (i32::MAX, 0), (-1, 0), (8, 0)],
+            |a, _| a.overflowing_add(i32::from(imm)),
+        );
+    }
+}
+
+#[test]
+fn paired_lds_write2_b32() {
+    check_lds_paired_write("ds_write2_b32", 0x0E, 1, false);
+}
+
+#[test]
+fn paired_lds_write2st64_b32() {
+    check_lds_paired_write("ds_write2st64_b32", 0x0F, 1, true);
+}
+
+#[test]
+fn paired_lds_write2_b64() {
+    check_lds_paired_write("ds_write2_b64", 0x4E, 2, false);
+}
+
+#[test]
+fn paired_lds_write2st64_b64() {
+    check_lds_paired_write("ds_write2st64_b64", 0x4F, 2, true);
+}
