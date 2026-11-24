@@ -57,6 +57,10 @@ fn build() -> &'static [u8; BUILD_LEN] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // Breadcrumbs change the code; off, the key is what it was.
+                if victory_shader::emit::breadcrumbs() {
+                    bytes.extend_from_slice(b"breadcrumbs");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
