@@ -137,6 +137,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        crumbs: None,
     })
     .expect("lower");
 
@@ -174,11 +175,22 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
+}
+
+/// `run_cases` on the given backends only (WARP cannot pin a wave size, which
+/// the lane-aware programs ask for).
+fn run_cases_on(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    backends: &[(&str, bool)],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for &(label, warp) in backends {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -212,6 +224,56 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// `run_cases_on`, but a backend whose driver rejects the pipeline is skipped
+/// instead of failing the test. For shaders no available adapter can build —
+/// the test then verifies nothing, which it reports.
+fn run_cases_lenient(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    backends: &[(&str, bool)],
+    mut check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for &(label, warp) in backends {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(shader) else {
+            eprintln!("{label}: driver rejected the pipeline; skipped");
+            continue;
+        };
+        for (i, &inputs) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            check(label, i, inputs, out[0][0]);
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no backend could build the pipeline; cases untested");
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
@@ -1983,6 +2045,7 @@ fn build_test_cs(body: &[u32], compute: ComputeIo, result_store: &[u32]) -> Host
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        crumbs: None,
     })
     .expect("lower");
 
@@ -2200,4 +2263,36 @@ fn v_cmp_16bit_ignores_vop3_op_sel() {
             inp[0], inp[1],
         );
     });
+}
+/// A select whose mask is a plain SGPR (here a root constant), so the
+/// structure pass does not follow it: this lane takes its own bit of the
+/// number. Inline 0 and -1 masks pick src0 and src1 in every lane.
+#[test]
+fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
+    // v_cndmask_b32_e64 v0, v1, v2, <mask> (VOP3 0x101); s3 holds the mask.
+    // The lane bit comes out of waveGetLaneIndex; where every available
+    // adapter rejects the emitted compute pipeline the cases stay untested
+    // (upstream CI has no GPU: its drivers reject this shader outright).
+    let from_sgpr = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), sgpr(3)));
+    let hw = &[("hardware", false), ("warp", true)];
+    run_cases_lenient(
+        &from_sgpr,
+        &[
+            [10, 20, 0, 0],
+            [10, 20, 0, 1],
+            [10, 20, 0, 2],
+            [10, 20, 0, !0],
+        ],
+        hw,
+        |label, i, inp, got| {
+            let want = if inp[3] & 1 != 0 { inp[1] } else { inp[0] };
+            assert_eq!(got, want, "{label} case {i}");
+        },
+    );
+    for (mask, pick) in [(128u16, 0usize), (193, 1)] {
+        let k = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), mask));
+        run_cases_lenient(&k, &[[10, 20, 0, 0]], hw, |label, _, inp, got| {
+            assert_eq!(got, inp[pick], "{label} inline {mask}");
+        });
+    }
 }

@@ -49,6 +49,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Heap handles annotated as constant buffers.
+    #[cfg(test)]
+    pub cbuffer_handles: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -65,6 +68,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// With breadcrumbs (see [`super::breadcrumbs`]): the shader's slot.
+    pub crumbs: Option<u32>,
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
@@ -256,6 +261,9 @@ struct Lower<'a> {
     /// so the function has a single exit as DXC emits it (dxil-spirv, under
     /// Proton, cannot structure a loop left by both a break and a return).
     ret: Option<usize>,
+    /// Breadcrumbs: the loops that store their count, by header, in the
+    /// order met (the word each owns in the shader's slot).
+    crumb_loops: HashMap<usize, u32>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -380,6 +388,35 @@ fn unsupported(offset: usize, what: Why) -> ShaderError {
 /// atomic operation code.
 const ATOMIC_LOOP: u32 = u32::MAX - 1;
 
+/// Why dword `rel` of a GFX10 image (`image`) or buffer descriptor has no
+/// value when the program reads it as a number: what the dword holds.
+/// `None` past the descriptor.
+fn descriptor_field(image: bool, rel: u32) -> Option<Why> {
+    Some(match (image, rel) {
+        (true, 0) => "an image descriptor's address read as data",
+        (true, 5) => "an image descriptor's array pitch or mip limits read as data",
+        (true, 6) => "an image descriptor's compression fields read as data",
+        (true, 7) => "an image descriptor's metadata address read as data",
+        (false, 0) => "a buffer descriptor's address read as data",
+        (false, 1) => "a buffer descriptor's stride or high address read as data",
+        (false, 3) => "a buffer descriptor's format or swizzle read as data",
+        _ => return None,
+    })
+}
+
+/// Why a scalar memory instruction other than a load of dwords has no
+/// value here, named by what it is.
+fn smem_reason(name: &str) -> Why {
+    match name {
+        "s_memtime" | "s_memrealtime" => "a timestamp read as data",
+        "s_get_waveid_in_workgroup" => "a wave's index in its group read as data",
+        "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => "a scalar cache instruction",
+        n if n.contains("_store_") => "a scalar memory store",
+        n if n.starts_with("s_scratch_load") => "a scalar scratch load",
+        _ => "a scalar memory read as data",
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>) -> Self {
         let p = x.p;
@@ -411,7 +448,13 @@ impl<'a> Lower<'a> {
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(
+                        n,
+                        "v_readlane_b32"
+                            | "v_writelane_b32"
+                            | "v_permlane16_b32"
+                            | "v_permlanex16_b32"
+                    )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
@@ -436,6 +479,22 @@ impl<'a> Lower<'a> {
                         .support(g)
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                }) || insts().any(|i| {
+                    matches!(
+                        i.name(),
+                        "v_cndmask_b32"
+                            | "v_add_co_ci_u32"
+                            | "v_sub_co_ci_u32"
+                            | "v_subrev_co_ci_u32"
+                    ) && match &i.fields {
+                        Fields::Valu(v) => match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) => i
+                                .read(Reg::S(code))
+                                .is_none_or(|m| !x.st.masks.contains_key(&m)),
+                            _ => false,
+                        },
+                        _ => false,
+                    }
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -514,6 +573,7 @@ impl<'a> Lower<'a> {
             sinks: Vec::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
+            crumb_loops: HashMap::new(),
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -965,6 +1025,8 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+            // A breadcrumb may have ended the block (a back edge's counting).
+            self.tail[b] = Some(self.cur);
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
@@ -983,6 +1045,8 @@ impl<'a> Lower<'a> {
             descriptor_words,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            cbuffer_handles: self.s.cbuffer_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -1310,15 +1374,19 @@ impl<'a> Lower<'a> {
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword;
-        self.user_reads.insert(
+        let data = UserData {
             index,
-            UserData {
-                index,
-                slot: rp.slot,
-                root: rp.root,
-                dword,
-            },
-        );
+            slot: rp.slot,
+            root: rp.root,
+            dword,
+        };
+        Val::I32(self.user_dword(data))
+    }
+
+    /// The entry-block load of user-data dword `data`.
+    fn user_dword(&mut self, data: UserData) -> V {
+        let index = data.index;
+        self.user_reads.insert(index, data);
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -1338,7 +1406,7 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
     }
 
     fn extend_cur_reads(&mut self, extra: &[ReadDep]) {
@@ -1964,6 +2032,62 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+        }
+    }
+
+    /// The mask operand of a select or carry-in as a per-lane boolean: a
+    /// tracked mask, this lane's bit of an untracked SGPR mask (console
+    /// lanes only), or an inline constant.
+    fn mask_cond(
+        &mut self,
+        inst: &Inst,
+        op: Option<&Operand>,
+        at: usize,
+        err: Why,
+    ) -> Result<V, Why> {
+        match op {
+            Some(&Operand::Scalar { code, .. }) => {
+                if let Some(m) = inst.read(Reg::S(code)).and_then(|m| {
+                    self.x
+                        .st
+                        .masks
+                        .get(&m)
+                        .or_else(|| self.x.st.other.get(&m))
+                        .copied()
+                }) {
+                    return self.boolean(m, at);
+                }
+                if !self.console_lanes {
+                    return Err(err);
+                }
+                let lo = inst.read(Reg::S(code)).ok_or(err)?;
+                let lo = self.i32_of(lo)?;
+                let hi = if self.x.native.wave64 {
+                    match inst.read(Reg::S(code + 1)) {
+                        Some(v) => Some(self.i32_of(v)?),
+                        None => Some(self.s.m.i32(0)),
+                    }
+                } else {
+                    None
+                };
+                self.s.flags |= flags::WAVE_OPS;
+                Ok(self.lane_bit(at, lo, hi))
+            }
+            Some(&Operand::Const(k)) => {
+                let x = crate::resource::inline(k).ok_or(err)?;
+                if x == 0 {
+                    Ok(self.s.m.bool(false))
+                } else if x == u32::MAX {
+                    Ok(self.s.m.bool(true))
+                } else if self.console_lanes {
+                    let lo = self.s.m.i32(x);
+                    let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                    Ok(self.lane_bit(at, lo, Some(hi)))
+                } else {
+                    Err(err)
+                }
+            }
+            _ => Err(err),
         }
     }
 
@@ -3346,11 +3470,15 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A raw view, read only or not; a constant buffer otherwise. (A
-        // UAV read through a constant buffer handle removes the device.)
+        // A raw view for an SRV range. A descriptor of no listed kind (one
+        // fetched from the heap by index) that vector buffer accesses use is
+        // a buffer view in the title's heap too: an SRV if they only read
+        // it, a UAV if one writes it. Reading either slot through a
+        // constant buffer handle is a descriptor of the wrong type.
         let raw = match kind.map(|u| u.kind) {
             Some(ResourceType::Srv) => Some(11),
             Some(ResourceType::Uav) => Some(11 | 0x1000),
+            None => self.heap_buffer_view(src),
             _ => None,
         };
         if let Some(props) = raw {
@@ -3428,7 +3556,9 @@ impl<'a> Lower<'a> {
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
+    // stops the program. So does reading any dword of a descriptor that
+    // scalar buffer loads use first; its reasons name the dword and the
+    // view's kind.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -3436,7 +3566,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err(smem_reason(inst.name()));
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -3444,30 +3574,43 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(smem_reason(inst.name())),
         };
         // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        let uses: Vec<(Site, u8)> = self
             .x
             .res
             .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
+            .filter_map(|d| {
                 d.source.leaves().into_iter().find_map(|l| match *l {
                     Source::Loaded { load, first } if load == site => Some((d.site, first)),
                     _ => None,
                 })
-            });
+            })
+            .collect();
         // A load read only for its numbers (sizes for a mip level, say):
         // another load of the same entry, used as a resource, tells its kind.
-        let Some((at, first)) = use_at.or_else(|| self.same_entry_use(site)) else {
-            // No access names it: the console words are all there is.
-            let words = self.descriptor_words(site, count)?;
-            for (k, x) in words.into_iter().enumerate() {
-                self.write(inst, Reg::S(code + k as u8), x, None);
+        let Some((at, first)) = uses.first().copied().or_else(|| self.same_entry_use(site)) else {
+            // A load through a root view's address reads that buffer's
+            // memory, not a descriptor.
+            let root_view = self
+                .scalar
+                .get(&site)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::Descriptor);
+            if root_view {
+                return Err("a root view's memory read with scalar loads");
             }
-            return Ok(());
+            if let Ok(words) = self.descriptor_words(site, count) {
+                // No access names it: the console words are all there is.
+                for (k, x) in words.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
+            return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -3505,13 +3648,43 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
-            Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+            Fields::Smem { .. } => {
+                // Scalar buffer loads (`s_buffer_load_dword*`) read through
+                // it first. Each dword gets the reason for what it holds,
+                // as an error here would give every dword one reason.
+                let vector_later = uses[1..].iter().any(|&(s, _)| {
+                    matches!(
+                        self.x.p.blocks[s.0].insts[s.1].fields,
+                        Fields::Image { .. } | Fields::Buffer { .. }
+                    )
+                });
+                let records = match used.map(|u| (u.kind, u.stride)) {
+                    _ if vector_later => {
+                        "a descriptor read as data, used by scalar loads before a vector access"
+                    }
+                    Some((ResourceType::Srv, 0)) => {
+                        "a scalar-loaded raw buffer's record count read as data"
+                    }
+                    Some((ResourceType::Srv, _)) => {
+                        "a scalar-loaded structured buffer's record count read as data"
+                    }
+                    Some((ResourceType::Cbv, _)) => {
+                        "a scalar-loaded constant buffer's record count read as data"
+                    }
+                    _ => "a scalar-loaded buffer's record count read as data",
+                };
+                for k in 0..count {
+                    let why = match k.wrapping_sub(u32::from(first)) {
+                        2 => records,
+                        _ => "a scalar-loaded buffer's address or format read as data",
+                    };
+                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        self.vals.insert(v, Val::Missing(why));
+                    }
                 }
-                ((11 | u, 0), None)
+                return Ok(());
             }
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err("a descriptor read as data by an unknown access"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -3581,7 +3754,8 @@ impl<'a> Lower<'a> {
                 (None, Some(c)) => self.write(inst, Reg::S(code + k as u8), c[k as usize], None),
                 (None, None) => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        let why = descriptor_field(image.is_some(), rel).unwrap_or(OTHER);
+                        self.vals.insert(v, Val::Missing(why));
                     }
                 }
             }
@@ -3652,7 +3826,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err(smem_reason(inst.name()));
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -3660,7 +3834,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(smem_reason(inst.name())),
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
@@ -3769,15 +3943,44 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// Correctly rounded f32 bits of `value / (2^n - 1)`, for a signed or
+    /// unsigned integer already clamped to the normalized range.
+    fn norm_bits(&mut self, value: V, n: u32) -> V {
+        let c = self.cur;
+        // All normalized fields fit in signed i32 and convert to f32 exactly.
+        let f = self.s.m.cast(c, Cast::SiToFp, value, self.s.t.f32);
+        let bits = self.as_int(f);
+        if n == 1 {
+            return bits;
+        }
+        // Start at |value| / 2^n. In units of its last place, its magnitude
+        // is the 24-bit significand M. Multiplying by 2^n / (2^n - 1)
+        // adds M / (2^n - 1) ULPs. The denominator is odd, so rounding the
+        // correction has no ties. Only a full-scale input reaches the next
+        // exponent, and adding the correction to the bits carries into it.
+        let mask = self.s.m.i32(0x7f_ffff);
+        let implicit = self.s.m.i32(1 << 23);
+        let fraction = self.s.m.bin(c, Bin::And, bits, mask);
+        let significand = self.s.m.bin(c, Bin::Or, fraction, implicit);
+        let max = (1 << n) - 1;
+        let half = self.s.m.i32(max / 2);
+        let divisor = self.s.m.i32(max);
+        let biased = self.s.m.bin(c, Bin::Add, significand, half);
+        let correction = self.s.m.bin(c, Bin::UDiv, biased, divisor);
+        let scale = self.s.m.i32(n << 23);
+        let base = self.s.m.bin(c, Bin::Sub, bits, scale);
+        let rounded = self.s.m.bin(c, Bin::Add, base, correction);
+        let zero = self.s.m.i32(0);
+        let is_zero = self.s.m.cmp(c, pred::EQ, value, zero);
+        self.s.m.select(c, is_zero, zero, rounded)
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    // bytes or more as dword-aligned.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -3836,20 +4039,13 @@ impl<'a> Lower<'a> {
             };
             let f32t = self.s.t.f32;
             let x = match numeric {
-                Numeric::Unorm => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    float(self, q)
-                }
+                Numeric::Unorm => self.norm_bits(field, w),
                 Numeric::Snorm => {
                     let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    let lo = self.s.m.f32((-1.0f32).to_bits());
-                    let q = self.binary(35, q, lo);
-                    float(self, q)
+                    let min = self.s.m.i32(1u32.wrapping_sub(1 << (w - 1)));
+                    let below = self.s.m.cmp(c, pred::SLT, s, min);
+                    let clamped = self.s.m.select(c, below, min, s);
+                    self.norm_bits(clamped, w - 1)
                 }
                 Numeric::Uscaled => {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
@@ -3903,6 +4099,31 @@ impl<'a> Lower<'a> {
             }
             _ => Ok((0, None)),
         }
+    }
+
+    /// The raw view kind of descriptor `src` as vector buffer accesses use
+    /// it: an SRV (11) if they only read it, a UAV (`11 | 0x1000`) if one
+    /// writes through it (a store or an atomic), `None` if none uses it.
+    fn heap_buffer_view(&self, src: &Source) -> Option<u32> {
+        let mut view = None;
+        for (&((b, i), sampler), &other) in &self.descriptors {
+            if sampler || other != src {
+                continue;
+            }
+            let Some(inst) = self.x.p.blocks[b].insts.get(i) else {
+                continue;
+            };
+            if !matches!(inst.fields, Fields::Buffer { .. }) {
+                continue;
+            }
+            let name = inst.name();
+            if name.starts_with("buffer_load") || name.starts_with("tbuffer_load") {
+                view.get_or_insert(11);
+            } else {
+                return Some(11 | 0x1000);
+            }
+        }
+        view
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -4021,30 +4242,10 @@ impl<'a> Lower<'a> {
                     _ => Err("a root UAV or typed root view"),
                 }
             }
-            Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
+            Source::Phi { .. } => {
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let prev_edge = self.cur_edge.replace((q, *block));
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur_edge = prev_edge;
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                let index = self.uniform_heap_index(src, sampler)?;
+                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -4071,6 +4272,37 @@ impl<'a> Lower<'a> {
                 let index = self.lane_heap_index(src, sampler)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
+        }
+    }
+
+    /// The heap index of a descriptor every lane shares, computed in the
+    /// current block. One chosen by control flow is a phi at its join of the
+    /// index each predecessor computes at its end; an edge may bring another
+    /// join's (nested if/else).
+    fn uniform_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Phi { block, args } => {
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let prev_edge = self.cur_edge.replace((q, *block));
+                    let index = self.uniform_heap_index(arg, sampler);
+                    self.cur_edge = prev_edge;
+                    self.cur = here;
+                    incoming.push((index?, at));
+                }
+                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
+            }
+            _ => Err("a descriptor chosen by control flow"),
         }
     }
 
@@ -4819,38 +5051,8 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let cond = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => {
-                        let m = inst
-                            .read(Reg::S(code))
-                            .and_then(|m| {
-                                self.x
-                                    .st
-                                    .masks
-                                    .get(&m)
-                                    .or_else(|| self.x.st.other.get(&m))
-                                    .copied()
-                            })
-                            .ok_or("a select on an untracked mask")?;
-                        self.boolean(m, c)?
-                    }
-                    Some(&Operand::Const(k)) => {
-                        let x =
-                            crate::resource::inline(k).ok_or("a select on an untracked mask")?;
-                        if x == 0 {
-                            self.s.m.bool(false)
-                        } else if x == u32::MAX {
-                            self.s.m.bool(true)
-                        } else if self.console_lanes {
-                            let lo = self.s.m.i32(x);
-                            let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
-                            self.lane_bit(c, lo, Some(hi))
-                        } else {
-                            return Err("a constant lane mask");
-                        }
-                    }
-                    _ => return Err("a select on an untracked mask"),
-                };
+                let cond =
+                    self.mask_cond(inst, v.src.get(2), c, "a select on an untracked mask")?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
@@ -4868,14 +5070,12 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
-                    };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(self.mask_cond(
+                        inst,
+                        v.src.get(2),
+                        c,
+                        "a carry-in from an untracked mask",
+                    )?)
                 } else {
                     None
                 };
@@ -4919,6 +5119,37 @@ impl<'a> Lower<'a> {
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
+                int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                self.cross_lane(false)?;
+                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let me = self.lane_index();
+                let k8 = self.s.m.i32(8);
+                let k7 = self.s.m.i32(7);
+                let k4 = self.s.m.i32(4);
+                let k15 = self.s.m.i32(15);
+                let zero = self.s.m.i32(0);
+                let hi_half = self.s.m.bin(c, Bin::And, me, k8);
+                let use_s2 = self.s.m.cmp(c, pred::NE, hi_half, zero);
+                let sel_word = self.s.m.select(c, use_s2, s2, s1);
+                let lane_in_8 = self.s.m.bin(c, Bin::And, me, k7);
+                let sh = self.s.m.bin(c, Bin::Mul, lane_in_8, k4);
+                let shifted = self.s.m.bin(c, Bin::LShr, sel_word, sh);
+                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
+                let base = if name == "v_permlanex16_b32" {
+                    let mask = self.s.m.i32(!31u32);
+                    let row = self.s.m.bin(c, Bin::And, me, mask);
+                    let k16 = self.s.m.i32(16);
+                    let half = self.s.m.bin(c, Bin::And, me, k16);
+                    let other_half = self.s.m.bin(c, Bin::Xor, half, k16);
+                    self.s.m.bin(c, Bin::Or, row, other_half)
+                } else {
+                    let mask = self.s.m.i32(!15u32);
+                    self.s.m.bin(c, Bin::And, me, mask)
+                };
+                let lane = self.s.m.bin(c, Bin::Or, base, pick);
+                let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_readfirstlane_b32"
@@ -7959,12 +8190,76 @@ impl<'a> Lower<'a> {
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         let limit = self.s.m.i32(super::loop_limit());
+        // The breadcrumb may end the block (a store of one lane), so the
+        // back edge leaves from where it ends.
+        self.crumb(to, next);
+        let c = self.cur;
         self.counters
             .get_mut(&to)
             .expect("header")
             .1
             .push((next, c));
         self.s.m.cmp(c, p, next, limit)
+    }
+
+    /// Breadcrumbs (see [`super::breadcrumbs`]): the count of the loop at
+    /// header `to` goes to its word of the shader's slot, as the largest
+    /// any lane reached: the wave's largest, stored by its first active lane
+    /// (one atomic a wave, not one a lane). The buffer's UAV is the view
+    /// heap's entry at the index in the first user-data dword past the
+    /// console's.
+    fn crumb(&mut self, to: usize, count: V) {
+        let Some(slot) = self.x.crumbs else { return };
+        let next = self.crumb_loops.len() as u32;
+        let n = *self.crumb_loops.entry(to).or_insert(next);
+        if n >= super::BREADCRUMB_LOOPS {
+            return;
+        }
+        let first = self
+            .x
+            .native
+            .layout
+            .iter()
+            .map(|r| u32::from(r.user_data) + r.sgprs)
+            .max()
+            .unwrap_or(0);
+        let index = self.user_dword(UserData {
+            index: first,
+            slot: 0,
+            root: super::BREADCRUMB_ROOT,
+            dword: 0,
+        });
+        let c = self.cur;
+        let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
+        self.s.flags |= flags::WAVE_OPS;
+        // The largest count of the lanes that take the back edge (unsigned max).
+        let (k, u) = (self.s.m.i8(3), self.s.m.i8(1));
+        let count = self.s.op(
+            c,
+            "waveActiveOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            119,
+            &[count, k, u],
+        );
+        let first = self
+            .s
+            .op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        let guarded = self.begin_guarded(Some(first));
+        let c = self.cur;
+        // A raw buffer UAV (`atomicMax`, operation 7, at the word's byte offset).
+        let h = self.s.heap_handle(c, index, false, false, (11 | 0x1000, 0));
+        let at = self.s.m.i32((slot * super::BREADCRUMB_LOOPS + n) * 4);
+        let (op, unused) = (self.s.m.i32(7), self.s.m.undef(i32t));
+        self.s.op(
+            c,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, op, at, unused, unused, count],
+        );
+        self.end_guarded(guarded, &[]);
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
@@ -8316,6 +8611,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            crumbs: None,
         })
         .map(|_| ())
     }
@@ -8366,7 +8662,80 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            crumbs: None,
         })
+    }
+
+    /// A counted loop (`s5` from 0 to 4) in a compute program with one root
+    /// constant in `s0`, lowered with breadcrumbs for `crumbs`.
+    fn counted_loop(crumbs: Option<u32>) -> Lowered {
+        let words = [
+            0xBE85_0380u32, // s_mov_b32 s5, 0
+            0x8005_8105,    // s_add_u32 s5, s5, 1
+            0xBF0A_8405,    // s_cmp_lt_u32 s5, 4
+            0xBF85_FFFD,    // s_cbranch_scc1 -3
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![root(RootType::Constants, 0, 0)],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            crumbs,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn breadcrumbs_add_a_loop_store_and_one_user_data_dword() {
+        let plain = counted_loop(None);
+        assert!(
+            plain
+                .user_data
+                .iter()
+                .all(|u| u.root != crate::emit::BREADCRUMB_ROOT)
+        );
+        let crumbs = counted_loop(Some(7));
+        // The store (and the heap handle it goes through) are in the module.
+        assert!(crumbs.dxil.len() > plain.dxil.len());
+        assert!(crumbs.wave_ops && !plain.wave_ops);
+        // The first dword past the console's (one root constant: s0).
+        let heap_index: Vec<_> = crumbs
+            .user_data
+            .iter()
+            .filter(|u| u.root == crate::emit::BREADCRUMB_ROOT)
+            .collect();
+        assert_eq!(heap_index.len(), 1);
+        assert_eq!(heap_index[0].index, 1);
+        // Everything else is unchanged.
+        assert_eq!(
+            crumbs.user_data.len(),
+            plain.user_data.len() + 1,
+            "{:?}",
+            crumbs.user_data
+        );
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
@@ -8488,6 +8857,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            crumbs: None,
         })
         .unwrap();
 
@@ -8510,6 +8880,70 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    #[test]
+    fn scalar_loads_through_a_heap_buffer_that_vector_accesses_use_read_a_buffer_view() {
+        // A descriptor from the resource heap (s0) at an index from a root
+        // constant (s1), read by a scalar buffer load, then used by nothing
+        // else, by a vector buffer load, or by a vector buffer store. A slot
+        // that vector accesses use is a buffer view (an SRV if they only
+        // read it, a UAV if one writes it), so the scalar load must not read
+        // it through a constant buffer handle (a descriptor of the wrong
+        // type). With no other use, nothing says it isn't a CBV.
+        #[derive(Clone, Copy)]
+        enum Also {
+            Nothing,
+            Load,
+            Store,
+        }
+        let program = |also: Also| {
+            let mut words = vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0x8F06_8501, // s_lshl_b32 s6, s1, 5
+                0xF408_0202,
+                0x0C00_0000, // s_load_dwordx4 s[8:11], s[4:5], s6
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF420_0304,
+                0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0x0
+                0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+                0x7E02_020C, // v_mov_b32 v1, s12
+            ];
+            match also {
+                Also::Nothing => {}
+                Also::Load => words.extend([
+                    0xE030_1000,
+                    0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 offen
+                    0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+                    0x4A02_0302, // v_add_nc_u32 v1, v2, v1
+                ]),
+                Also::Store => words.extend([
+                    0xE070_1000,
+                    0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+                ]),
+            }
+            words.extend([
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]);
+            words
+        };
+        let layout = || {
+            vec![
+                root(RootType::ResourceHeap, 0, 0),
+                root(RootType::Constants, 1, 1),
+            ]
+        };
+        let cbuffers = |also| {
+            lower_with(&program(also), layout(), vec![])
+                .unwrap()
+                .cbuffer_handles
+        };
+        assert_eq!(cbuffers(Also::Nothing), 1, "no other use: a CBV");
+        assert_eq!(cbuffers(Also::Load), 0, "buffer_load: an SRV");
+        assert_eq!(cbuffers(Also::Store), 0, "buffer_store: a UAV");
     }
 
     #[test]
@@ -8746,6 +9180,54 @@ mod tests {
     }
 
     #[test]
+    fn descriptors_joined_by_nested_control_flow_lower_to_one_uniform_handle() {
+        // The view table at s0 (2D textures at entries 0 and 1, a raw UAV at
+        // dword 16) and a root constant at s1: entry 0 if s1 is 0, else
+        // entry 1 if it is 1, else entry 0 again, the inner if/else joined
+        // before the outer one. The join's edges are a load and a join.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF84_0003, // s_cbranch_scc0 -> 0x38
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBF82_0008, // s_branch -> 0x58
+            0xBF06_8101, // 0x38: s_cmp_eq_u32 s1, 1
+            0xBF84_0003, // s_cbranch_scc0 -> 0x4c
+            0xF40C_0302,
+            0xFA00_0020, // s_load_dwordx8 s[12:19], s[4:5], 0x20
+            0xBF82_0002, // s_branch -> 0x54
+            0xF40C_0302,
+            0xFA00_0000, // 0x4c: s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE86_0301, // 0x54: s_mov_b32 s6, s1
+            0x7E04_02F0, // 0x58: v_mov_b32 v2, 0.5
+            0x7E06_02F0, // v_mov_b32 v3, 0.5
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let l = lower_with(&words, layout, used).unwrap();
+        // One image handle from the joins' heap index, the same in all lanes.
+        assert_eq!(l.nonuniform_handles, 0);
+        validate_dxil(&l.dxil);
+    }
+
+    #[test]
     fn scalar_bit_tests_lower() {
         // Each tests one bit of a constant into SCC and branches on it (only
         // code with an effect needs its operands).
@@ -8863,7 +9345,7 @@ mod tests {
         let through_two_joins = reason(&words);
         assert_eq!(
             through_two_joins,
-            Some("a descriptor's address or format read as data")
+            Some("a buffer descriptor's stride or high address read as data")
         );
         words[13] = 0xBF82_0001; // skip the overwrite unconditionally: one join
         assert_eq!(through_two_joins, reason(&words));
@@ -9000,6 +9482,7 @@ mod tests {
                 outputs,
                 prims: vec![],
                 mesh_stride: 0,
+                crumbs: None,
             })
         };
         // Overwritten on the s0 != 0 branch: p1 never reaches exp.
@@ -9122,7 +9605,7 @@ mod tests {
         let Err(crate::ShaderError::Unsupported { what, .. }) = run(&words) else {
             panic!("live loop back-edge missing value must refuse");
         };
-        assert_eq!(what, "a scalar memory read as data");
+        assert_eq!(what, "a timestamp read as data");
     }
 
     #[test]
@@ -9304,8 +9787,254 @@ mod tests {
                 vec![],
                 false,
             ),
-            "a scalar memory read as data",
+            "a timestamp read as data",
         );
+    }
+
+    /// The names `words` decode to, to check hand-written encodings.
+    fn names(words: &[u32]) -> Vec<&'static str> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        p.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter().map(|i| i.name()))
+            .collect()
+    }
+
+    /// The reason a program stops, or `None` if it translates.
+    fn refusal(r: Result<Lowered, crate::ShaderError>) -> Option<&'static str> {
+        match r {
+            Ok(_) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// A descriptor table at s0 whose first entry is a buffer of `kind`
+    /// and `stride`.
+    fn buffer_table(kind: ResourceType, stride: u32) -> (Vec<RootParam>, Vec<UsedResource>) {
+        let used = UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        (vec![root(RootType::Table, 0, 0)], vec![used])
+    }
+
+    #[test]
+    fn scalar_loaded_buffer_descriptors_read_as_data_name_the_dword_and_kind() {
+        // A buffer descriptor that scalar buffer loads read through, one
+        // of whose dwords is also stored as a number.
+        let program = |word: u32| {
+            vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0xF420_0304,
+                0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+                word,        // v_mov_b32 v1, s10 (dword 2) or s8 (dword 0)
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let (dword2, dword0) = (0x7E02_020A, 0x7E02_0208);
+        assert_eq!(
+            names(&program(dword2)),
+            [
+                "s_mov_b32",
+                "s_mov_b32",
+                "s_load_dwordx4",
+                "s_buffer_load_dword",
+                "v_mov_b32",
+                "ds_write_b32",
+                "s_endpgm"
+            ]
+        );
+        let cases = [
+            (
+                ResourceType::Srv,
+                0,
+                "a scalar-loaded raw buffer's record count read as data",
+            ),
+            (
+                ResourceType::Srv,
+                16,
+                "a scalar-loaded structured buffer's record count read as data",
+            ),
+            (
+                ResourceType::Cbv,
+                0,
+                "a scalar-loaded constant buffer's record count read as data",
+            ),
+            (
+                ResourceType::Uav,
+                0,
+                "a scalar-loaded buffer's record count read as data",
+            ),
+        ];
+        for (kind, stride, want) in cases {
+            let (layout, used) = buffer_table(kind, stride);
+            let got = refusal(lower_with(&program(dword2), layout.clone(), used.clone()));
+            assert_eq!(got, Some(want), "{kind:?}, stride {stride}");
+            assert_eq!(
+                refusal(lower_with(&program(dword0), layout, used)),
+                Some("a scalar-loaded buffer's address or format read as data"),
+                "{kind:?}, stride {stride}"
+            );
+        }
+        // The same descriptor also read by a vector load later: the record
+        // count has a host value once that use decides the view.
+        let mut words = program(dword2);
+        words.splice(
+            6..6,
+            [
+                0xE030_0000,
+                0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0
+            ],
+        );
+        assert!(names(&words).contains(&"buffer_load_dword"));
+        let (layout, used) = buffer_table(ResourceType::Srv, 0);
+        assert_eq!(
+            refusal(lower_with(&words, layout, used)),
+            Some("a descriptor read as data, used by scalar loads before a vector access")
+        );
+    }
+
+    #[test]
+    fn scalar_memory_that_is_no_descriptor_names_what_it_reads() {
+        // Each value stored to LDS, so that the program needs it.
+        let program = |op: [u32; 2], sgpr: u32| {
+            vec![
+                op[0],
+                op[1],
+                0x7E02_0200 | sgpr, // v_mov_b32 v1, s<sgpr>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let cases = [
+            ([0xF490_0180, 0], "s_memtime", "a timestamp read as data"),
+            (
+                [0xF494_0180, 0],
+                "s_memrealtime",
+                "a timestamp read as data",
+            ),
+            (
+                [0xF4A8_0180, 0],
+                "s_get_waveid_in_workgroup",
+                "a wave's index in its group read as data",
+            ),
+        ];
+        for (op, name, want) in cases {
+            let words = program(op, 6);
+            assert_eq!(names(&words)[0], name);
+            assert_eq!(
+                refusal(lower_with(&words, vec![], vec![])),
+                Some(want),
+                "{name}"
+            );
+        }
+        // A load through a root view's address (s[0:1]) reads that
+        // buffer's memory (`root_view_smem` lowers it); one from a table
+        // with no use reads a descriptor.
+        let root_view = program([0xF400_0180, 0xFA00_0000], 6); // s_load_dword s6, s[0:1], null
+        assert_eq!(names(&root_view)[0], "s_load_dword");
+        lower_with(&root_view, vec![root(RootType::Descriptor, 0, 0)], vec![])
+            .expect("a root view's memory read by scalar loads lowers");
+        // A table load with no resource use reads the bound descriptor
+        // words (ray tracing reads them for GPU addresses).
+        let mut table = vec![0xBE84_0300, 0xBE85_0380]; // s_mov_b32 s4, s0; s_mov_b32 s5, 0
+        table.extend(program([0xF400_0182, 0xFA00_0000], 6)); // s_load_dword s6, s[4:5], null
+        assert_eq!(names(&table)[2], "s_load_dword");
+        lower_with(&table, vec![root(RootType::Table, 0, 0)], vec![])
+            .expect("a descriptor read only as data gets the bound words");
+    }
+
+    #[test]
+    fn descriptor_dwords_read_as_data_name_what_they_hold() {
+        // An image descriptor that a sample uses and a buffer descriptor
+        // that a load uses, one dword of each stored as a number. Dwords
+        // the translation rebuilds from the host view translate.
+        let image = |sgpr: u32| {
+            vec![
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0301,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[2:3], null
+                0xBE84_0301, // s_mov_b32 s4, s1
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xF09C_0F08,
+                0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+                0x7E02_0200 | sgpr, // v_mov_b32 v1, s<sgpr>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(names(&image(12))[8], "image_sample_lz");
+        for (dword, want) in [
+            (0, Some("an image descriptor's address read as data")),
+            (2, None),
+            (
+                5,
+                Some("an image descriptor's array pitch or mip limits read as data"),
+            ),
+            (
+                6,
+                Some("an image descriptor's compression fields read as data"),
+            ),
+            (
+                7,
+                Some("an image descriptor's metadata address read as data"),
+            ),
+        ] {
+            let (layout, used) = texture_tables();
+            let got = refusal(lower_with(&image(12 + dword), layout, used));
+            assert_eq!(got, want, "image dword {dword}");
+        }
+        let buffer = |sgpr: u32| {
+            vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0xE030_0000,
+                0x8002_0100,        // buffer_load_dword v1, off, s[8:11], 0
+                0x7E02_0200 | sgpr, // v_mov_b32 v1, s<sgpr>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(names(&buffer(8))[3], "buffer_load_dword");
+        for (dword, want) in [
+            (0, Some("a buffer descriptor's address read as data")),
+            (
+                1,
+                Some("a buffer descriptor's stride or high address read as data"),
+            ),
+            (2, None),
+            (
+                3,
+                Some("a buffer descriptor's format or swizzle read as data"),
+            ),
+        ] {
+            let (layout, used) = buffer_table(ResourceType::Srv, 0);
+            let got = refusal(lower_with(&buffer(8 + dword), layout, used));
+            assert_eq!(got, want, "buffer dword {dword}");
+        }
     }
 
     #[test]
@@ -9444,6 +10173,7 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                crumbs: None,
             })
             .unwrap();
             let sfi0 = crate::dxbc::Container::parse(&emitted.dxil)
@@ -9454,5 +10184,16 @@ mod tests {
             let features = u64::from_le_bytes(sfi0.try_into().unwrap());
             assert_eq!(features & 0x8000, 0, "unexpected INT64 feature bit");
         }
+    }
+
+    #[test]
+    fn permlane16_lowers() {
+        let words = [
+            // v_permlanex16_b32 v2, v0, s0, s1 (VOP3 opcode 0x378)
+            0xD778_0002,
+            (1 << 18) | 0x100,
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).expect("v_permlanex16_b32 should lower");
     }
 }

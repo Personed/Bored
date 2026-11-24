@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod address_map;
+#[cfg(windows)]
+mod breadcrumb;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;

@@ -1,7 +1,7 @@
 //! The PC container around emitted DXIL: feature flags (`SFI0`), the
 //! signatures (`ISG1`, `OSG1`), pipeline state validation (`PSV0`) and the
-//! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
-//! the container hash that D3D12 checks.
+//! program (`DXIL`), laid out as validator versions 1.6 and 1.8 lay them out,
+//! plus the container hash that D3D12 checks.
 
 /// One signature element: one row (D3D12 links stages by semantic).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +97,9 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), then by name offset,
+    // not column (its `sort_sig`): rows of one register keep element order,
+    // apart from system values.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -167,9 +169,11 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Validator 1.8: runtime info 3 and the entry-point name.
+    pub validator18: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2, or 3 for validator 1.8.
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -185,8 +189,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
-    let mut info = [0u8; 48];
+    let info_size = if p.validator18 { 52 } else { 48 };
+    u32s(&mut out, &[info_size]);
+    let mut info = [0u8; 52];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
@@ -216,7 +221,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
     }
-    out.extend(info);
+    if p.validator18 {
+        // Runtime info 3 names the entry point at offset 1 in the strings.
+        info[48..52].copy_from_slice(&1u32.to_le_bytes());
+    }
+    out.extend(&info[..info_size as usize]);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -227,8 +236,13 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
-    let mut strings = vec![0u8];
+    // The optional entry point and arbitrary semantics (system values use ""),
+    // then indices.
+    let mut strings = if p.validator18 {
+        b"\0main\0".to_vec()
+    } else {
+        vec![0]
+    };
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
@@ -415,6 +429,7 @@ mod tests {
         Psv {
             stage,
             flag: false,
+            validator18: false,
             inputs: &[],
             outputs: &[],
             prims: &[],
@@ -441,7 +456,6 @@ mod tests {
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
     }
-
     #[test]
     fn hash_matches_synthetic_vectors_at_padding_boundaries() {
         // Calculated independently by applying MD5 compression to the
@@ -744,6 +758,7 @@ mod tests {
             bindings: &[],
             threads: [0; 3],
             wave_size: None,
+            validator18: false,
         });
         let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         let info_sz = u32_at(0) as usize;
@@ -801,5 +816,42 @@ mod tests {
         assert_eq!(row_name(0), "HI_HALF");
         assert_eq!(row_name(1), "LO_HALF");
         assert_eq!(row_name(2), "SECOND_ROW");
+    }
+
+    #[test]
+    fn rows_of_one_register_keep_element_order_not_column_order() {
+        let element = |name: &str, index, kind, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: if kind == 0 { 2 } else { 4 },
+            row: Some(row),
+            col,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        // As a vertex program declares them: a w channel before the xyz of
+        // the same register.
+        let elements = [
+            element("SV_Position", 0, 3, 0, 0, 4),
+            element("TEXCOORD", 3, 0, 1, 3, 1),
+            element("NORMAL", 0, 0, 1, 0, 3),
+        ];
+        let part = signature(&elements, false);
+        let rows: Vec<(u32, u32)> = (0..3)
+            .map(|r| {
+                let word = |k: usize| {
+                    let at = 8 + 32 * r + 4 * k;
+                    u32::from_le_bytes(part[at..at + 4].try_into().unwrap())
+                };
+                // Semantic index and register.
+                (word(2), word(5))
+            })
+            .collect();
+        // Register order, then name offset (element order here), as the
+        // validator writes them: TEXCOORD3 before NORMAL0 in register 1.
+        assert_eq!(rows, [(0, 0), (3, 1), (0, 1)]);
     }
 }

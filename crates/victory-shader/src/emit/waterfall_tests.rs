@@ -69,6 +69,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        crumbs: None,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -324,6 +325,28 @@ fn lanes_sample_after_vgpr_swap_and_word_extract() {
             0x03FE_1308,
             0x0706_0504, // v_perm_b32 v22, v8, v9, 0x07060504
             0x7E10_0316, // v_mov_b32 v8, v22
+        ],
+    );
+    let shader = build(&words, false);
+    let results = sampled(&shader);
+    assert!(!results.is_empty());
+    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+    for (label, red) in results {
+        assert_eq!(red, want, "{label}");
+    }
+}
+#[test]
+fn lanes_sample_their_arm_after_a_redundant_masked_write() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+    let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+    words.splice(
+        at..at,
+        [
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
+            0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+            0x7E08_0218, // v_mov_b32 v4, s24 (same word the then arm wrote)
+            0xBEFE_0312, // s_mov_b32 exec_lo, s18
         ],
     );
     let shader = build(&words, false);
