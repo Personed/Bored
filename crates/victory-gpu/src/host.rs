@@ -529,7 +529,8 @@ impl Host {
         // submitted. Preparing all preludes up front is incorrect when two
         // runs use the same shadow: the later prelude would assume a state
         // transition that the earlier command list has not executed yet.
-        for list in runs {
+        #[allow(unused_variables)]
+        for (i, list) in runs.iter().enumerate() {
             let mut group: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2);
             if let Some(prelude) = list.prelude() {
                 group.push(Some(prelude));
