@@ -87,6 +87,8 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod image_atomic_tests;
 mod lower;
+#[cfg(test)]
+mod mtbuf_tests;
 #[cfg(all(test, windows))]
 mod root_view_tests;
 mod sampler;
