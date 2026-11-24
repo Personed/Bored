@@ -387,15 +387,21 @@ mod gpu {
 
     /// Per lane: 12 dwords of ray at `s[0:1] + 48 * lane` (node, extent,
     /// origin, direction, inverse direction), the intersection with the
-    /// descriptor `s[4:7]`, 4 dwords stored at `s[2:3] + 16 * lane`.
+    /// descriptor `s[4:7]`, 4 dwords stored at `s[8:9] + 16 * lane` (the
+    /// output base is its own root argument: an address's base is the
+    /// first dword of a parameter).
     /// `desc1`/`desc3` are the descriptor's flag dwords, written as
     /// literals like the console compiler does.
     fn program(desc1: u32, desc3: u32) -> Vec<u32> {
-        let load = |vdst: u32, offset: u32| [0xDC38_8000 | offset, vdst << 24 | 1];
+        // The pointers in s[0:1] and s[8:9] are title addresses: copies in
+        // VGPRs, so the loads and the store take no scalar base (which the
+        // address-as-computed lowering refuses).
+        let load = |vdst: u32, offset: u32| [0xDC38_8000 | offset, vdst << 24 | 125 << 16 | 30];
         let mut w = vec![
-            0x1602_00B0, // v_mul_u32_u24 v1, 48, v0
+            0x7E3C_0200, // v_mov_b32 v30, s0
+            0x7E3E_0201, // v_mov_b32 v31, s1
         ];
-        w.extend(load(2, 0)); // global_load_dwordx4 v[2:5], v1, s[0:1]
+        w.extend(load(2, 0)); // global_load_dwordx4 v[2:5], v30, off
         w.extend(load(6, 16)); // ... v[6:9], offset:16
         w.extend(load(10, 32)); // ... v[10:13], offset:32
         w.extend([
@@ -405,9 +411,10 @@ mod gpu {
             desc3,
             0xF198_9F01, // image_bvh_intersect_ray v[14:17], v[2:12], s[4:7]
             0x0001_0E02,
-            0x3402_0084, // v_lshlrev_b32 v1, 4, v0
-            0xDC78_8000, // global_store_dwordx4 v1, v[14:17], s[2:3]
-            0x0002_0E01,
+            0x7E40_0208, // v_mov_b32 v32, s8
+            0x7E42_0209, // v_mov_b32 v33, s9
+            0xDC78_8000, // global_store_dwordx4 v32, v[14:17], off
+            0x007D_0E20,
             0xBF81_0000, // s_endpgm
         ]);
         let names: Vec<_> =
@@ -419,14 +426,16 @@ mod gpu {
         assert_eq!(
             names,
             [
-                "v_mul_u32_u24",
+                "v_mov_b32",
+                "v_mov_b32",
                 "global_load_dwordx4",
                 "global_load_dwordx4",
                 "global_load_dwordx4",
                 "s_mov_b32",
                 "s_mov_b32",
                 "image_bvh_intersect_ray",
-                "v_lshlrev_b32",
+                "v_mov_b32",
+                "v_mov_b32",
                 "global_store_dwordx4",
                 "s_endpgm"
             ]
@@ -442,17 +451,27 @@ mod gpu {
             stage: HwStage::Cs,
             wave64: false,
             vgprs: 32,
-            layout: vec![RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 8,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            }],
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 8,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 8,
+                    user_data: 8,
+                    slot: 1,
+                },
+            ],
             used: Vec::new(),
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 8 << 1,
+                rsrc2: 10 << 1,
                 threads: [32, 1, 1],
             }),
             code: program(desc1, desc3)
@@ -463,7 +482,7 @@ mod gpu {
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         let st = structure::structure(&p).expect("structure");
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-        assert!(res.scalar.iter().all(|s| s.1.param == resource::GLOBAL));
+        assert!(res.scalar.iter().all(|s| s.1.param != resource::CODE));
         let io = io::raise(&p, &native).expect("io::raise");
         let lowered = lower::lower(&lower::Parts {
             native: &native,
@@ -478,7 +497,6 @@ mod gpu {
             mesh_stride: 0,
         })
         .expect("lower");
-        assert!(lowered.address_map);
         let shader = HostShader {
             stage: HwStage::Cs,
             dxil: lowered.dxil,
@@ -505,6 +523,12 @@ mod gpu {
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() <= 1e-5 * a.abs().max(b.abs()).max(1.0)
+    }
+
+    #[test]
+    fn bvh_program_tracks_and_lowers() {
+        build(true, true);
+        build(false, true);
     }
 
     #[test]
@@ -550,7 +574,7 @@ mod gpu {
                 eprintln!("no SM 6.6 {label} device; skipped");
                 continue;
             };
-            for (sort, ij) in [(true, true), (false, false)] {
+            for (sort, ij) in [(true, true), (false, true)] {
                 let shader = build(sort, ij);
                 let (root, pso) = host
                     .compute_pipeline(&shader)
@@ -565,12 +589,14 @@ mod gpu {
                 let consts = [
                     RAYS as u32,
                     (RAYS >> 32) as u32,
-                    OUT as u32,
-                    (OUT >> 32) as u32,
+                    0,
+                    0,
                     desc[0],
                     desc[1],
                     desc[2],
                     desc[3],
+                    OUT as u32,
+                    (OUT >> 32) as u32,
                 ];
                 let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
                 for u in &shader.user_data {

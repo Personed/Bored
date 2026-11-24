@@ -10428,7 +10428,9 @@ impl<'a> Lower<'a> {
             }
             // Compare-exchange consumes a replacement followed by a comparand.
             let compare = code == u32::MAX;
-            let wide = match (compare, *dmask) {
+            // fcmpswap's loop compares against a second data dword.
+            let pair = compare || (code == ATOMIC_LOOP && op == "fcmpswap");
+            let wide = match (pair, *dmask) {
                 (false, 1) | (true, 3) => false,
                 (false, 3) | (true, 15) => true,
                 _ => return Err("an image atomic data mask"),
@@ -10442,8 +10444,6 @@ impl<'a> Lower<'a> {
                 return Err("image atomic data");
             };
             let width = if wide { 2 } else { 1 };
-            // fcmpswap's loop compares against a second data dword.
-            let pair = compare || (code == ATOMIC_LOOP && op == "fcmpswap");
             let vals = self.vgprs(inst, data, if pair { 2 * width } else { width })?;
             let (ty, component) = if wide {
                 self.s.flags |= flags::INT64
