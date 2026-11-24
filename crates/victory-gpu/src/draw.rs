@@ -51,6 +51,13 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// The root data sent to the host for one stage of the current draw.
+#[cfg(feature = "diagnostics")]
+struct BoundUserData {
+    values: Vec<u32>,
+    rebuilt_tables: Vec<(u8, u32)>,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -82,6 +89,9 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
     /// Address maps made in this list: title view heap, host GPU address.
     maps: Vec<(usize, u64)>,
+    /// The values sent to each stage for the next device-removed marker.
+    #[cfg(feature = "diagnostics")]
+    bound_user_data: Vec<BoundUserData>,
 }
 
 struct FreshTable {
@@ -151,6 +161,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .min(if srv { 1 << 20 } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
+        crate::list::ensure_shadow_state(list, &shadow, if srv { 0x40 | 0x80 } else { 0x1 });
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
@@ -389,6 +400,7 @@ impl State {
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 continue;
             };
+            crate::list::ensure_shadow_state(list, &shadow, 0x1);
             shadow.refresh(list, v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -407,6 +419,7 @@ impl State {
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 return false;
             };
+            crate::list::ensure_shadow_state(list, &shadow, 0x2);
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -436,6 +449,12 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        let record_bindings = crate::host::dred_on();
+        #[cfg(feature = "diagnostics")]
+        if record_bindings {
+            self.bound_user_data.clear();
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -490,8 +509,9 @@ impl State {
                 }
                 return false;
             };
+            let mut values = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                values.resize(dwords as usize, 0);
                 for u in &t.host.user_data {
                     let fresh = made
                         .iter()
@@ -558,6 +578,13 @@ impl State {
                         l.SetGraphicsRootShaderResourceView(param, gpu);
                     }
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if record_bindings {
+                self.bound_user_data.push(BoundUserData {
+                    values,
+                    rebuilt_tables: made,
+                });
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -700,9 +727,8 @@ impl State {
     }
 
     /// What a draw or dispatch runs, for the device-removed report
-    /// (diagnostics): the pipeline, then per stage the user data it gets
-    /// (with the view at that heap index, if one is), the host addresses
-    /// of its root views and the views its tables name.
+    /// (diagnostics): the pipeline, then each stage's bound user data,
+    /// descriptor table bases, root view addresses and known table entries.
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
@@ -710,19 +736,11 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
-        let views = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-            .flatten();
-        for stage in &p.stages {
+        for (stage, bound) in p.stages.iter().zip(&self.bound_user_data) {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
-                let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
-                if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
-                    let _ = write!(text, " [heap {index}: {slot}]");
-                }
+                self.note_user_data(&mut text, compute, u, bound);
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
@@ -732,8 +750,52 @@ impl State {
                 }
             }
         }
-        let _ = write!(text, " tables {:?}", self.reads(compute));
+        let _ = write!(text, " title tables {:?}", self.reads(compute));
         text
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn note_user_data(
+        &self,
+        text: &mut String,
+        compute: bool,
+        data: &victory_shader::emit::UserData,
+        bound: &BoundUserData,
+    ) {
+        use std::fmt::Write;
+        let Some(&value) = bound.values.get(data.index as usize) else {
+            return;
+        };
+        let _ = write!(text, " u{}={value:#x}", data.index);
+        if data.root != RootType::Table {
+            return;
+        }
+        if bound
+            .rebuilt_tables
+            .iter()
+            .any(|&(slot, _)| slot == data.slot)
+        {
+            // Rebuilt tables use dynamic view slots, which have no mirror
+            // record. The offset is in 32-byte console view descriptors.
+            let _ = write!(text, " [rebuilt view table base {}]", value / 32);
+            return;
+        }
+        let table = match self.roots_ref(compute).get(usize::from(data.slot)) {
+            Some(Root::Table(handle)) => self
+                .heap_of(*handle)
+                .and_then(|heap| heap.index(*handle).map(|index| (heap, index))),
+            _ => None,
+        };
+        if let Some((heap, index)) = table {
+            let kind = if heap.samplers() { "sampler" } else { "view" };
+            let _ = write!(text, " [{kind} table base {index}");
+            if let Some(record) = heap.host().and_then(|h| h.describe_slot(index)) {
+                let _ = write!(text, ": {record}");
+            }
+            text.push(']');
+        } else {
+            text.push_str(" [unbound table]");
+        }
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -1176,10 +1238,17 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // The clamp writes the argument shadow as UAV, then leaves it
+        // in INDIRECT_ARGUMENT for ExecuteIndirect.
+        crate::list::ensure_shadow_state(list, &args, 0x8);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
+        }
+        list.note_shadow_state(&args, 0x200);
+        if let Some((shadow, _)) = &counter {
+            crate::list::ensure_shadow_state(list, shadow, 0x200);
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1194,6 +1263,7 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &args.buffer);
+            list.note_shadow_state(&args, 0x8);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1224,6 +1294,7 @@ impl State {
             )
         };
         crate::indirect::done(list, &args.buffer);
+        list.note_shadow_state(&args, 0x8);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1280,10 +1351,23 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    let range = match view {
+        View::Constant(address, size) => Some((*address, u64::from(*size))),
+        _ => crate::descriptor::host::buffer_range(view),
+    };
+    if let Some((address, len)) = range
         && len > 0
         && let Some(shadow) = crate::shadow::find(address, len)
     {
+        let state = match u.kind {
+            ResourceType::Cbv => 0x1,
+            ResourceType::Srv => SHADER_RESOURCE,
+            ResourceType::Uav => UNORDERED_ACCESS,
+            ResourceType::Other(_) | ResourceType::Sampler => 0,
+        };
+        if state != 0 {
+            crate::list::ensure_shadow_state(list, &shadow, state);
+        }
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
@@ -1498,5 +1582,39 @@ mod tests {
         assert_eq!(state.fresh_tables[&accepted_key], accepted_first);
         drop(state);
         crate::object::slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod breadcrumb_tests {
+    use super::*;
+    use victory_shader::emit::UserData;
+
+    #[test]
+    fn breadcrumbs_distinguish_constants_rebuilt_tables_and_missing_tables() {
+        let mut state = State::default();
+        state.set_table(false, 1, 0x1000);
+        let bound = BoundUserData {
+            values: vec![0x1234, 0x8000, 0],
+            rebuilt_tables: vec![(1, 0x8000)],
+        };
+        let mut text = String::new();
+        for (index, root) in [
+            (0, RootType::Constants),
+            (1, RootType::Table),
+            (2, RootType::Table),
+        ] {
+            let data = UserData {
+                index,
+                slot: index as u8,
+                root,
+                dword: 0,
+            };
+            state.note_user_data(&mut text, false, &data, &bound);
+        }
+        assert_eq!(
+            text,
+            " u0=0x1234 u1=0x8000 [rebuilt view table base 1024] u2=0x0 [unbound table]"
+        );
     }
 }

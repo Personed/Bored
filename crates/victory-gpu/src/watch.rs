@@ -536,7 +536,7 @@ fn writable(at: usize) -> bool {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
@@ -553,6 +553,10 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        // A reused address can carry stale watch state (kernel bits, journal
+        // entries) left by a freed allocation: drain it, then ask fresh.
+        let _ = writes(start, end, false);
+        new_submission();
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
@@ -574,8 +578,9 @@ mod tests {
             )
             .is_none()
         );
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // Kept, not freed: another test given this address would see its
+        // watch state as its own first read (the kernel's bits and the
+        // journal's entries outlive the allocation they were made for).
     }
 
     /// Under Wine, a write after a range was asked about in a submission

@@ -298,6 +298,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Shadow buffers and their first/last states in this command list.
+    shadow_states: Mutex<ShadowStates>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -325,6 +327,15 @@ type Note = (String, Option<(u64, u64)>);
 
 type States =
     std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+type ShadowStates =
+    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::shadow::Shadow>)>;
+
+/// Whether GPU timestamp diagnostics are enabled (`VICTORY_GPU_TIMING`).
+#[cfg(feature = "diagnostics")]
+fn timing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -333,15 +344,6 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
-}
-
-/// Whether each list of a submission runs and is timed on its own, slow
-/// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
-#[cfg(feature = "diagnostics")]
-fn timing() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -480,6 +482,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                shadow_states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -491,7 +494,7 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
+    /// Runs closed lists in order and waits for each before preparing the next.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
@@ -513,40 +516,33 @@ impl Host {
     fn submit(&self, submitted: &mut u64, runs: &[&HostList]) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
+        crate::copystat::add(crate::copystat::C::Submissions, runs.len() as u64);
+
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
+
+        // A run's prelude must be recorded immediately before that run is
+        // submitted. Preparing all preludes up front is incorrect when two
+        // runs use the same shadow: the later prelude would assume a state
+        // transition that the earlier command list has not executed yet.
+        #[allow(unused_variables)]
+        for (i, list) in runs.iter().enumerate() {
+            let mut group: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2);
+            if let Some(prelude) = list.prelude() {
+                group.push(Some(prelude));
+            }
+            group.push(list.list.cast().ok());
+
             *submitted += 1;
-            let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let list_started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                self.queue.ExecuteCommandLists(&group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -554,12 +550,13 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
+                        list.decay_shadows();
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if runs.len() > 1 && list_started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i]
@@ -568,7 +565,7 @@ impl Host {
                     .unwrap_or_else(|e| e.into_inner())
                     .len();
                 tracing::warn!(
-                    ms = started.elapsed().as_millis(),
+                    ms = list_started.elapsed().as_millis(),
                     commands,
                     "slow host list"
                 );
@@ -576,9 +573,7 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (i, started);
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -683,7 +678,6 @@ impl Host {
                     }
                 }
                 text.push_str(&crate::shadow::near(va));
-                text.push_str(&crate::descriptor::host::near_heaps(va));
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
@@ -944,6 +938,10 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.shadow_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -990,12 +988,81 @@ impl HostList {
         }
     }
 
+    /// Moves a shadow buffer to `wanted` in this list. Its real state is
+    /// tracked separately because D3D12 buffers decay to COMMON after each
+    /// ExecuteCommandLists operation.
+    pub(crate) fn transition_shadow(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        wanted: u32,
+    ) -> Option<(ID3D12Resource, u32)> {
+        let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, shadow.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                if before != wanted {
+                    tracing::debug!(
+                        list = format_args!("{:#x}", self.list.as_raw() as usize),
+                        resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),
+                        before,
+                        wanted,
+                        "shadow state transition recorded"
+                    );
+                    Some((shadow.buffer.clone(), before))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Records a state change already emitted by a helper such as the
+    /// indirect-argument clamp, without adding another barrier.
+    pub(crate) fn note_shadow_state(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        state: u32,
+    ) {
+        let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let previous = states.get(&key).map(|entry| entry.1);
+        states
+            .entry(key)
+            .and_modify(|entry| entry.1 = state)
+            .or_insert_with(|| (state, state, shadow.clone()));
+        tracing::debug!(
+            list = format_args!("{:#x}", self.list.as_raw() as usize),
+            resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),
+            previous,
+            state,
+            "shadow state set by helper"
+        );
+    }
+
+    /// Buffers decay to COMMON after a completed ExecuteCommandLists call.
+    fn decay_shadows(&self) {
+        let states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, last, shadow) in states.values() {
+            tracing::debug!(
+                list = format_args!("{:#x}", self.list.as_raw() as usize),
+                resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),
+                last,
+                "shadow state decayed to COMMON"
+            );
+            shadow.state.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -1008,6 +1075,28 @@ impl HostList {
                 })
             })
             .collect();
+        drop(states);
+        let shadows = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        barriers.extend(shadows.values().filter_map(|(first, last, shadow)| {
+            let real = shadow.state.swap(*last, Ordering::Relaxed);
+            if real != *first {
+                tracing::debug!(
+                    list = format_args!("{:#x}", self.list.as_raw() as usize),
+                    resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),
+                    real,
+                    first,
+                    last,
+                    "shadow submission prelude transition"
+                );
+                Some(transition(
+                    &shadow.buffer,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                ))
+            } else {
+                None
+            }
+        }));
         if barriers.is_empty() {
             return None;
         }
@@ -1236,7 +1325,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -1245,6 +1334,8 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    // The flush counted its own time; the copy starts here.
+                    started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1269,6 +1360,10 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            started = std::time::Instant::now();
+                        }
                     }
                     work();
                     #[cfg(feature = "diagnostics")]

@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -27,6 +27,8 @@ use crate::watch::PAGE;
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    /// The D3D12 state of this host copy between submissions (buffers decay to COMMON).
+    pub(crate) state: AtomicU32,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -115,6 +117,7 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
             buffer,
+            state: AtomicU32::new(0),
             data,
             gpu,
             start,
@@ -419,15 +422,22 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let host = host()?;
+        let Some((buffer, data)) = host.shared_buffer(len.next_multiple_of(1 << 16)) else {
+            tracing::warn!(
+                address = format_args!("{:#x}", key.0),
+                len,
+                "could not allocate host copy for title buffer"
+            );
+            return None;
+        };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
             tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
+                "large buffer copied to the host: start={:#x}, len={len}",
+                key.0
             );
         } else {
             tracing::debug!(
@@ -451,6 +461,25 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// The number and total size of registered and loose host copies retained.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cache_stats() -> (usize, u64, usize, u64) {
+    let (registered_count, registered_bytes) = buffers()
+        .values()
+        .filter_map(|entry| entry.shadow.as_ref())
+        .fold((0usize, 0u64), |(count, bytes), shadow| {
+            (count + 1, bytes.saturating_add(shadow.len))
+        });
+    let (loose_count, loose_bytes) = LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .fold((0usize, 0u64), |(count, bytes), shadow| {
+            (count + 1, bytes.saturating_add(shadow.len))
+        });
+    (registered_count, registered_bytes, loose_count, loose_bytes)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -458,15 +487,19 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let host = host()?;
+    let Some((buffer, data)) = host.shared_buffer(len) else {
+        tracing::warn!(
+            address = format_args!("{start:#x}"),
+            len,
+            "could not allocate host copy for loose title memory"
+        );
+        return None;
+    };
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
+    tracing::debug!("loose memory copied to the host: start={start:#x}, len={len}");
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)

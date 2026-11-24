@@ -13,6 +13,15 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Number of shader-visible descriptor slots retaining a host resource.
+#[cfg(feature = "diagnostics")]
+static KEPT_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kept_slots() -> usize {
+    KEPT_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -85,33 +94,6 @@ pub(crate) fn console_words(view: &View) -> [u32; 8] {
         0,
         0,
     ]
-}
-
-/// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
-/// device-removed reports: a shader indexing a heap past its end faults.
-static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
-
-/// For device-removed reports: where host GPU address `va` lies against
-/// the host descriptor heaps.
-pub(crate) fn near_heaps(va: u64) -> String {
-    let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut text = String::new();
-    for &(start, bytes, step, sampler) in ranges.iter() {
-        let kind = if sampler { "sampler" } else { "view" };
-        let place = if va < start {
-            format!("{:#x} below", start - va)
-        } else if va < start + bytes {
-            format!("inside, slot {}", (va - start) / step)
-        } else {
-            format!(
-                "{:#x} past its end (slot {})",
-                va - start - bytes,
-                (va - start) / step
-            )
-        };
-        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
-    }
-    text
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
@@ -188,14 +170,12 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
-        // SAFETY: a live shader-visible heap.
-        let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
-        GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
-            gpu,
-            u64::from(count + extra) * u64::from(step),
-            u64::from(step),
-            sampler,
-        ));
+        // DRED identifies matching allocations by name. Descriptor handles
+        // have their own increment and cannot locate a faulting GPU VA.
+        crate::host::name(&heap, || {
+            let kind = if sampler { "sampler" } else { "view" };
+            format!("{kind} descriptor heap ({} slots)", count + extra)
+        });
         let words = if sampler {
             None
         } else {
@@ -282,6 +262,22 @@ impl HostHeap {
     /// view.
     fn null_sampler(&self, index: u32) {
         null_sampler(self.cpu(index));
+    }
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let retained = self
+                .kept
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count();
+            KEPT_SLOTS.fetch_sub(retained, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -435,6 +431,15 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
+            #[cfg(feature = "diagnostics")]
+            if slot.is_some() != resource.is_some() {
+                use std::sync::atomic::Ordering::Relaxed;
+                if resource.is_some() {
+                    KEPT_SLOTS.fetch_add(1, Relaxed);
+                } else {
+                    KEPT_SLOTS.fetch_sub(1, Relaxed);
+                }
+            }
             *slot = resource;
         }
     }
