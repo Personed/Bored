@@ -131,12 +131,12 @@ fn build(op: u8, pair: bool) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        static_samplers: super::build_static_samplers(&lowered.samplers, &lowered.cmp_samplers),
         samplers: lowered.samplers,
-        static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
-        address_map: false,
-        descriptor_words: false,
+        address_map: lowered.address_map,
+        descriptor_words: lowered.descriptor_words,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

@@ -946,8 +946,8 @@ mod tests {
             samplers: l.samplers,
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
-            address_map: false,
-            descriptor_words: false,
+            address_map: l.address_map,
+            descriptor_words: l.descriptor_words,
         };
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
