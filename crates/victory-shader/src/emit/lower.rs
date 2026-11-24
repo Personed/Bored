@@ -3270,6 +3270,12 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
+            Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
+                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                ((11 | u, 0), None)
+            }
             _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
