@@ -475,6 +475,8 @@ mod gpu {
             root_srvs: lowered.root_srvs,
             address_map: lowered.address_map,
             descriptor_words: lowered.descriptor_words,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: Vec::new(),
         };
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
