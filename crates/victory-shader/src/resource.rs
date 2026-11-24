@@ -4413,4 +4413,120 @@ pub(crate) mod tests {
         );
         assert!(waterfall(&w64_inline, true).is_ok());
     }
+    fn joined_descriptor_redundant_partial_write() {
+        // After the if/else join of WATERFALL_JOINED_WAVE32, re-writing v4
+        // with s24 under the same lane < 16 predicate leaves every lane's
+        // descriptor unchanged.
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+        words.splice(
+            at..at,
+            [
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
+                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+                0x7E08_0218, // v_mov_b32 v4, s24 (same word the then arm wrote)
+                0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            ],
+        );
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::LanePhi { .. }))
+            .unwrap();
+        let offsets: Vec<u32> = image
+            .source
+            .leaves()
+            .into_iter()
+            .map(|s| table_offset(&r, s))
+            .collect();
+        assert_eq!(offsets, vec![0, 0x20]);
+    }
+
+    #[test]
+    fn joined_descriptor_redundant_partial_write_negated_compare() {
+        // Same as above, targeting the else arm (lane >= 16) via the negated
+        // integer compare `v_cmp_le_u32 16, v0` and writing s32 to v4.
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+        words.splice(
+            at..at,
+            [
+                0x7D86_0090, // v_cmp_le_u32 vcc_lo, 16, v0 (lane >= 16)
+                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+                0x7E08_0220, // v_mov_b32 v4, s32 (same word the else arm wrote)
+                0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            ],
+        );
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::LanePhi { .. }))
+            .unwrap();
+        let offsets: Vec<u32> = image
+            .source
+            .leaves()
+            .into_iter()
+            .map(|s| table_offset(&r, s))
+            .collect();
+        assert_eq!(offsets, vec![0, 0x20]);
+    }
+
+    #[test]
+    fn joined_descriptor_non_redundant_partial_write_fails() {
+        // Writing the else arm's word (s32) under the then arm's mask
+        // (lane < 16) changes active lanes' v4 and must still be refused.
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+        words.splice(
+            at..at,
+            [
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
+                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+                0x7E08_0220, // v_mov_b32 v4, s32 (wrong arm's word)
+                0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            ],
+        );
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a per-lane descriptor written where some lanes may keep the old one",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn joined_descriptor_wider_mask_partial_write_fails() {
+        // Writing s24 under lane < 24 overwrites lanes 16..24 (which held s32)
+        // and must still be refused.
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+        words.splice(
+            at..at,
+            [
+                0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0 (lane < 24)
+                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+                0x7E08_0218, // v_mov_b32 v4, s24
+                0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            ],
+        );
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a per-lane descriptor written where some lanes may keep the old one",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+}
 }
