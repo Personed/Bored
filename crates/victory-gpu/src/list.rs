@@ -261,7 +261,10 @@ pub(crate) fn sweep_idle() {
     }
     drop(expired);
     crate::host::trail(|| {
-        format!("sweep: {count} idle host lists let go ({bytes} KiB upload scratch)")
+        format!(
+            "sweep: {count} idle host lists let go ({} KiB upload scratch)",
+            bytes / 1024
+        )
     });
 }
 
