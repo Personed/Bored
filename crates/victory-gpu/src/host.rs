@@ -104,7 +104,10 @@ pub(crate) fn moment() -> u64 {
 /// for seconds, and at many frames per second not for many frames. (A title
 /// that never waits for frames has no frame count: nothing is then idle.)
 pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
-    let now = self::moment();
+    long_ago_at(moment, self::moment(), ms, frames)
+}
+
+fn long_ago_at(moment: u64, now: u64, ms: u64, frames: u64) -> bool {
     let tenths = (now & 0xffff_ffff).saturating_sub(moment & 0xffff_ffff);
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
@@ -201,6 +204,7 @@ fn sweep() {
     {
         return;
     }
+    sweep_scratch_chunks();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1610,7 +1614,7 @@ fn scratch_pool() -> bool {
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
 struct Spare<T> {
-    kept: Vec<(T, u64)>,
+    kept: Vec<(T, u64, u64)>,
     bytes: u64,
 }
 
@@ -1624,7 +1628,7 @@ impl<T> Spare<T> {
 
     /// A kept thing of `size` bytes, the one given last.
     fn take(&mut self, size: u64) -> Option<T> {
-        let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+        let at = self.kept.iter().rposition(|(_, s, _)| *s == size)?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
     }
@@ -1636,8 +1640,30 @@ impl<T> Spare<T> {
             return Some(thing);
         }
         self.bytes += size;
-        self.kept.push((thing, size));
+        self.kept.push((thing, size, moment()));
         None
+    }
+
+    /// Things not reused for `ms` and `frames`, dropped by the caller
+    /// outside the pool's lock: how many, their bytes, and the things.
+    fn sweep(&mut self, ms: u64, frames: u64) -> (u64, u64, Vec<T>) {
+        self.sweep_at(moment(), ms, frames)
+    }
+
+    fn sweep_at(&mut self, now: u64, ms: u64, frames: u64) -> (u64, u64, Vec<T>) {
+        let (kept, expired): (Vec<_>, Vec<_>) = std::mem::take(&mut self.kept)
+            .into_iter()
+            .partition(|(_, _, since)| !long_ago_at(*since, now, ms, frames));
+        let (mut count, mut bytes) = (0u64, 0u64);
+        let mut things = Vec::with_capacity(expired.len());
+        for (thing, size, _) in expired {
+            count += 1;
+            bytes += size;
+            things.push(thing);
+        }
+        self.bytes -= bytes;
+        self.kept = kept;
+        (count, bytes, things)
     }
 }
 
@@ -1698,6 +1724,33 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// Lets go of spare scratch chunks no list has reused lately. They are
+/// upload memory kept only to avoid allocation and zeroing bursts; when a
+/// streaming phase is over, up to [`SPARE_MOST`] otherwise stayed resident
+/// for the rest of the run. Resources are dropped outside the pool lock.
+fn sweep_scratch_chunks() {
+    const IDLE_FRAMES: u64 = 4;
+    let idle_ms = ram_idle_ms(available_physical_ram());
+    let (count, bytes, expired) = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.sweep(idle_ms, IDLE_FRAMES)
+    };
+    if count == 0 {
+        return;
+    }
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    drop(expired);
+    trail(|| {
+        format!(
+            "sweep: {count} spare list scratch chunks let go ({} KiB)",
+            bytes >> 10
+        )
+    });
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -9598,6 +9651,58 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// The sweep keeps things not yet idle and hands idle things to its
+    /// caller once, leaving their bytes out of the pool.
+    #[test]
+    fn sweep_takes_only_idle_things() {
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, 4, 10), None);
+        let (count, bytes, things) = spare.sweep(u64::MAX, u64::MAX);
+        assert_eq!((count, bytes), (0, 0));
+        assert!(things.is_empty());
+        assert_eq!(spare.bytes, 4);
+        let (count, bytes, things) = spare.sweep(0, 0);
+        assert_eq!((count, bytes), (1, 4));
+        assert_eq!(things, vec![1]);
+        assert_eq!(spare.bytes, 0);
+        assert!(spare.kept.is_empty());
+    }
+
+    /// Mixed-age pools keep entries meeting only one of the time and frame
+    /// thresholds, while entries meeting both are taken once.
+    #[test]
+    fn sweep_keeps_entries_meeting_only_one_threshold() {
+        fn at(frames: u64, tenths: u64) -> u64 {
+            (frames << 32) | tenths
+        }
+        let now = at(10, 1_000);
+        let mut spare: Spare<u32> = Spare::new();
+        for thing in 1..=4 {
+            assert_eq!(spare.give(thing, 1, 10), None);
+        }
+        for entry in &mut spare.kept {
+            entry.2 = match entry.0 {
+                1 => at(10, 999), // neither threshold
+                2 => at(10, 900), // time only
+                3 => at(7, 999),  // frames only
+                4 => at(7, 900),  // both
+                _ => unreachable!(),
+            };
+        }
+        let (count, bytes, things) = spare.sweep_at(now, 5_000, 2);
+        assert_eq!((count, bytes), (1, 1));
+        assert_eq!(things, vec![4]);
+        assert_eq!(spare.bytes, 3);
+        assert_eq!(
+            spare
+                .kept
+                .iter()
+                .map(|(thing, _, _)| *thing)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 }
 
