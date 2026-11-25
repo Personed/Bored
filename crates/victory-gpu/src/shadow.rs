@@ -1460,6 +1460,10 @@ mod snapshot_tests {
         assert_eq!(state(snapshot.base + 3 * PIECE), MEM_COMMIT);
         assert_eq!(snapshot.committed_bytes(), 3 * PIECE);
 
+        snapshot.commit(10, 2 * PIECE + 1);
+        assert_eq!(state(snapshot.base), MEM_COMMIT);
+        assert_eq!(snapshot.committed_bytes(), 4 * PIECE);
+
         let mut partial = Snapshot::new(4097);
         partial.commit(0, 4097);
         assert_eq!(state(partial.base + 4096), MEM_COMMIT);
