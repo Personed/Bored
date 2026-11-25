@@ -4080,17 +4080,16 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// [`window`] cuts the windows of asks that give a length on a finer grid.
 const WINDOW: u64 = 4 << 20;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
+/// The grid the windows of asks with a length are cut on, in bytes: 256 KiB
+/// unless `VICTORY_WINDOW_KB` names another power of two (64 KiB at least).
 /// A window is the PC's memory, all of it, however little of it is read:
 /// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
-/// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
-/// window ends nearer to what is read. An ask without a length keeps the
-/// 4 MiB grid whatever is set: a root view reads from its address to its
-/// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// asked for in them lay within 1.6 GB. On this grid a window ends nearer
+/// to what is read, which matters on a 16 GB host even though the same
+/// memory asked for with different ranges can lie in more than one window.
+/// An ask without a length keeps the 4 MiB grid whatever is set: a root
+/// view reads from its address to its window's end, and mesh streams bound
+/// that way reach megabytes.
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
@@ -4102,11 +4101,11 @@ fn window() -> u64 {
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
-/// 64 KiB to 4 MiB, 4 MiB for anything else.
+/// 64 KiB to 4 MiB, 256 KiB without one or for anything else.
 fn grid(kb: Option<u64>) -> u64 {
     match kb {
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        _ => WINDOW,
+        _ => 256 << 10,
     }
 }
 
@@ -4489,16 +4488,16 @@ mod window_tests {
     }
 
     /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
-    /// leaves the grid as it was.
+    /// leaves the grid at its memory-saving default.
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
-        assert_eq!(grid(None), WINDOW);
+        assert_eq!(grid(None), 256 << 10);
         assert_eq!(grid(Some(4096)), WINDOW);
         assert_eq!(grid(Some(1024)), 1 << 20);
         assert_eq!(grid(Some(256)), 256 << 10);
         assert_eq!(grid(Some(64)), 64 << 10);
         for bad in [0, 32, 100, 1000, 8192] {
-            assert_eq!(grid(Some(bad)), WINDOW, "{bad}");
+            assert_eq!(grid(Some(bad)), 256 << 10, "{bad}");
         }
     }
 
