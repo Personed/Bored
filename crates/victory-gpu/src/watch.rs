@@ -907,7 +907,7 @@ pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 /// Upstream's c75fdba does the same for its trackers (its `Writing` marks
 /// the pages once more when dropped; page destinations are reported at
 /// each address showing them). Here it is counted always and acted on as
-/// [`page_writes`] says. Called without the runtime's page-table lock;
+/// `page_writes` says. Called without the runtime's page-table lock;
 /// takes the guards' lock, then, alone, the lock of the ranges kept for
 /// the texture pass.
 pub fn title_memory_written(at: usize, len: usize, pages: bool) {
