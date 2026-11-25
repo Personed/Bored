@@ -1079,13 +1079,33 @@ mod tests {
     use super::super::bitcode::Term;
     use super::*;
 
+    /// What stage a test program is: vertex (no thread-group size), pixel,
+    /// compute, mesh or geometry.
+    #[derive(Clone, Copy)]
+    enum Stage {
+        Vertex,
+        Pixel,
+        Compute,
+        Mesh,
+        Geometry,
+    }
+
     /// A program that sets a bit through a root UAV, or (`heap`) through a
-    /// UAV indexed from the heap: a vertex (`pixel` false, no thread-group
-    /// size), pixel or compute program. Upstream a1a2077 writes the marks'
-    /// UAV instead of a root one; this tree has no marks.
-    fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
-        let mut s = Shader::new(pixel);
-        s.threads = threads;
+    /// UAV indexed from the heap. Upstream a1a2077 writes the marks' UAV
+    /// instead of a root one; this tree has no marks.
+    fn marked(stage: Stage, heap: bool) -> (Vec<u8>, u64) {
+        let mut s = Shader::new(matches!(stage, Stage::Pixel));
+        match stage {
+            Stage::Mesh => {
+                s.threads = Some([1, 1, 1]);
+                s.mesh = Some(Mesh { max_vertices: 1, max_primitives: 1, topology: 2 });
+            }
+            Stage::Geometry => {
+                s.geometry = Some(Geometry { max_vertices: 1 });
+            }
+            Stage::Compute => s.threads = Some([1, 1, 1]),
+            _ => {}
+        }
         let b = s.entry;
         let h = if heap {
             let index = s.m.i32(0);
@@ -1098,26 +1118,40 @@ mod tests {
         let i32t = s.t.i32;
         s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
         s.m.terminate(b, Term::Ret);
-        s.finish()
+        let dxil = s.finish();
+        // The SFI0 part's feature bits (the container's own assertion:
+        // `finish` consumes the shader, so the flags are read back).
+        let at = dxil
+            .windows(4)
+            .position(|w| w == b"SFI0")
+            .expect("an SFI0 part");
+        let features = u64::from_le_bytes(dxil[at + 8..at + 16].try_into().unwrap());
+        (dxil, features)
     }
 
-    /// A vertex program writing a declared UAV declares UAVs at every stage
-    /// (the validator refuses it otherwise: "Flags must match usage");
-    /// pixel and compute programs need not, nor a vertex program whose UAVs
-    /// all come from the heap (the validator counts declared ranges only).
+    /// A vertex, mesh or geometry program writing a declared UAV declares
+    /// UAVs at every stage (the validator refuses it otherwise: "Flags must
+    /// match usage"); pixel and compute programs need not, nor a vertex
+    /// program whose UAVs all come from the heap (the validator counts
+    /// declared ranges only).
     #[test]
     fn uavs_outside_pixel_and_compute_programs_are_declared() {
-        let mut validator = super::super::validator::Validator::load(
-            super::super::validator::Validator::default_path().as_deref(),
-        )
-        .ok();
-        for (name, pixel, threads, heap) in [
-            ("vertex", false, None, false),
-            ("pixel", true, None, false),
-            ("compute", false, Some([1, 1, 1]), false),
-            ("vertex, heap", false, None, true),
+        // The flags assertion runs everywhere; the validator check only
+        // where dxil.dll is found.
+        for (name, stage, heap, want) in [
+            ("vertex", Stage::Vertex, false, true),
+            ("pixel", Stage::Pixel, false, false),
+            ("compute", Stage::Compute, false, false),
+            ("mesh", Stage::Mesh, false, true),
+            ("geometry", Stage::Geometry, false, true),
+            ("vertex, heap", Stage::Vertex, true, false),
         ] {
-            let mut dxil = marked(pixel, threads, heap);
+            let (mut dxil, features) = marked(stage, heap);
+            assert_eq!(features & 0x4 != 0, want, "{name}: SFI0 UAVs at every stage");
+            let mut validator = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            )
+            .ok();
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
