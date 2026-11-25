@@ -1201,6 +1201,7 @@ mod state {
     pub(super) use super::ignored_state as heaps;
     pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as scissors;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as stencil_ref;
     pub(super) use super::ignored_state as targets;
     pub(super) use super::ignored_state as topology;
