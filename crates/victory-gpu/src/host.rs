@@ -561,13 +561,14 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] =
 /// About host lists, for the memory line: lists made by the host since the
 /// start; preludes made (a list's second allocator and list, made when it
 /// first needs one, [`lazy_prelude`]); and, in diagnostics builds, the
-/// bytes the process's private memory grew by while lists were being made
-/// (what a list costs: host objects with the driver's command memory; 631
-/// lists were alive in run 65, each with a prelude it may never use).
-/// Then the lists alive that were never reset since they were made: the
-/// host sides of title lists the title made and has not used (a host list
-/// cost 0.68 MB of private memory in run 69: 431 MB for the 632 the title
-/// makes at its start).
+/// bytes the process's private memory grew by while the lists' driver pairs
+/// were being made (what first recording into one costs: host objects with
+/// the driver's command memory; 631 lists were alive in run 65, each with a
+/// prelude it may never use). Then the lists alive that were never reset
+/// since they were made: the host sides of title lists the title made and
+/// has not used. Before driver pairs became lazy, a host list cost 0.68 MB
+/// of private memory in run 69: 431 MB for the 632 the title makes at its
+/// start.
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
@@ -954,10 +955,88 @@ mod tests {
     }
 }
 
-/// A host command list and its allocator, always used together.
+/// A host command list and its allocator, made when the list is first
+/// recorded into rather than when the title object is made. The title makes
+/// hundreds of objects it may never use; the driver pair costs most of a
+/// host list's memory (0.68 MB a list in run 69), so an untouched title
+/// object should not commit it.
+pub(crate) struct LazyCommandList {
+    device: ID3D12Device,
+    made: OnceLock<windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>>,
+}
+
+impl LazyCommandList {
+    fn new(device: &ID3D12Device) -> LazyCommandList {
+        LazyCommandList {
+            device: device.clone(),
+            made: OnceLock::new(),
+        }
+    }
+
+    fn cell(&self) -> &windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+        self.made.get_or_init(|| {
+            #[cfg(feature = "diagnostics")]
+            let before = private_bytes();
+            // SAFETY: plain object creation.
+            let made = unsafe {
+                (|| {
+                    let allocator: ID3D12CommandAllocator = self
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?;
+                    Ok((allocator, list))
+                })()
+            };
+            #[cfg(feature = "diagnostics")]
+            if made.is_ok() {
+                LISTS[2].fetch_add(private_bytes().wrapping_sub(before), Ordering::Relaxed);
+            }
+            made
+        })
+    }
+
+    /// Makes the driver pair now, or says why it could not be made.
+    pub(crate) fn ensure(&self) -> windows::core::Result<()> {
+        match self.cell() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    fn pair(&self) -> &(ID3D12CommandAllocator, ID3D12GraphicsCommandList) {
+        match self.cell() {
+            Ok(pair) => pair,
+            Err(e) => fail(format_args!("a host command list could not be made ({e})")),
+        }
+    }
+
+    fn allocator(&self) -> &ID3D12CommandAllocator {
+        &self.pair().0
+    }
+
+    /// Whether the driver pair exists. Merely making, closing or resetting
+    /// the title object need not make it; the first recorded command does.
+    fn initialized(&self) -> bool {
+        matches!(self.made.get(), Some(Ok(_)))
+    }
+}
+
+impl std::ops::Deref for LazyCommandList {
+    type Target = ID3D12GraphicsCommandList;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pair().1
+    }
+}
+
+/// A host command list and its allocator, always used together once made.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
-    pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) list: LazyCommandList,
     /// Whether the list is closed; the console tolerates a repeated close,
     /// which host D3D12 fails with the same E_FAIL as an invalid command.
     closed: std::sync::atomic::AtomicBool,
@@ -4197,46 +4276,33 @@ impl Host {
     }
 
     fn make_list(&self) -> windows::core::Result<HostList> {
-        // SAFETY: plain object creation.
-        unsafe {
-            let allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &allocator,
-                None,
-            )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
-            }
-            Ok(HostList {
-                allocator,
-                list,
-                closed: std::sync::atomic::AtomicBool::new(false),
-                deferred: Mutex::default(),
-                scratch: Mutex::default(),
-                states: Mutex::default(),
-                twins: Mutex::default(),
-                pending_barriers: Mutex::default(),
-                prelude,
-                pipelines: Mutex::default(),
-                budget: OnceLock::new(),
-                card_budget: OnceLock::new(),
-                indirect_args: Mutex::default(),
-                window_check: OnceLock::new(),
-                _alive: Counted::new(),
-                meter: AtomicU32::new(u32::MAX),
-                pipeline_meter: AtomicU32::new(u32::MAX),
-                gather: Mutex::default(),
-                #[cfg(feature = "diagnostics")]
-                notes: Mutex::default(),
-                #[cfg(feature = "diagnostics")]
-                stamps: OnceLock::new(),
-            })
+        let prelude = OnceLock::new();
+        if !lazy_prelude() {
+            let _ = prelude.set(self.make_prelude());
         }
+        Ok(HostList {
+            list: LazyCommandList::new(&self.device),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            deferred: Mutex::default(),
+            scratch: Mutex::default(),
+            states: Mutex::default(),
+            twins: Mutex::default(),
+            pending_barriers: Mutex::default(),
+            prelude,
+            pipelines: Mutex::default(),
+            budget: OnceLock::new(),
+            card_budget: OnceLock::new(),
+            indirect_args: Mutex::default(),
+            window_check: OnceLock::new(),
+            _alive: Counted::new(),
+            meter: AtomicU32::new(u32::MAX),
+            pipeline_meter: AtomicU32::new(u32::MAX),
+            gather: Mutex::default(),
+            #[cfg(feature = "diagnostics")]
+            notes: Mutex::default(),
+            #[cfg(feature = "diagnostics")]
+            stamps: OnceLock::new(),
+        })
     }
 
     /// The card's clock ([`CARD_CLOCK_US`]), made at the first send.
@@ -6108,7 +6174,12 @@ impl Host {
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
-            lists.push(list.list.cast().ok());
+            // A list never recorded into has no driver pair and no commands;
+            // omitting its empty execution keeps relative ordering of the
+            // real lists unchanged and avoids committing its memory.
+            if list.list.initialized() {
+                lists.push(list.list.cast().ok());
+            }
         }
         batch.flush();
         crate::watch::ask_once_end();
@@ -6143,7 +6214,9 @@ impl Host {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
+                if !lists.is_empty() {
+                    self.queue.ExecuteCommandLists(&lists);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -6192,7 +6265,9 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                if !group.is_empty() {
+                    self.queue.ExecuteCommandLists(group);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -6721,31 +6796,44 @@ impl HostList {
                 )]);
             }
         }
-        crate::cardmeter::end(
-            &self.list,
-            crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)),
-        );
-        crate::cardmeter::end_named(
-            &self.list,
-            crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)),
-            &self.pipelines.lock().unwrap_or_else(|e| e.into_inner()),
-        );
-        #[cfg(feature = "diagnostics")]
-        if let Some((heap, back)) = self.stamps() {
-            let count =
-                (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list
-                    .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+        // Nothing above touched the driver list: there are no commands to
+        // close, and making the pair now would cost the memory lazy lists
+        // exist to save.
+        if self.list.initialized() {
+            crate::cardmeter::end(
+                &self.list,
+                crate::cardmeter::Span::from_raw(
+                    self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed),
+                ),
+            );
+            crate::cardmeter::end_named(
+                &self.list,
+                crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)),
+                &self.pipelines.lock().unwrap_or_else(|e| e.into_inner()),
+            );
+            #[cfg(feature = "diagnostics")]
+            if let Some((heap, back)) = self.stamps() {
+                let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32)
+                    .min(STAMPS - 1);
+                // SAFETY: an open list, our heap and read-back buffer.
+                unsafe {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                    self.list.ResolveQueryData(
+                        heap,
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        0,
+                        count + 1,
+                        back,
+                        0,
+                    );
+                }
             }
-        }
-        // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
-            fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
-            ));
+            // SAFETY: our list.
+            if let Err(e) = unsafe { self.list.Close() } {
+                fail(format_args!(
+                    "a host command list did not close ({e}): a command recorded into it was invalid"
+                ));
+            }
         }
     }
 
@@ -6801,19 +6889,37 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+        if self.list.initialized() || crate::cardmeter::on() {
+            // With card metering on the pair is made even before the first
+            // command: its begin timestamp belongs at the reset, not at
+            // whichever command first happens to make the pair. A pair made
+            // here starts open; close its empty recording before the reset.
+            if !self.list.initialized() {
+                if let Err(e) = self.list.ensure() {
+                    fail(format_args!("a host command list could not be made ({e})"));
+                }
+                // SAFETY: the pair was just made and nothing recorded into it.
+                if let Err(e) = unsafe { self.list.Close() } {
+                    fail(format_args!(
+                        "an empty host command list did not close ({e})"
+                    ));
+                }
+            }
+            // SAFETY: the list is not executing.
+            let allocator = self.list.allocator();
+            let reset = unsafe {
+                allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(allocator, None))
+            };
+            if let Err(e) = reset {
+                fail(format_args!("a host command list did not reset ({e})"));
+            }
+            self.meter.store(
+                crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(),
+                Ordering::Relaxed,
+            );
         }
-        self.meter.store(
-            crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(),
-            Ordering::Relaxed,
-        );
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::ResetNs,
@@ -9010,6 +9116,7 @@ impl Host {
                     .position(|(_, flown)| *flown <= finished)
                     .or_else(|| {
                         let list = self.new_list().ok()?;
+                        list.list.ensure().ok()?;
                         list.close();
                         p.ahead.push((list, 0));
                         Some(p.ahead.len() - 1)
@@ -9104,6 +9211,7 @@ impl Host {
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
+            copy.list.ensure()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");

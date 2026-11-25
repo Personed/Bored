@@ -431,6 +431,9 @@ fn dump_one(
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
+    if list.list.ensure().is_err() {
+        return;
+    }
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
