@@ -136,7 +136,7 @@ fn hash_live(
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
-struct Spare(ID3D12Resource, usize);
+struct Spare(ID3D12Resource, usize, u64);
 
 // SAFETY: a D3D12 buffer and its mapping, touched by nobody while it is
 // spare.
@@ -181,7 +181,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         }
         taken
     };
-    if let Some(Spare(buffer, data)) = spare {
+    if let Some(Spare(buffer, data, _)) = spare {
         SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the buffer's own mapping, `size` bytes, which nothing
         // else holds.
@@ -606,10 +606,11 @@ impl Drop for Staging {
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
             if all.1 + self.pooled <= SPARE_MOST.0 {
                 all.1 += self.pooled;
-                all.0
-                    .entry(self.pooled)
-                    .or_default()
-                    .push(Spare(self.buffer.clone(), self.data as usize));
+                all.0.entry(self.pooled).or_default().push(Spare(
+                    self.buffer.clone(),
+                    self.data as usize,
+                    crate::host::moment(),
+                ));
             }
         }
     }
@@ -649,6 +650,33 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let (spares, spare_bytes, expired) = {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut expired = Vec::new();
+        let mut freed = (0u64, 0u64);
+        for (&size, buffers) in all.0.iter_mut() {
+            let (kept, went): (Vec<_>, Vec<_>) = std::mem::take(buffers)
+                .into_iter()
+                .partition(|s| !crate::host::long_ago(s.2, idle_ms, IDLE_FRAMES));
+            freed.0 += went.len() as u64;
+            freed.1 += went.len() as u64 * size;
+            expired.extend(went);
+            *buffers = kept;
+        }
+        all.0.retain(|_, buffers| !buffers.is_empty());
+        all.1 -= freed.1;
+        (freed.0, freed.1, expired)
+    };
+    drop(expired);
+    if spares != 0 {
+        crate::host::trail(|| {
+            format!(
+                "sweep: {spares} spare staging buffers let go ({} KiB)",
+                spare_bytes >> 10
+            )
+        });
+    }
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -656,7 +684,6 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
