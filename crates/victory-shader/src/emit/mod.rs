@@ -204,7 +204,7 @@ pub fn shader_opt() -> u32 {
 /// translator alone keeps its translations. Call it after the device is made.
 pub fn translation_fingerprint() -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
+    out.extend_from_slice(crate::SOURCE_HASH.as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
     for name in env!("VICTORY_SHADER_SWITCHES")

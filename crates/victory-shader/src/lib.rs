@@ -18,6 +18,10 @@ pub mod resource;
 pub mod spill;
 pub mod structure;
 
+/// Hash of this crate's translation source, made by `build.rs`: rebuilds
+/// that leave the translator alone keep the same shader and pipeline caches.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
+
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
