@@ -119,7 +119,10 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use lower::set_host_max_wave;
-pub use mesh_emu::{INDIRECT_SLOT_MAP_FLAG, MeshEmu, MeshMode, MeshOutput, unpack_vertex_shader};
+pub use mesh_emu::{
+    INDIRECT_SLOT_MAP_FLAG, MeshEmu, MeshEmuDispatchBatch, MeshEmuDispatchPlan, MeshMode,
+    MeshOutput, unpack_vertex_shader,
+};
 pub use rect::rect_list_gs;
 pub use sampler::StaticSampler;
 pub use shader::{

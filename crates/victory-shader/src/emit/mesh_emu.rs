@@ -69,6 +69,33 @@ pub struct MeshEmu {
     pub prim_outputs: Vec<MeshOutput>,
 }
 
+/// A checked plan for running an emulated mesh dispatch in bounded batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshEmuDispatchPlan {
+    /// Total groups requested by the title.
+    pub groups: u32,
+    /// Bytes reserved for one group's output.
+    pub group_bytes: u32,
+    /// Maximum groups in one compute dispatch and raster draw.
+    pub groups_per_batch: u32,
+    /// Number of batches; zero when `groups` is zero.
+    pub batch_count: u32,
+    max_primitives: u32,
+}
+
+/// One bounded compute dispatch and its corresponding non-indexed draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshEmuDispatchBatch {
+    /// The first title group represented by this batch.
+    pub first_group: u32,
+    /// Groups written by this compute dispatch.
+    pub groups: u32,
+    /// Bytes required for this batch's intermediate output.
+    pub output_bytes: u64,
+    /// Vertex count for its non-indexed triangle-list draw.
+    pub draw_vertices: u32,
+}
+
 impl MeshEmu {
     /// Bytes reserved per group for packed primitive index words.
     pub fn index_bytes(&self) -> u32 {
@@ -98,6 +125,167 @@ impl MeshEmu {
     /// Total bytes occupied by one threadgroup in the intermediate buffer.
     pub fn group_bytes(&self) -> u32 {
         self.prim_offset_bytes() + self.max_primitives * self.prim_stride_bytes()
+    }
+
+    /// Computes the per-group output size without allowing arithmetic
+    /// overflow.
+    pub fn checked_group_bytes(&self) -> Option<u64> {
+        let index_bytes = u64::from(self.max_primitives).checked_mul(4)?;
+        let vertex_stride = u64::from(self.vertex_dwords).checked_mul(4)?;
+        let vertex_bytes = u64::from(self.max_vertices).checked_mul(vertex_stride)?;
+        let prim_offset = index_bytes.checked_add(vertex_bytes)?;
+        let prim_stride = u64::from(self.prim_dwords).checked_mul(4)?;
+        let prim_bytes = u64::from(self.max_primitives).checked_mul(prim_stride)?;
+        prim_offset.checked_add(prim_bytes)
+    }
+
+    /// Plans batches that fit D3D12's one-dimensional compute dispatch limit,
+    /// 32-bit raw-buffer byte offsets, and `DrawInstanced` vertex count.
+    pub fn dispatch_plan(&self, groups: u32) -> Option<MeshEmuDispatchPlan> {
+        const MAX_DISPATCH_GROUPS: u64 = 65_535;
+        const MAX_RAW_BUFFER_BYTES: u64 = u32::MAX as u64 + 1;
+        const MAX_DRAW_VERTICES: u64 = u32::MAX as u64;
+
+        if self.max_vertices == 0 || self.max_primitives == 0 {
+            return None;
+        }
+        let group_bytes = self.checked_group_bytes()?;
+        // The generated shaders encode the per-group stride as a 32-bit
+        // byte offset. Even if a single allocation could be larger, that
+        // stride would not be representable.
+        let group_bytes_u32 = u32::try_from(group_bytes).ok()?;
+        if group_bytes_u32 == 0 {
+            return None;
+        }
+
+        let vertices_per_group = u64::from(self.max_primitives).checked_mul(3)?;
+        let groups_by_buffer = MAX_RAW_BUFFER_BYTES / group_bytes;
+        let groups_by_draw = MAX_DRAW_VERTICES / vertices_per_group;
+        let groups_per_batch = u32::try_from(
+            MAX_DISPATCH_GROUPS
+                .min(groups_by_buffer)
+                .min(groups_by_draw),
+        )
+        .ok()?;
+        if groups_per_batch == 0 {
+            return None;
+        }
+
+        Some(MeshEmuDispatchPlan {
+            groups,
+            group_bytes: group_bytes_u32,
+            groups_per_batch,
+            batch_count: groups.div_ceil(groups_per_batch),
+            max_primitives: self.max_primitives,
+        })
+    }
+}
+
+impl MeshEmuDispatchPlan {
+    /// Returns one batch, or `None` when `index` is outside the plan.
+    pub fn batch(&self, index: u32) -> Option<MeshEmuDispatchBatch> {
+        if index >= self.batch_count {
+            return None;
+        }
+        let first_group = index.checked_mul(self.groups_per_batch)?;
+        let groups = self
+            .groups
+            .checked_sub(first_group)?
+            .min(self.groups_per_batch);
+        let output_bytes = u64::from(groups).checked_mul(u64::from(self.group_bytes))?;
+        let draw_vertices = u64::from(groups)
+            .checked_mul(u64::from(self.max_primitives))?
+            .checked_mul(3)?;
+        Some(MeshEmuDispatchBatch {
+            first_group,
+            groups,
+            output_bytes,
+            draw_vertices: u32::try_from(draw_vertices).ok()?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod dispatch_plan_tests {
+    use super::{MeshEmu, MeshEmuDispatchBatch};
+
+    fn mesh(
+        max_vertices: u32,
+        max_primitives: u32,
+        vertex_dwords: u32,
+        prim_dwords: u32,
+    ) -> MeshEmu {
+        MeshEmu {
+            threads: 32,
+            max_vertices,
+            max_primitives,
+            vertex_dwords,
+            prim_dwords,
+            reads_group_id: false,
+            vertex_outputs: Vec::new(),
+            prim_outputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn batches_large_dispatches_with_checked_draw_and_buffer_sizes() {
+        let emu = mesh(3, 2, 4, 1);
+        assert_eq!(emu.checked_group_bytes(), Some(64));
+        assert_eq!(emu.group_bytes(), 64);
+
+        let plan = emu.dispatch_plan(65_536).unwrap();
+        assert_eq!(plan.group_bytes, 64);
+        assert_eq!(plan.groups_per_batch, 65_535);
+        assert_eq!(plan.batch_count, 2);
+        assert_eq!(
+            plan.batch(0),
+            Some(MeshEmuDispatchBatch {
+                first_group: 0,
+                groups: 65_535,
+                output_bytes: 4_194_240,
+                draw_vertices: 393_210,
+            })
+        );
+        assert_eq!(
+            plan.batch(1),
+            Some(MeshEmuDispatchBatch {
+                first_group: 65_535,
+                groups: 1,
+                output_bytes: 64,
+                draw_vertices: 6,
+            })
+        );
+        assert_eq!(plan.batch(2), None);
+    }
+
+    #[test]
+    fn limits_batches_by_raw_buffer_address_space() {
+        let emu = mesh(256, 256, 100, 1);
+        let plan = emu.dispatch_plan(u32::MAX).unwrap();
+        assert!(plan.groups_per_batch < 65_535);
+        let batch = plan.batch(0).unwrap();
+        assert_eq!(batch.groups, plan.groups_per_batch);
+        assert!(batch.output_bytes <= u32::MAX as u64 + 1);
+        assert!(batch.output_bytes + u64::from(plan.group_bytes) > u32::MAX as u64 + 1);
+    }
+
+    #[test]
+    fn rejects_zero_or_unrepresentable_group_layouts() {
+        assert!(mesh(0, 1, 1, 0).dispatch_plan(1).is_none());
+        assert!(mesh(1, 0, 0, 0).dispatch_plan(1).is_none());
+        assert!(mesh(256, 256, u32::MAX, 0).dispatch_plan(1).is_none());
+        assert!(
+            mesh(u32::MAX, u32::MAX, u32::MAX, u32::MAX)
+                .checked_group_bytes()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn zero_groups_have_no_batches() {
+        let plan = mesh(3, 2, 4, 1).dispatch_plan(0).unwrap();
+        assert_eq!(plan.batch_count, 0);
+        assert_eq!(plan.batch(0), None);
     }
 }
 
