@@ -30,6 +30,8 @@
 //! Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 //! EXPRESS OR IMPLIED.
 
+use std::sync::OnceLock;
+
 /// A swizzle mode, by its hardware number (addrlib's `ADDR_SW_*` order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Swizzle(pub u32);
@@ -174,10 +176,13 @@ pub struct Layout {
     /// The first mip in the tail; `mips.len()` without one.
     pub first_tail_mip: u32,
     pub mips: Vec<Mip>,
-    /// Byte offsets inside a block of each element coordinate bit, per
-    /// axis; empty for linear and unsupported modes.
-    pattern: [Vec<u32>; 3],
+    /// Byte offsets inside a block for each coordinate, per axis.
+    /// Empty for linear and unsupported modes.
+    pattern: &'static SwizzlePattern,
 }
+
+type SwizzlePattern = [Vec<u32>; 3];
+static EMPTY_PATTERN: SwizzlePattern = [const { Vec::new() }; 3];
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
 /// address bit, the element coordinate bit it takes (`x0`, `y1`, `z0`...),
@@ -245,6 +250,18 @@ fn spread(bits: &[u32]) -> Vec<u32> {
                 .sum()
         })
         .collect()
+}
+
+/// Tables depend only on the micro-tile kind, block size and element size.
+/// Texture extents, mip placement and array slices only affect the base
+/// address, so layouts with the same key can share these immutable tables.
+fn shared_pattern(kind: usize, element_log2: u32, block_log2: u32) -> &'static SwizzlePattern {
+    // Indexed by MICRO kind, block size (256 B, 4 KiB, 64 KiB), then element size.
+    static PATTERNS: [[[OnceLock<SwizzlePattern>; 5]; 3]; 3] =
+        [const { [const { [const { OnceLock::new() }; 5] }; 3] }; 3];
+    let block_index = ((block_log2 - 8) / 4) as usize;
+    PATTERNS[kind][block_index][element_log2 as usize]
+        .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits)))
 }
 
 const MAX_MIPS: u32 = 16;
@@ -322,7 +339,7 @@ impl Layout {
             alignment: 256,
             first_tail_mip: d.mips,
             mips,
-            pattern: Default::default(),
+            pattern: &EMPTY_PATTERN,
         }
     }
 
@@ -498,9 +515,9 @@ impl Layout {
             } else {
                 usize::from(d.swizzle.display())
             };
-            pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))
+            shared_pattern(kind, element_log2, block_log2)
         } else {
-            Default::default()
+            &EMPTY_PATTERN
         };
         Layout {
             desc: d,
@@ -744,6 +761,13 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
+        // A mip can end partway through the last run. Check the other runs
+        // once so each row can copy them with a compile-time length.
+        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+        let run_len = body
+            .first()
+            .map(|run| run.2)
+            .filter(|&len| body.iter().all(|run| run.2 == len));
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -754,13 +778,30 @@ impl Layout {
                     copy(tiled_row as usize, linear_row, bytes);
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                    match run_len {
+                        Some(8) => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
+                        Some(16) => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
+                        Some(32) => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
+                        _ => copy_runs::<0>(body, tiled_row, linear_row, &mut copy),
                     }
+                    copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
+fn copy_runs<const N: usize>(
+    runs: &[(usize, usize, usize)],
+    tiled_row: usize,
+    linear_row: usize,
+    copy: &mut impl FnMut(usize, usize, usize),
+) {
+    for &(tiled, linear, len) in runs {
+        let len = if N == 0 { len } else { N };
+        copy(tiled_row + tiled, linear_row + linear, len);
     }
 }
 
@@ -1129,6 +1170,41 @@ mod tests {
         // Blocks row by row: (16, 0) is the second block, (0, 16) the third.
         assert_eq!(l.offset(0, 16, 0, 0), Ok(4096));
         assert_eq!(l.offset(0, 0, 16, 0), Ok(8192));
+    }
+
+    #[test]
+    fn layouts_share_identical_swizzle_tables() {
+        for (swizzle, kind, dimension, block_log2) in [
+            (Swizzle::SW_256B_S, 0, Dimension::Tex2d, 8),
+            (Swizzle::SW_256B_D, 1, Dimension::Tex2d, 8),
+            (Swizzle::SW_4KB_S, 0, Dimension::Tex2d, 12),
+            (Swizzle::SW_4KB_D, 1, Dimension::Tex2d, 12),
+            (Swizzle::SW_64KB_S, 0, Dimension::Tex2d, 16),
+            (Swizzle::SW_64KB_D, 1, Dimension::Tex2d, 16),
+            (Swizzle::SW_4KB_S, 2, Dimension::Tex3d, 12),
+            (Swizzle::SW_64KB_S, 2, Dimension::Tex3d, 16),
+        ] {
+            for element_log2 in 0..5 {
+                let d = Desc {
+                    dimension,
+                    depth: 8,
+                    ..desc(128, 96, 7, 1 << element_log2, swizzle)
+                };
+                let first = Layout::new(&d).unwrap();
+                let second = Layout::new(&Desc {
+                    width: 32,
+                    height: 24,
+                    mips: 3,
+                    depth: 1,
+                    ..d
+                })
+                .unwrap();
+                let expected = pattern(kind, element_log2, block_log2).map(|bits| spread(&bits));
+                assert_eq!(first.pattern, &expected);
+                assert!(std::ptr::eq(first.pattern, second.pattern));
+                assert!(std::ptr::eq(first.pattern, first.clone().pattern));
+            }
+        }
     }
 
     /// A 256x256 BC7 chain in 64 KiB `D`: one tail block holding mips 1-8,
