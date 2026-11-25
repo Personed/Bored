@@ -5770,21 +5770,27 @@ impl Host {
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
             let size = total.next_multiple_of(16 << 20);
+            let mut shrink = false;
             if work.fetched.as_ref().is_some_and(|f| f.2 > size) {
                 let since = work.fetched_small_since.get_or_insert_with(moment);
                 const SMALL_FRAMES: u64 = 4;
-                if long_ago(*since, 5_000, SMALL_FRAMES) {
-                    work.fetched = None;
-                    work.fetched_small_since = None;
-                }
+                shrink = long_ago(*since, 5_000, SMALL_FRAMES);
             } else {
                 work.fetched_small_since = None;
             }
-            if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
-                work.fetched = self
+            let lacks = work.fetched.as_ref().is_none_or(|f| f.2 < total);
+            if shrink || lacks {
+                if let Some(buffer) = self
                     .shared_buffer(size)
-                    .map(|(buffer, data)| (buffer, data as usize, size));
-                work.fetched_small_since = None;
+                    .map(|(buffer, data)| (buffer, data as usize, size))
+                {
+                    work.fetched = Some(buffer);
+                    work.fetched_small_since = None;
+                } else if shrink && !lacks {
+                    // The old, larger buffer still serves; do not retry an
+                    // optional shrink in every fetch.
+                    work.fetched_small_since = Some(moment());
+                }
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!(
