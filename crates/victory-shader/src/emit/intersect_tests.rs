@@ -177,6 +177,7 @@ fn build(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -188,6 +189,7 @@ fn build(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        mesh_emu: None,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -680,6 +682,7 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
     });
     match r {
         Err(ShaderError::Unsupported { what, .. }) => {
