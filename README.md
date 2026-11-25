@@ -55,8 +55,8 @@ The project does not currently build as a native Linux application; cross-build
 the Windows executable and run it under Wine/Proton instead.
 
 Windows requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+shader model 6.6 (hardware mesh shaders or the SM 6.6 compute + vertex
+fallback for the world), Rust (pinned in `rust-toolchain.toml`).
 
 Under Wine or Proton, indirect execution also needs DXC's `dxcompiler.dll` (with
 its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile the indirect-argument
@@ -168,6 +168,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE=1024` | smallest post-drop texture dimension eligible for mip dropping |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^14 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_MESH_EMULATION=1\|0` | forces compute (`cs_6_6`) + unpack vertex (`vs_6_6`) mesh shader emulation (`1`) or disables the automatic fallback on GPUs without hardware mesh shaders (`0`) |
+| `VICTORY_MESH_BUFFER_MB=<n>` | size in MiB (`1..=1024`, default `128` with fallback down to `16`) of the intermediate buffer for emulated mesh shaders |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
