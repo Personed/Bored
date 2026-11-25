@@ -594,6 +594,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
+    if answer.is_some() && (kfirst, klast) != (first, last) {
+        // A whole allocation asked: its other buffers answer from the
+        // journal for the rest of the submission instead of scanning it
+        // whole once a flush each (under Wine, about 1 ms a scan).
+        j.ahead.push((kfirst, klast));
+        j.ahead_asked = now;
+    }
     Some((
         now,
         j.written
