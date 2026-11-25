@@ -167,7 +167,7 @@ const WINDOW_MOST: u64 = 64;
 /// the list's scratch buffer in one pass, and the draws that follow read
 /// their record there with no pass of ours and no barrier (the scratch
 /// buffer stays readable as arguments until the next clamp), until one of
-/// these: a compute
+/// these: a nonempty compute
 /// dispatch, a direct draw, an indirect call with a count buffer or more
 /// than one record, a draw whose shaders can store to buffers, a record
 /// outside the window, another host list.
