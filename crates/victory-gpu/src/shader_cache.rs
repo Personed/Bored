@@ -147,9 +147,18 @@ fn cached(
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => {
+                // A cache that cannot write (a full or read-only disk) must
+                // not cost the shader: the translation is the same work the
+                // converter just did, returned uncached instead of dropping
+                // every draw of the program for the rest of the run.
+                tracing::debug!("shader cache write failed ({e:#}); the shader is not cached");
+                MISSES.fetch_add(1, Ordering::Relaxed);
+                return (converter.translate)(container);
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
