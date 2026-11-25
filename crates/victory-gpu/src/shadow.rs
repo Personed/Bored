@@ -223,18 +223,32 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    let mut runs: Vec<(usize, usize)> = Vec::new();
+                    let mut run = None;
+                    for (i, ((t, h), o)) in
+                        title.iter_mut().zip(host.iter_mut()).zip(old).enumerate()
+                    {
                         if *h != *o && *t != *h {
                             *t = *h;
-                            changed = true;
+                            run.get_or_insert(i);
+                        } else if let Some(first) = run.take() {
+                            runs.push((first, i - first));
                         }
                         *h = *t;
                     }
-                    if changed {
+                    if let Some(first) = run.take() {
+                        runs.push((first, n - first));
+                    }
+                    if !runs.is_empty() {
                         crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                        for &(off, len) in &runs {
+                            crate::host::write_mapped(
+                                (start + at + off) as *mut u8,
+                                title[off..off + len].as_ptr(),
+                                len,
+                            );
+                        }
+                        written += runs.iter().map(|&(_, len)| len).sum::<usize>();
                     }
                     synced.push((start + at) / PAGE);
                 }
