@@ -1411,10 +1411,17 @@ impl Staging {
                     return false;
                 }
                 last.hash = Some(hash);
-                if live_ranges(&self.layout, self.mip_drop).all(|(at, len)| {
-                    read.get(at..at.saturating_add(len))
-                        .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
-                }) {
+                // A staging buffer starts as zeros, so a first all-zero
+                // read need not be detiled. After `forget` because the
+                // view's levels changed, though, it may still hold texels
+                // from the earlier judgement; then zeros must replace them.
+                let blank = !self.filled.load(std::sync::atomic::Ordering::Relaxed);
+                if blank
+                    && live_ranges(&self.layout, self.mip_drop).all(|(at, len)| {
+                        read.get(at..at.saturating_add(len))
+                            .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
+                    })
+                {
                     return false;
                 }
                 self.detile(read);
