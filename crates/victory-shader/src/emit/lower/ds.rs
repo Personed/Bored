@@ -32,8 +32,10 @@ impl Lower<'_> {
                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
-            let mesh_quad = self.is_mesh() && quad;
-            if !mesh_quad {
+            // As `dpp`: pixel programs read helpers through quad operations
+            // (upstream 4015a18).
+            let quad_read = quad && (self.is_mesh() || self.s.pixel);
+            if !quad_read {
                 self.cross_lane(quad)?;
             }
             // The source sits in the address field.
@@ -58,7 +60,7 @@ impl Lower<'_> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if quad_read {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
