@@ -125,7 +125,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[33..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
@@ -179,7 +179,11 @@ const STAGES: [HwStage; 8] = [
     HwStage::Cs,
 ];
 
-fn root_code(r: RootType) -> u32 {
+/// The tag of [`RootType::Other`]: a tag cannot hold every `u32`, so its
+/// raw value follows it as its own word.
+const OTHER_ROOT: u32 = 6;
+
+fn root_tag(r: RootType) -> u32 {
     match r {
         RootType::Constants => 0,
         RootType::Descriptor => 1,
@@ -187,19 +191,7 @@ fn root_code(r: RootType) -> u32 {
         RootType::ImmediateSampler => 3,
         RootType::ResourceHeap => 4,
         RootType::SamplerHeap => 5,
-        RootType::Other(x) => 6 + x,
-    }
-}
-
-fn root_type(code: u32) -> RootType {
-    match code {
-        0 => RootType::Constants,
-        1 => RootType::Descriptor,
-        2 => RootType::Table,
-        3 => RootType::ImmediateSampler,
-        4 => RootType::ResourceHeap,
-        5 => RootType::SamplerHeap,
-        x => RootType::Other(x - 6),
+        RootType::Other(_) => OTHER_ROOT,
     }
 }
 
@@ -213,7 +205,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
     for u in &s.user_data {
-        for v in [u.index, u32::from(u.slot), root_code(u.root)] {
+        for v in [u.index, u32::from(u.slot), root_tag(u.root)] {
             word(&mut out, v);
         }
         if let RootType::Other(raw) = u.root {
