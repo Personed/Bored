@@ -6892,7 +6892,19 @@ impl HostList {
         if self.list.initialized() || crate::cardmeter::on() {
             // With card metering on the pair is made even before the first
             // command: its begin timestamp belongs at the reset, not at
-            // whichever command first happens to make the pair.
+            // whichever command first happens to make the pair. A pair made
+            // here starts open; close its empty recording before the reset.
+            if !self.list.initialized() {
+                if let Err(e) = self.list.ensure() {
+                    fail(format_args!("a host command list could not be made ({e})"));
+                }
+                // SAFETY: the pair was just made and nothing recorded into it.
+                if let Err(e) = unsafe { self.list.Close() } {
+                    fail(format_args!(
+                        "an empty host command list did not close ({e})"
+                    ));
+                }
+            }
             // SAFETY: the list is not executing.
             let allocator = self.list.allocator();
             let reset = unsafe {
