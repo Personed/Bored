@@ -143,6 +143,7 @@ fn build_valu_cs_threads(body: &[u32], threads: u32) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         crumbs: None,
+        emulate_mesh: false,
     })
     .expect("lower");
 
@@ -158,6 +159,7 @@ fn build_valu_cs_threads(body: &[u32], threads: u32) -> HostShader {
         descriptor_words: lowered.descriptor_words,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        mesh_emu: None,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -2174,6 +2176,7 @@ fn build_test_cs(body: &[u32], compute: ComputeIo, result_store: &[u32]) -> Host
         prims: Vec::new(),
         mesh_stride: 0,
         crumbs: None,
+        emulate_mesh: false,
     })
     .expect("lower");
 
@@ -2189,6 +2192,7 @@ fn build_test_cs(body: &[u32], compute: ComputeIo, result_store: &[u32]) -> Host
         descriptor_words: lowered.descriptor_words,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        mesh_emu: None,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

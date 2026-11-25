@@ -1600,6 +1600,7 @@ mod tests {
                 descriptor_words: false,
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                mesh_emu: None,
             },
             used,
         });

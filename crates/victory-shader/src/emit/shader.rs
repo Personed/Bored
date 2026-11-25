@@ -21,6 +21,11 @@ pub const ADDRESS_MAP_SPACE: u32 = 2;
 /// when the shader reads descriptors as numbers beyond what host views
 /// tell (see [`super::HostShader::descriptor_words`]).
 pub const DESCRIPTOR_WORDS_SPACE: u32 = 3;
+/// Where mesh shader emulation binds its scratch UAV (`u0`), indirect slot
+/// map / unpack vertex input SRV (`t0`), and group-base CBV (`b0`). Space 2
+/// and 3 are the fork's address map and descriptor words, so emulation uses
+/// the next space rather than upstream's `MESH_EMU_SPACE = 2`.
+pub const MESH_EMU_SPACE: u32 = 4;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -165,6 +170,9 @@ pub(crate) struct Shader {
     pub descriptor_words: Option<V>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    emu_cbv: Option<V>,
+    emu_srv: Option<V>,
+    emu_uav: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -227,6 +235,9 @@ impl Shader {
             address_map: None,
             descriptor_words: None,
             root_uavs: Vec::new(),
+            emu_cbv: None,
+            emu_srv: None,
+            emu_uav: None,
             flags: 0,
             nonuniform_handles: 0,
             cbuffer_handles: 0,
@@ -355,6 +366,64 @@ impl Shader {
         let h = self.annotate(block, h, 11, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_srvs.push((slot, h));
+        h
+    }
+
+    /// The handle of the mesh emulation group-base CBV (`b0` in
+    /// [`MESH_EMU_SPACE`]).
+    pub fn emu_cbv_handle(&mut self) -> V {
+        if let Some(h) = self.emu_cbv {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(MESH_EMU_SPACE), self.m.i8(2)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 13, 16);
+        self.emu_cbv = Some(h);
+        h
+    }
+
+    /// The handle of the mesh emulation raw SRV (`t0` in [`MESH_EMU_SPACE`]).
+    pub fn emu_srv_handle(&mut self) -> V {
+        if let Some(h) = self.emu_srv {
+            return h;
+        }
+        let h = self.space_handle(MESH_EMU_SPACE);
+        self.emu_srv = Some(h);
+        h
+    }
+
+    /// The handle of the mesh emulation raw UAV (`u0` in [`MESH_EMU_SPACE`]).
+    pub fn emu_uav_handle(&mut self) -> V {
+        if let Some(h) = self.emu_uav {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(MESH_EMU_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.emu_uav = Some(h);
         h
     }
 
@@ -540,6 +609,9 @@ impl Shader {
             || self.address_map.is_some()
             || self.descriptor_words.is_some()
             || !self.root_uavs.is_empty()
+            || self.emu_cbv.is_some()
+            || self.emu_srv.is_some()
+            || self.emu_uav.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -590,6 +662,29 @@ impl Shader {
                     dxil_kind: 13,
                 });
             }
+            if self.emu_cbv.is_some() {
+                let arr = self.m.array(4, self.t.i32);
+                let ty = self.m.named_struct("EmuConst", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, MESH_EMU_SPACE)),
+                    Some(i32c(&mut self, 0)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 16)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: MESH_EMU_SPACE,
+                    register: 0,
+                    dxil_kind: 13,
+                });
+            }
             if !cbv_list.is_empty() {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
@@ -605,6 +700,9 @@ impl Shader {
             }
             if self.descriptor_words.is_some() {
                 raw.push((DESCRIPTOR_WORDS_SPACE, 0));
+            }
+            if self.emu_srv.is_some() {
+                raw.push((MESH_EMU_SPACE, 0));
             }
             if !raw.is_empty() {
                 let ty = self
@@ -636,7 +734,15 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            let mut raw_uavs: Vec<(u32, u32)> = self
+                .root_uavs
+                .iter()
+                .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                .collect();
+            if self.emu_uav.is_some() {
+                raw_uavs.push((MESH_EMU_SPACE, 0));
+            }
+            if !raw_uavs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -645,7 +751,7 @@ impl Shader {
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                for (n, (space, register)) in raw_uavs.into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
                     // shape (11: raw buffer), globally coherent, counter,
                     // rasterizer ordered, no extra properties.
@@ -653,8 +759,8 @@ impl Shader {
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(no),
@@ -665,8 +771,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 7,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }
@@ -990,6 +1096,7 @@ mod tests {
             descriptor_words: false,
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            mesh_emu: None,
         };
         if let Ok(host) = Host::new(false) {
             host.compute_pipeline(&hs).unwrap();
