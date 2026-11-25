@@ -206,6 +206,7 @@ fn sweep() {
     }
     sweep_scratch_chunks();
     sweep_indirect_scratch();
+    sweep_preludes();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1060,8 +1061,9 @@ pub(crate) struct HostList {
     /// before the next command that may depend on them.
     pending_barriers: Mutex<Vec<D3D12_RESOURCE_BARRIER>>,
     /// The list that runs those transitions just before this one, made
-    /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    /// when the list first has such transitions ([`lazy_prelude`]). After
+    /// its submission finishes it may return to the shared prelude pool.
+    prelude: Mutex<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -1131,6 +1133,66 @@ const GATHER_SETS: usize = 8;
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Prelude allocator/list pairs no host list holds. Entries come only from
+/// preludes that were needed by a real submission, so the pool cannot grow
+/// beyond the largest number of lists using preludes together; the sweep
+/// releases that peak after it goes idle.
+static PRELUDE_SPARE: Mutex<Spare<Prelude>> = Mutex::new(Spare::new());
+
+/// Whether prelude allocator/list pairs are shared between host lists.
+/// `VICTORY_LAZY_PRELUDE=0` keeps the old eager/private lifecycle exactly.
+fn share_preludes() -> bool {
+    static POOL: OnceLock<bool> = OnceLock::new();
+    lazy_prelude()
+        && *POOL.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_none_or(|v| v != "0"))
+}
+
+/// A closed prelude list and its allocator: one no other list uses, or a
+/// new one.
+fn take_prelude(host: &Host) -> Option<Prelude> {
+    if share_preludes()
+        && let Some(prelude) = PRELUDE_SPARE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(1)
+    {
+        return Some(prelude);
+    }
+    host.make_prelude()
+}
+
+/// A list is done with `prelude` after its submissions ran. Entry sizes
+/// are nominal (`1` pair): there is no fixed count cap because the pool is
+/// bounded by past simultaneous demand and swept when that demand stops.
+fn give_prelude(prelude: Prelude) {
+    let back = if share_preludes() {
+        PRELUDE_SPARE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give(prelude, 1, u64::MAX)
+    } else {
+        Some(prelude)
+    };
+    // Freed outside the pool lock.
+    drop(back);
+}
+
+/// Lets go of spare preludes no list has reused lately. Their driver
+/// allocations are private memory, so the timeout follows RAM pressure.
+fn sweep_preludes() {
+    const IDLE_FRAMES: u64 = 4;
+    let idle_ms = ram_idle_ms(available_physical_ram());
+    let (count, _, expired) = {
+        let mut spare = PRELUDE_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.sweep(idle_ms, IDLE_FRAMES)
+    };
+    if count == 0 {
+        return;
+    }
+    drop(expired);
+    trail(|| format!("sweep: {count} spare host preludes let go"));
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4350,10 +4412,11 @@ impl Host {
     }
 
     fn make_list(&self) -> windows::core::Result<HostList> {
-        let prelude = OnceLock::new();
-        if !lazy_prelude() {
-            let _ = prelude.set(self.make_prelude());
-        }
+        let prelude = Mutex::new(if lazy_prelude() {
+            None
+        } else {
+            take_prelude(self)
+        });
         Ok(HostList {
             list: LazyCommandList::new(&self.device),
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -6987,6 +7050,19 @@ impl HostList {
                 give_indirect_scratch(buffer, size);
             }
         }
+        if share_preludes() {
+            let prelude = self
+                .prelude
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(prelude) = prelude {
+                // Every submission that ran the prelude has finished. The
+                // pair is closed and can be reset for another list instead
+                // of staying as this list's private driver memory.
+                give_prelude(prelude);
+            }
+        }
         if self.list.initialized() || crate::cardmeter::on() {
             // With card metering on the pair is made even before the first
             // command: its begin timestamp belongs at the reset, not at
@@ -7343,11 +7419,11 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && !gathered {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let mut kept = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.is_none() {
+            *kept = host().and_then(take_prelude);
+        }
+        let Some((allocator, list)) = kept.as_ref() else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
