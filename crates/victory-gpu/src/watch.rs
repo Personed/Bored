@@ -46,6 +46,10 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Under Wine: ranges the kernel answered this submission (whole
+    /// allocations included), so another range inside one is answered from
+    /// the journal instead of scanning the same allocation again.
+    asked_now: Vec<(usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -54,6 +58,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
+    asked_now: Vec::new(),
     kept: false,
 });
 
@@ -129,8 +134,10 @@ fn allocation(at: usize) -> Option<Region> {
         end = i.BaseAddress as usize + i.RegionSize;
     }
     if !done {
-        // At least past `at`, so the next asking here is a cache hit.
-        end = end.max((at / PAGE + 1) * PAGE).max(at + (256 << 20));
+        // At least past `at`, so the next asking here is a cache hit — but
+        // never past what the walk verified: a neighbouring allocation
+        // inside an unverified range would inherit this one's `mapped`.
+        end = end.max((at / PAGE + 1) * PAGE);
     }
     if end <= at {
         return None;
@@ -313,6 +320,7 @@ pub(crate) fn ask_once_end() {
         j.kept = false;
         j.ahead.clear();
     }
+    j.asked_now.clear();
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking
@@ -423,6 +431,20 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
+    // Under Wine a range inside one the kernel already answered this
+    // submission (a whole allocation asked at once) is answered from the
+    // journal: the scan cost is per asking, not per byte. A write between
+    // the two keeps its dirty bit, so the next submission sees it.
+    if on_wine() && j.asked_now.iter().any(|&(f, l)| f <= first && last <= l) {
+        j.asked += 1;
+        return Some((
+            j.asked,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
     // Under Wine: view memory cannot be watched (straight to its guards),
     // and watched memory is asked about whole allocations at a time, so the
     // other buffers in one are answered from the journal for the rest of
@@ -455,6 +477,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         } == 0;
         ok.then_some(count)
     };
+    let mut asked_range = (kfirst, klast);
     let mut answer = if mapped { None } else { ask(j, kfirst, klast) };
     if answer.is_none() && !mapped && (kfirst, klast) != (first, last) {
         // The allocation was not one watched range after all (or is gone):
@@ -462,10 +485,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if let Some(r) = region {
             forget_region(r.base);
         }
+        asked_range = (first, last);
         answer = ask(j, first, last);
     }
     let mut count = answer.unwrap_or(0);
     let failed = answer.is_none();
+    if !failed && on_wine() && j.asked_now.len() < 4096 {
+        j.asked_now.push(asked_range);
+    }
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -537,12 +564,12 @@ fn guard(start: usize, end: usize, known_mapped: bool) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = known_mapped
-        || !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+        && (known_mapped || {
             let g = guards();
             let first = start / BLOCK;
             g.protected.contains(&first) || g.absent.contains(&first)
-        };
+        });
     if !known && !is_view(start, end) {
         return None;
     }
