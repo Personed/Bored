@@ -120,7 +120,7 @@ fn dxc_library() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
 }
 
 /// Compiles a compute shader with DXC (see [`dxc_library`]).
-fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
+pub(crate) fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Dxc::*;
     use windows::Win32::System::LibraryLoader::GetProcAddress;
     use windows::core::{Interface, w};
@@ -344,14 +344,11 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
     }
 }
 
-/// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
-pub(crate) fn bound(
+/// Clamps `records` indirect arguments of `kind` (`stride` bytes apart at
+/// `gpu`), leaving their buffer in `UNORDERED_ACCESS`. Replaces the list's
+/// compute root signature and pipeline.
+pub(crate) fn clamp_only(
     list: &HostList,
-    buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
@@ -374,14 +371,32 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    true
+}
+
+/// Records, in `list`, the clamp of `records` records of `kind` (PC
+/// argument numbering) `stride` bytes apart at host address `gpu` in
+/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
+/// the list's compute root signature and pipeline (callers bind theirs
+/// after). False if the clamp is not available.
+pub(crate) fn bound(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> bool {
+    if !clamp_only(list, gpu, (kind, stride, records)) {
+        return false;
+    }
+    // SAFETY: an open list and live buffer.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
     true
 }
@@ -399,7 +414,7 @@ pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

@@ -744,6 +744,7 @@ impl State {
         p: &HostPipeline,
         buffers: &crate::mesh_emu::Buffers,
         base_group: u32,
+        slot_map_gpu: u64,
     ) -> bool {
         let Some(emu) = &p.mesh_emu else {
             return false;
@@ -769,10 +770,11 @@ impl State {
                 l.SetComputeRoot32BitConstants(param, 4, constants.as_ptr().cast(), 0);
             }
             if let Some(param) = emu.cs_srv_param {
-                l.SetComputeRootShaderResourceView(param, buffers.dummy_srv_gpu);
+                l.SetComputeRootShaderResourceView(param, slot_map_gpu);
             }
         }
         list.keep(&buffers.output);
+        list.keep(&buffers.slot_map);
         list.keep(&buffers.dummy_srv);
         true
     }
@@ -975,7 +977,7 @@ impl State {
         let mut base = 0u32;
         while base < x {
             let chunk = (x - base).min(group_cap);
-            if !self.bind_emulated_cs(list, p, buffers, base) {
+            if !self.bind_emulated_cs(list, p, buffers, base, buffers.dummy_srv_gpu) {
                 self.restore_mesh_emu_state(list);
                 return false;
             }
@@ -1456,6 +1458,19 @@ impl State {
             },
             None => None,
         };
+        if kind == MESH
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && p.mesh_emu.is_some()
+        {
+            return self.execute_indirect_mesh_emulated(
+                list,
+                p,
+                (stride, max),
+                (&args, arguments, len),
+                counter.as_ref().map(|(s, at)| (s, *at)),
+                &why,
+            );
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -1530,6 +1545,155 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        true
+    }
+    fn execute_indirect_mesh_emulated(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        (stride, max): (u32, u32),
+        (args, arguments, len): (&std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+        counter: Option<(&std::sync::Arc<crate::shadow::Shadow>, u64)>,
+        why: &dyn Fn(&str),
+    ) -> bool {
+        if stride < 12 {
+            why("indirect mesh stride smaller than 12 bytes");
+            return false;
+        }
+        let Some(emu_pipe) = &p.mesh_emu else {
+            return false;
+        };
+        let Some(buffers) = crate::mesh_emu::buffers() else {
+            why("no mesh emulation buffers");
+            return false;
+        };
+        let group_cap = buffers.group_cap(emu_pipe.emu.group_bytes());
+        if group_cap == 0 {
+            why("mesh emulation buffer smaller than one group");
+            return false;
+        }
+        let (Some(dispatch_sig), Some(draw_sig)) = (host_signature(2, 12), host_signature(0, 16))
+        else {
+            why("no host indirect command signature");
+            return false;
+        };
+        let count_gpu = counter.map(|(s, at)| s.gpu(at));
+        if count_gpu.is_some_and(|g| !g.is_multiple_of(4)) {
+            why("count not 4-byte aligned");
+            return false;
+        }
+        args.refresh(list, arguments, len);
+        if let Some((s, at)) = counter {
+            s.refresh(list, at, 4);
+        }
+        crate::list::ensure_shadow_state(list, args, 0x8);
+        if let Some((s, _)) = counter {
+            crate::list::ensure_shadow_state(list, s, 0x8);
+        }
+        // The title's mesh records are still clamped first: garbage counts
+        // must not become huge compute dispatches or draw counts here.
+        if !crate::indirect::clamp_only(list, args.gpu(arguments), (10, stride, max)) {
+            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            return false;
+        }
+        list.flush_barriers();
+        buffers.prepare_indirect(
+            list,
+            args.gpu(arguments),
+            count_gpu,
+            stride,
+            max,
+            emu_pipe.emu.max_primitives,
+            group_cap,
+        );
+        list.keep(&buffers.indirect_args);
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+
+        let finish_indirect = |list: &HostList| {
+            let args_back = transition(
+                &buffers.indirect_args,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            );
+            // SAFETY: an open list; emulation buffers return to UAV for the
+            // next preparation pass.
+            unsafe {
+                if max > 1 {
+                    let map_back = transition(
+                        &buffers.slot_map,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    );
+                    list.list.ResourceBarrier(&[args_back, map_back]);
+                } else {
+                    list.list.ResourceBarrier(&[args_back]);
+                }
+            }
+        };
+
+        let (base_group, slot_map_gpu) = if max > 1 {
+            (
+                victory_shader::emit::INDIRECT_SLOT_MAP_FLAG,
+                buffers.slot_map_gpu,
+            )
+        } else {
+            (0, buffers.dummy_srv_gpu)
+        };
+        if !self.bind_emulated_cs(list, p, buffers, base_group, slot_map_gpu) {
+            finish_indirect(list);
+            self.restore_mesh_emu_state(list);
+            why("prepare emulated mesh CS failed");
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            self.op_text(
+                format!("indirect mesh-emu max {max} at {arguments:#x}"),
+                false,
+            )
+        });
+        list.flush_barriers();
+        // SAFETY: open list with the emulated compute pipeline bound,
+        // generated indirect arguments, and `output` in UAV state.
+        unsafe {
+            list.list
+                .ExecuteIndirect(&dispatch_sig, 1, &buffers.indirect_args, 0, None, 0);
+            list.list.ResourceBarrier(&[transition(
+                &buffers.output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+        }
+        if !self.bind_emulated_gfx(list, p, buffers) {
+            // SAFETY: restore `output` for the next dispatch.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    &buffers.output,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            finish_indirect(list);
+            self.restore_mesh_emu_state(list);
+            why("prepare emulated mesh graphics failed");
+            return false;
+        }
+        list.flush_barriers();
+        // SAFETY: open list with the unpack graphics pipeline bound and
+        // generated draw arguments at offset 16.
+        unsafe {
+            list.list
+                .ExecuteIndirect(&draw_sig, 1, &buffers.indirect_args, 16, None, 0);
+            list.list.ResourceBarrier(&[transition(
+                &buffers.output,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        finish_indirect(list);
+        self.restore_mesh_emu_state(list);
+        DRAWN.fetch_add(1, Ordering::Relaxed);
         true
     }
 }
