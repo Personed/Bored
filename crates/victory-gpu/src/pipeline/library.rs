@@ -48,7 +48,7 @@
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
@@ -58,8 +58,47 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
+///
+/// The library's pipelines are named after the shaders they were made from,
+/// so a change to the translator (`victory_shader::SOURCE_HASH`) makes every
+/// name in it useless. The first run after one used to write the few
+/// pipelines it made over the old library: measured on the title, a 926 MB
+/// library (27 160 pipelines, a 7.5 minute warm-up) became 612 KB, and
+/// bisecting between two builds paid that warm-up for each of them, in
+/// turn, every time. So each translation keeps its library beside the
+/// others, in `dir/<SOURCE_HASH>`, and a run only ever writes its own;
+/// [`KEPT`] of the newest are kept.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    let _ = DIR.set(keyed(&dir));
+}
+
+/// How many translations keep a library: the one in use and the previous
+/// build's, which is what a bisection between two builds needs.
+const KEPT: usize = 2;
+
+/// `dir` under this build's translation, with older libraries pruned to
+/// [`KEPT`] (by modification time).
+fn keyed(dir: &Path) -> PathBuf {
+    let path = dir.join(victory_shader::SOURCE_HASH);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return path;
+    };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|other| *other != path && other.is_dir())
+        .filter_map(|other| {
+            let at = other.metadata().ok()?.modified().ok()?;
+            Some((at, other))
+        })
+        .collect();
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, older) in others.into_iter().skip(KEPT - 1) {
+        // A library and a list or two: gone with the translation that made
+        // them. Nothing this run reads is ever one of them.
+        let _ = std::fs::remove_dir_all(&older);
+    }
+    path
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -810,6 +849,28 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn each_translation_keeps_its_own_library_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(victory_shader::SOURCE_HASH);
+        std::fs::create_dir(&current).unwrap();
+        for older in ["a", "b", "c"] {
+            let older = dir.path().join(older);
+            std::fs::create_dir(&older).unwrap();
+            std::fs::write(older.join(LIBRARY_FILE), b"old").unwrap();
+        }
+        std::fs::write(dir.path().join("unrelated"), b"file").unwrap();
+        assert_eq!(keyed(dir.path()), current);
+        let directories = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .count();
+        assert!(directories <= KEPT);
+        assert!(current.exists());
+        assert!(dir.path().join("unrelated").exists());
     }
 
     #[test]
