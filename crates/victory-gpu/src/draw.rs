@@ -2021,6 +2021,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.flush_barriers();
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2291,6 +2292,7 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    list.flush_barriers();
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
@@ -2688,6 +2690,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.flush_barriers();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2789,6 +2792,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.flush_barriers();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2995,6 +2999,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        list.flush_barriers();
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {

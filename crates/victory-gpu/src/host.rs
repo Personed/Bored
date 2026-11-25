@@ -783,6 +783,9 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Texture transition barriers not yet recorded; coalesced and flushed
+    /// before the next command that may depend on them.
+    pending_barriers: Mutex<Vec<D3D12_RESOURCE_BARRIER>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -2937,6 +2940,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                pending_barriers: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -4518,6 +4522,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.flush_barriers();
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -4545,6 +4550,10 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pending_barriers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4568,6 +4577,30 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Queues `barrier` until the next flush. Texture state users keep the
+    /// resource alive through the list's state map until the list is reset.
+    pub(crate) fn queue_barrier(&self, barrier: D3D12_RESOURCE_BARRIER) {
+        let mut pending = self
+            .pending_barriers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        push_barrier(&mut pending, barrier);
+    }
+
+    /// Records queued texture transitions in one call before dependent work.
+    pub(crate) fn flush_barriers(&self) {
+        let mut pending = self
+            .pending_barriers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pending.is_empty() {
+            return;
+        }
+        // SAFETY: an open list; resources are alive through the list state map.
+        unsafe { self.list.ResourceBarrier(&pending) };
+        pending.clear();
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -6448,6 +6481,62 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
     }
     text
+}
+
+/// Appends `barrier`, folding a transition into the queued transition of
+/// the same resource it continues. Split barriers are never folded.
+fn push_barrier(barriers: &mut Vec<D3D12_RESOURCE_BARRIER>, barrier: D3D12_RESOURCE_BARRIER) {
+    if barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+        || barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE
+    {
+        barriers.push(barrier);
+        return;
+    }
+    // SAFETY: a transition barrier.
+    let next = unsafe { &barrier.Anonymous.Transition };
+    if next.StateBefore == next.StateAfter {
+        return;
+    }
+    let raw = next.pResource.as_ref().map(Interface::as_raw);
+    for i in (0..barriers.len()).rev() {
+        if barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+            break;
+        }
+        let flags = barriers[i].Flags;
+        // SAFETY: a transition barrier.
+        let prev = unsafe { &mut barriers[i].Anonymous.Transition };
+        if prev.pResource.as_ref().map(Interface::as_raw) != raw {
+            continue;
+        }
+        if flags == D3D12_RESOURCE_BARRIER_FLAG_NONE
+            && prev.Subresource == next.Subresource
+            && prev.StateAfter == next.StateBefore
+        {
+            if prev.StateBefore == next.StateAfter {
+                if next.StateAfter.0 & D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 != 0 {
+                    // A round trip out of unordered access still orders the
+                    // writes before and after it.
+                    barriers[i] = D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                // SAFETY: a borrowed pointer; the barrier never releases it.
+                                pResource: unsafe { std::mem::transmute_copy(&prev.pResource) },
+                            }),
+                        },
+                    };
+                } else {
+                    barriers.remove(i);
+                }
+            } else {
+                prev.StateAfter = next.StateAfter;
+            }
+            return;
+        }
+        break;
+    }
+    barriers.push(barrier);
 }
 
 pub(crate) fn transition(

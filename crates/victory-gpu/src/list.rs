@@ -758,6 +758,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
         if !host.is_empty() {
+            list.flush_barriers();
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
@@ -782,8 +783,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.queue_barrier(barrier);
     }
 }
 
@@ -863,6 +863,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            list.flush_barriers();
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -1023,6 +1024,7 @@ extern "system" fn copy_texture_region(
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        list.flush_barriers();
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
@@ -1150,6 +1152,7 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        list.flush_barriers();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -1223,17 +1226,10 @@ extern "system" fn clear_rtv(
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
-                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    State(before as i32),
-                    State(RENDER_TARGET as i32),
-                )]);
-            }
-            list.list.ClearRenderTargetView(rtv, color, rects);
-        }
+        ensure_state(list, record.resource, RENDER_TARGET);
+        list.flush_barriers();
+        // SAFETY: an open list, a fresh view of a live texture.
+        unsafe { list.list.ClearRenderTargetView(rtv, color, rects) };
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
@@ -1276,6 +1272,7 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        list.flush_barriers();
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
