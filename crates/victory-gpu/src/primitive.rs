@@ -129,6 +129,9 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if v.is_nan() {
+        return sign | 0x7e00 | (man >> 13) as u16;
+    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -150,12 +153,33 @@ fn f32_to_half(v: f32) -> u16 {
     // Rounded to nearest: a carry out of the mantissa is added into the
     // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    // At an exact midpoint, only increment an odd retained mantissa.
+    let rounding_bias = 0xfff + ((man >> 13) & 1);
+    sign | (half + ((man + rounding_bias) >> 13)) as u16
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_midpoints_round_to_the_even_neighbour() {
+        for lower in 0u16..0x7bff {
+            let midpoint = (half_to_f32(lower) + half_to_f32(lower + 1)) * 0.5;
+            let even = lower + (lower & 1);
+            assert_eq!(f32_to_half(midpoint), even);
+            assert_eq!(f32_to_half(-midpoint), even | 0x8000);
+        }
+    }
+
+    #[test]
+    fn half_nan_attributes_remain_nan() {
+        for bits in [0x7f80_0001, 0x7fc0_0000, 0xffc0_0000] {
+            let half = f32_to_half(f32::from_bits(bits));
+            assert!(half_to_f32(half).is_nan());
+            assert_eq!(u32::from(half >> 15), bits >> 31);
+        }
+    }
 
     /// A rectangle of float2 positions and RGBA8 colors, given as top
     /// left, bottom left, bottom right: the fourth corner completes the
