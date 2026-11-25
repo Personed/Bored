@@ -1198,7 +1198,8 @@ mod host {
 
     /// Right-stick deflection per pixel the mouse moves in one poll, at
     /// sensitivity 1: 20 pixels in 8 ms is the full stick.
-    const STICK_PER_PIXEL: f32 = 0.05;
+    /// Full stick at 4000 pixels of mouse travel per second.
+    const STICK_PER_PIXEL_SECOND: f32 = 1.0 / 4000.0;
 
     #[derive(Default)]
     pub(super) struct Host {
@@ -1335,22 +1336,25 @@ mod host {
             };
             // The first poll after gaining focus only centres the cursor.
             let moved = std::mem::replace(&mut self.mouse_centred, true) && read;
-            // v = alpha*delta + (1-alpha)*v, with alpha set by the wall
-            // time since the last poll (half-life 50 ms).
+            // v = alpha*speed + (1-alpha)*v, alpha by the wall time
+            // since the last poll (half-life 50 ms). Speed is pixels per
+            // second — dividing the delta out of the poll interval keeps
+            // the camera independent of how long polls take.
             let now = Instant::now();
-            let keep = self
-                .mouse_decayed
-                .replace(now)
-                .map_or(0.0, |then| 0.5f32.powf((now - then).as_secs_f32() / 0.05));
+            let elapsed = self.mouse_decayed.replace(now);
+            let (keep, dt) = elapsed.map_or((0.0, 0.0), |then| {
+                let secs = (now - then).as_secs_f32().max(0.001);
+                (0.5f32.powf(secs / 0.05), secs)
+            });
             self.mouse_x *= keep;
             self.mouse_y *= keep;
-            if moved {
+            if moved && dt > 0.0 {
                 let alpha = 1.0 - keep;
-                self.mouse_x += (at.x - centre.0) as f32 * alpha;
-                self.mouse_y += (at.y - centre.1) as f32 * alpha;
+                self.mouse_x += (at.x - centre.0) as f32 / dt * alpha;
+                self.mouse_y += (at.y - centre.1) as f32 / dt * alpha;
             }
             let (x, y) = (self.mouse_x, self.mouse_y);
-            let scale = STICK_PER_PIXEL * sensitivity;
+            let scale = STICK_PER_PIXEL_SECOND * sensitivity;
             MouseState {
                 x: x * scale,
                 y: -(y) * scale,
