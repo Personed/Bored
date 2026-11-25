@@ -178,11 +178,18 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     if !at.is_null() && !placeholder && kind & MEM_COMMIT != 0 {
-        COMMITTED.fetch_add(size, Ordering::Relaxed);
-        COMMITTED_VIRTUAL
+        let previous = COMMITTED_VIRTUAL
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(at as usize, size);
+        // A recommit of the same range replaces its charge rather than
+        // adding to it.
+        if let Some(old) = previous {
+            let _ = COMMITTED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(old))
+            });
+        }
+        COMMITTED.fetch_add(size, Ordering::Relaxed);
     }
     at
 }
