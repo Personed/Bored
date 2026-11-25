@@ -2465,7 +2465,7 @@ impl State {
 
     /// A mesh draw under `VICTORY_MESH_TEST=scissor` rasterises one pixel:
     /// the scissors before it (`on`), the title's after it.
-    fn mesh_scissor(&self, list: &HostList, on: bool) {
+    fn mesh_scissor(&mut self, list: &HostList, on: bool) {
         if mesh_test() != 2 {
             return;
         }
