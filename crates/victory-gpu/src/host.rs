@@ -7209,7 +7209,10 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// a copy to a thread (`VICTORY_WIDE_REFRESH=0` turns this off). On hosts
+/// with fewer than eight hardware threads it stays off unless
+/// `VICTORY_WIDE_REFRESH=1`: spare parallelism is what pays for the extra
+/// memory traffic.
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
@@ -7222,7 +7225,11 @@ impl HostList {
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_WIDE_REFRESH").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => std::thread::available_parallelism().is_ok_and(|n| n.get() >= 8),
+    })
 }
 
 /// Whether a range of a host copy brought up to date in a submission is
