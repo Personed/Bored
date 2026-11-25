@@ -7100,7 +7100,31 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // Texture refreshes only read title memory and write each staging
+        // buffer's own memory. Consecutive ones can therefore run together;
+        // the group is still finished before the next step that writes title
+        // memory, preserving submission ordering.
+        let mut textures = Vec::new();
+        let run_textures = |textures: &mut Vec<std::sync::Arc<crate::texture::Staging>>| {
+            if textures.is_empty() {
+                return;
+            }
+            if wide_refresh() && textures.len() >= 4 {
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = textures
+                    .drain(..)
+                    .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                    .collect();
+                crate::shadow::wide_run(jobs);
+            } else {
+                for staging in textures.drain(..) {
+                    staging.refresh();
+                }
+            }
+        };
         for step in &self.deferred().copies {
+            if !matches!(step, Step::Texture(_)) {
+                run_textures(&mut textures);
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -7172,7 +7196,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        textures.push(staging.clone());
                     }
                     continue;
                 }
@@ -7180,6 +7204,7 @@ impl HostList {
             preparing(0, started.elapsed().as_micros() as u64);
             preparing(1, copied as u64);
         }
+        run_textures(&mut textures);
     }
 }
 
