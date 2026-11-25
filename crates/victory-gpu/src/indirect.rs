@@ -1143,7 +1143,7 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -1163,6 +1163,11 @@ void main() {
 }
 "#;
 
+    // Parallel device creation AVs on the GPU runner (same class as
+    // victory-shader's valu_tests::ONE_AT_A_TIME): every harness test holds
+    // this for its lifetime, so only one WARP device exists at a time.
+    pub(crate) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct WarpHarness {
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
@@ -1173,10 +1178,14 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        // Last field on purpose: the guard drops last, after the device and
+        // every object on it is released (fields drop in declaration order).
+        _one: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -1215,6 +1224,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _one: one,
                 })
             }
         }

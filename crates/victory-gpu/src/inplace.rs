@@ -1673,7 +1673,10 @@ mod tests {
         }
     }
 
-    pub(crate) fn warp() -> Option<ID3D12Device> {
+    pub(crate) fn warp() -> Option<(std::sync::MutexGuard<'static, ()>, ID3D12Device)> {
+        let one = crate::indirect::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
         // SAFETY: plain DXGI queries and device creation on the software
@@ -1687,7 +1690,11 @@ mod tests {
             }
             let mut device: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-            device
+            // The guard rides first in the tuple: callers destructure
+            // `(_one, device)`, and locals drop in reverse pattern order -
+            // the device first, then the guard unlocks, so no two WARP
+            // devices exist at a time.
+            device.map(|d| (one, d))
         }
     }
 
@@ -1696,7 +1703,7 @@ mod tests {
     /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
     fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
-        let Some(device) = warp() else { return };
+        let Some((_one, device)) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
             return;
@@ -1728,7 +1735,7 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
-        let Some(device) = warp() else { return };
+        let Some((_one, device)) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;
         }
