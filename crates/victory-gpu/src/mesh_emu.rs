@@ -31,6 +31,8 @@ cbuffer Info : register(b0) {
     uint has_count;
     uint build_map;
 };
+// The inputs are unordered views only so same-submission GPU writes need no
+// SRV transition; this pass reads them and never stores to either.
 RWByteAddressBuffer args : register(u0);
 RWByteAddressBuffer count_buf : register(u1);
 RWByteAddressBuffer out_args : register(u2);
