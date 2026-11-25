@@ -2478,7 +2478,8 @@ impl State {
             };
             crate::draw::scissors(list, &vec![one; self.scissors.len().max(1)]);
         } else if !self.scissors.is_empty() {
-            crate::draw::scissors(list, &self.scissors);
+            let rects = self.scissors.clone();
+            self.set_scissors(list, &rects);
         }
     }
 
