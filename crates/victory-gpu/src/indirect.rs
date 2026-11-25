@@ -1163,7 +1163,13 @@ void main() {
 }
 "#;
 
+    // Parallel device creation AVs on the GPU runner (same class as
+    // victory-shader's valu_tests::ONE_AT_A_TIME): every harness test holds
+    // this for its lifetime, so only one WARP device exists at a time.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct WarpHarness {
+        _one: std::sync::MutexGuard<'static, ()>,
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
         allocator: ID3D12CommandAllocator,
@@ -1177,6 +1183,7 @@ void main() {
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -1206,6 +1213,7 @@ void main() {
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
+                    _one: one,
                     device,
                     queue,
                     allocator,
