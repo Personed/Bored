@@ -3779,6 +3779,43 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     submission_us(1, us);
 }
 
+/// Fits a fetch buffer to `total` bytes, in 16 MiB size classes. Growth is
+/// required: if a new buffer cannot be made, an undersized old one is not
+/// kept for copies to run past. Shrinking is optional: the old one stays if
+/// the smaller one cannot be made, and the next attempt is a hysteresis
+/// interval later.
+fn fit_fetch_buffer(
+    host: &Host,
+    buffer: &mut Option<(ID3D12Resource, usize, u64)>,
+    small_since: &mut Option<u64>,
+    total: u64,
+) {
+    let size = total.next_multiple_of(16 << 20);
+    let mut shrink = false;
+    if buffer.as_ref().is_some_and(|f| f.2 > size) {
+        let since = small_since.get_or_insert_with(moment);
+        const SMALL_FRAMES: u64 = 4;
+        shrink = long_ago(*since, 5_000, SMALL_FRAMES);
+    } else {
+        *small_since = None;
+    }
+    let lacks = buffer.as_ref().is_none_or(|f| f.2 < total);
+    if !shrink && !lacks {
+        return;
+    }
+    if let Some(made) = host
+        .shared_buffer(size)
+        .map(|(buffer, data)| (buffer, data as usize, size))
+    {
+        *buffer = Some(made);
+        *small_since = None;
+    } else if lacks {
+        *buffer = None;
+    } else {
+        *small_since = Some(moment());
+    }
+}
+
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
@@ -3790,6 +3827,8 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// Since when `buffer` has been larger than the fetches needed.
+    small_since: Option<u64>,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -5135,6 +5174,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                small_since: None,
             })
         }
     }
@@ -5294,12 +5334,7 @@ impl Host {
                 "no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"
             ));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
-            f.buffer = self
-                .shared_buffer(size)
-                .map(|(buffer, data)| (buffer, data as usize, size));
-        }
+        fit_fetch_buffer(self, &mut f.buffer, &mut f.small_since, total);
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!(
                 "no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"
@@ -5769,29 +5804,12 @@ impl Host {
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
-            let size = total.next_multiple_of(16 << 20);
-            let mut shrink = false;
-            if work.fetched.as_ref().is_some_and(|f| f.2 > size) {
-                let since = work.fetched_small_since.get_or_insert_with(moment);
-                const SMALL_FRAMES: u64 = 4;
-                shrink = long_ago(*since, 5_000, SMALL_FRAMES);
-            } else {
-                work.fetched_small_since = None;
-            }
-            let lacks = work.fetched.as_ref().is_none_or(|f| f.2 < total);
-            if shrink || lacks {
-                if let Some(buffer) = self
-                    .shared_buffer(size)
-                    .map(|(buffer, data)| (buffer, data as usize, size))
-                {
-                    work.fetched = Some(buffer);
-                    work.fetched_small_since = None;
-                } else if shrink && !lacks {
-                    // The old, larger buffer still serves; do not retry an
-                    // optional shrink in every fetch.
-                    work.fetched_small_since = Some(moment());
-                }
-            }
+            fit_fetch_buffer(
+                self,
+                &mut work.fetched,
+                &mut work.fetched_small_since,
+                total,
+            );
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!(
                     "no memory to fetch what shaders wrote to the card's memory ({total} bytes)"
