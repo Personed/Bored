@@ -1142,15 +1142,17 @@ fn lazy_prelude() -> bool {
 static PRELUDE_SPARE: Mutex<Spare<Prelude>> = Mutex::new(Spare::new());
 
 /// Whether prelude allocator/list pairs are shared between host lists.
-fn prelude_pool() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_none_or(|v| v != "0"))
+/// `VICTORY_LAZY_PRELUDE=0` keeps the old eager/private lifecycle exactly.
+fn share_preludes() -> bool {
+    static POOL: OnceLock<bool> = OnceLock::new();
+    lazy_prelude()
+        && *POOL.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_none_or(|v| v != "0"))
 }
 
 /// A closed prelude list and its allocator: one no other list uses, or a
 /// new one.
 fn take_prelude(host: &Host) -> Option<Prelude> {
-    if prelude_pool()
+    if share_preludes()
         && let Some(prelude) = PRELUDE_SPARE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1165,7 +1167,7 @@ fn take_prelude(host: &Host) -> Option<Prelude> {
 /// are nominal (`1` pair): there is no fixed count cap because the pool is
 /// bounded by past simultaneous demand and swept when that demand stops.
 fn give_prelude(prelude: Prelude) {
-    let back = if prelude_pool() {
+    let back = if share_preludes() {
         PRELUDE_SPARE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -7048,7 +7050,7 @@ impl HostList {
                 give_indirect_scratch(buffer, size);
             }
         }
-        if prelude_pool() {
+        if share_preludes() {
             let prelude = self
                 .prelude
                 .lock()
