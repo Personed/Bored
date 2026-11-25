@@ -181,7 +181,9 @@ impl GraphicsState {
     pub(crate) fn screen_pass(&self) -> bool {
         self.inputs.is_empty()
             && (self.depth_format == DXGI_FORMAT_UNKNOWN
-                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+                || !self.depth_bounds
+                    && !self.depth.DepthEnable.as_bool()
+                    && !self.depth.StencilEnable.as_bool())
             && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
     }
 
@@ -1503,6 +1505,10 @@ mod tests {
         g.depth.DepthEnable = false.into();
         g.depth.StencilEnable = false.into();
         assert!(g.screen_pass());
+
+        g.depth_bounds = true;
+        assert!(!g.screen_pass());
+        g.depth_bounds = false;
 
         g.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
         assert!(!g.screen_pass());
