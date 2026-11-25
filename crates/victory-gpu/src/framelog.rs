@@ -178,19 +178,37 @@ pub fn on_slow_core() -> bool {
 /// The system's processor sets of group 0: each one's id, its logical
 /// processor and its efficiency class (higher is faster).
 fn cpu_sets() -> Vec<(u32, u8, u8)> {
-    use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
+    use windows_sys::Win32::System::SystemInformation::{
+        GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
     // SAFETY: a size query, then the call into a buffer of that size.
-    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    unsafe {
+        GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0)
+    };
     let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
     // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
-    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    let ok = unsafe {
+        GetSystemCpuSetInformation(
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+            GetCurrentProcess(),
+            0,
+        )
+    };
     let mut sets = Vec::new();
     let mut at = 0usize;
     while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
         // SAFETY: a record inside the buffer; each says its own size.
-        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        let info = unsafe {
+            &*(buffer
+                .as_ptr()
+                .cast::<u8>()
+                .add(at)
+                .cast::<SYSTEM_CPU_SET_INFORMATION>())
+        };
         if info.Size == 0 {
             break;
         }
@@ -202,6 +220,16 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
         at += info.Size as usize;
     }
     sets
+}
+
+/// The slow logical processors of group 0 as a mask (a lower efficiency
+/// class than the best): 0 where all cores are alike.
+pub fn slow_processors() -> usize {
+    let sets = cpu_sets();
+    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
+    sets.iter()
+        .filter(|c| c.2 < best && c.1 < usize::BITS as u8)
+        .fold(0, |mask, c| mask | 1usize << c.1)
 }
 
 /// Asks the system to run the calling thread on the fast cores only, where
@@ -227,11 +255,17 @@ pub fn keep_on_fast_cores(what: &str) {
         return;
     }
     // SAFETY: our own thread and a list of the system's own set ids.
-    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
+    let ok =
+        unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
     if ok == 0 {
         tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
     } else {
-        tracing::info!(what, fast = fast.len(), of = sets.len(), "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+        tracing::info!(
+            what,
+            fast = fast.len(),
+            of = sets.len(),
+            "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)"
+        );
     }
 }
 
@@ -255,10 +289,18 @@ pub fn keep_on_slow_cores(what: &str) -> bool {
         return false;
     }
     // SAFETY: our own thread and a list of the system's own set ids.
-    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) } != 0;
+    let ok =
+        unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) }
+            != 0;
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        tracing::info!(what, slow = slow.len(), of = sets.len(), ok, "helper threads are kept on the slow cores: the first one");
+        tracing::info!(
+            what,
+            slow = slow.len(),
+            of = sets.len(),
+            ok,
+            "helper threads are kept on the slow cores: the first one"
+        );
     });
     ok
 }
@@ -280,10 +322,21 @@ fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 pub fn thread_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: our own thread and four valid out pointers.
-    unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) };
+    unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
     (micros(user), micros(kernel))
 }
 
@@ -291,16 +344,29 @@ pub fn thread_times() -> (u64, u64) {
 fn process_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: our own process and four valid out pointers.
-    unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) };
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
     (micros(user), micros(kernel))
 }
 
 /// The process's page faults so far (soft and hard).
 fn page_faults() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: plain data the call fills in.
     let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
@@ -471,7 +537,14 @@ fn text(f: &Frame) -> String {
 /// The mean of `frames` (not empty).
 fn mean(frames: &[&Frame]) -> Frame {
     let n = frames.len() as f64;
-    let mut out = Frame { number: 0, at: 0.0, us: 0.0, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
+    let mut out = Frame {
+        number: 0,
+        at: 0.0,
+        us: 0.0,
+        t: [0.0; N],
+        s: [0.0; S],
+        h: [0.0; HN],
+    };
     for f in frames {
         out.us += f.us / n;
         for i in 0..N {
@@ -497,7 +570,10 @@ fn long_over(usual: f64) -> f64 {
 fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
     let over = long_over(usual);
     let (long, plain): (Vec<&Frame>, Vec<&Frame>) = frames.iter().partition(|f| f.us > over);
-    let each: Vec<String> = frames.iter().map(|f| format!("{:.0}", f.us / 1e3)).collect();
+    let each: Vec<String> = frames
+        .iter()
+        .map(|f| format!("{:.0}", f.us / 1e3))
+        .collect();
     let shortest = frames.iter().map(|f| f.us).fold(f64::INFINITY, f64::min);
     let longest = frames.iter().map(|f| f.us).fold(0.0, f64::max);
     let mut out = vec![format!(
@@ -513,13 +589,25 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
         each.join(" ")
     )];
     if !plain.is_empty() {
-        out.push(format!("usual frame (the mean of {} not long): {}", plain.len(), text(&mean(&plain))));
+        out.push(format!(
+            "usual frame (the mean of {} not long): {}",
+            plain.len(),
+            text(&mean(&plain))
+        ));
     }
     for f in long.iter().take(LONG_MOST) {
-        out.push(format!("long frame {} at {:.1} s: {}", f.number, f.at, text(f)));
+        out.push(format!(
+            "long frame {} at {:.1} s: {}",
+            f.number,
+            f.at,
+            text(f)
+        ));
     }
     if long.len() > LONG_MOST {
-        out.push(format!("long frames: {} more in this reading are not listed", long.len() - LONG_MOST));
+        out.push(format!(
+            "long frames: {} more in this reading are not listed",
+            long.len() - LONG_MOST
+        ));
     }
     out
 }
@@ -597,7 +685,14 @@ mod tests {
     use super::*;
 
     fn frame(number: u64, ms: f64) -> Frame {
-        let mut f = Frame { number, at: number as f64, us: ms * 1e3, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
+        let mut f = Frame {
+            number,
+            at: number as f64,
+            us: ms * 1e3,
+            t: [0.0; N],
+            s: [0.0; S],
+            h: [0.0; HN],
+        };
         f.t[T::PresentUs as usize] = ms * 100.0;
         f.t[T::Uploads as usize] = ms;
         f
@@ -605,16 +700,28 @@ mod tests {
 
     #[test]
     fn a_long_frame_is_listed_beside_the_usual_one() {
-        let frames: Vec<Frame> = [150.0, 160.0, 140.0, 400.0, 150.0].iter().enumerate().map(|(i, &ms)| frame(i as u64, ms)).collect();
+        let frames: Vec<Frame> = [150.0, 160.0, 140.0, 400.0, 150.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &ms)| frame(i as u64, ms))
+            .collect();
         let out = lines(&frames, 150_000.0, 1.0);
         assert_eq!(out.len(), 3, "{out:#?}");
         assert!(out[0].starts_with("frame times: 5 frames in 1.0 s: shortest 140 ms, median 150, longest 400; 1 long (over 225 ms"), "{}", out[0]);
         assert!(out[0].ends_with("each: 150 160 140 400 150"), "{}", out[0]);
         // The usual frame is the mean of the four that are not long.
-        assert!(out[1].starts_with("usual frame (the mean of 4 not long): 150 ms |"), "{}", out[1]);
+        assert!(
+            out[1].starts_with("usual frame (the mean of 4 not long): 150 ms |"),
+            "{}",
+            out[1]
+        );
         assert!(out[1].contains("in the present call 15.0 "), "{}", out[1]);
         assert!(out[1].contains(" 150 uploads"), "{}", out[1]);
-        assert!(out[2].starts_with("long frame 3 at 3.0 s: 400 ms |"), "{}", out[2]);
+        assert!(
+            out[2].starts_with("long frame 3 at 3.0 s: 400 ms |"),
+            "{}",
+            out[2]
+        );
         assert!(out[2].contains("in the present call 40.0 "), "{}", out[2]);
         assert!(out[2].contains(" 400 uploads"), "{}", out[2]);
     }
@@ -630,8 +737,14 @@ mod tests {
         let mut frames: Vec<Frame> = (0..12).map(|i| frame(i, 500.0)).collect();
         frames.push(frame(12, 100.0));
         let out = lines(&frames, 100_000.0, 5.0);
-        assert_eq!(out.iter().filter(|l| l.starts_with("long frame ")).count(), LONG_MOST);
-        assert!(out.last().unwrap().starts_with("long frames: 4 more"), "{out:#?}");
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("long frame ")).count(),
+            LONG_MOST
+        );
+        assert!(
+            out.last().unwrap().starts_with("long frames: 4 more"),
+            "{out:#?}"
+        );
     }
 
     #[test]

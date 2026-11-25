@@ -25,9 +25,9 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
-mod drvwatch;
-#[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod drvwatch;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
@@ -40,6 +40,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+#[cfg(windows)]
+mod memory;
 #[cfg(windows)]
 mod mesh_emu;
 pub mod object;
@@ -61,14 +63,14 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
-mod memory;
-#[cfg(windows)]
 mod shadow;
-#[cfg(windows)]
-mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod spread;
+#[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod tiles;
 #[cfg(windows)]
 mod watch;
 
