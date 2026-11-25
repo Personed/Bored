@@ -55,12 +55,15 @@ pub(crate) extern "system" fn set_interval(
     };
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
+    // Read it under the lock `next_tick` uses, so a concurrent wait cannot
+    // reserve a newer tick between the read and the clock replacement.
+    let mut clock = clock();
     let first = LAST
         .iter()
         .map(|t| t.load(Ordering::Relaxed))
         .max()
         .unwrap_or(0);
-    *clock() = Some(Clock {
+    *clock = Some(Clock {
         start: Instant::now(),
         interval,
         first,
