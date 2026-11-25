@@ -1143,7 +1143,7 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -1166,10 +1166,9 @@ void main() {
     // Parallel device creation AVs on the GPU runner (same class as
     // victory-shader's valu_tests::ONE_AT_A_TIME): every harness test holds
     // this for its lifetime, so only one WARP device exists at a time.
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct WarpHarness {
-        _one: std::sync::MutexGuard<'static, ()>,
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
         allocator: ID3D12CommandAllocator,
@@ -1179,6 +1178,9 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        // Last field on purpose: the guard drops last, after the device and
+        // every object on it is released (fields drop in declaration order).
+        _one: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
@@ -1213,7 +1215,6 @@ void main() {
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
-                    _one: one,
                     device,
                     queue,
                     allocator,
@@ -1223,6 +1224,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _one: one,
                 })
             }
         }
