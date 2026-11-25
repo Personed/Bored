@@ -94,6 +94,10 @@ waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
 to the per-lane load or choice that gives each lane its own (a mask's
 `v_cndmask_b32`, or an if/else whose arms each set it: traced on the paths
 the lanes take, from structurisation), and accessed with a non-uniform heap
-index in one pass. `victory translate`
+index in one pass. On GPUs with SM 6.6 that lack hardware mesh shaders (or with
+`VICTORY_MESH_EMULATION=1`), console mesh programs (`HwStage::Ms`) lower to a
+compute pass (`cs_6_6`) writing packed primitive indices and attributes into a
+VRAM buffer read back by a generated unpack vertex shader (`vs_6_6`).
+`victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
