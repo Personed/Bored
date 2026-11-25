@@ -6737,6 +6737,16 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// The adapter the device is on, as its locally unique id (for cache keys).
+    pub(crate) fn adapter_luid(&self) -> [u8; 8] {
+        // SAFETY: a live device; the returned value is plain data.
+        let luid = unsafe { self.device.GetAdapterLuid() };
+        let mut key = [0; 8];
+        key[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
+        key[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
+        key
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

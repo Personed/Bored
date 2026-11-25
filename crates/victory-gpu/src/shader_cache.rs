@@ -81,6 +81,9 @@ fn build() -> &'static [u8; BUILD_LEN] {
                     }
                     bytes.push(0);
                 }
+                // The host adapter too: wave size and driver capabilities can
+                // differ across GPUs even when the executable is unchanged.
+                bytes.extend_from_slice(&crate::host::host().map_or([0; 8], |h| h.adapter_luid()));
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
