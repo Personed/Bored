@@ -2053,7 +2053,7 @@ impl<'a> Lower<'a> {
     /// lanes outside the mask), bit for bit as the console adds it: every addition rounds to
     /// 16 bits, so the order counts, and the compiler's is the balanced tree over the lanes
     /// in their order (lanes 2k and 2k+1, then pairs, ... then the wave's two halves;
-    /// [`super::wave::buddies`]). Each lane adds its partner's partial sum, read from the
+    /// `super::wave::buddies`). Each lane adds its partner's partial sum, read from the
     /// lane whose number differs in one bit, step by step; two host waves of 32 then exchange
     /// their halves' sums for the last addition. The high half of the result is lane 0's,
     /// which no `v_add_f16` writes.
