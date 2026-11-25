@@ -1847,12 +1847,45 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    frame_times: FrameTimes,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+}
+
+/// Durations between presented frames, kept until the next performance log.
+#[derive(Default)]
+struct FrameTimes {
+    previous: Option<std::time::Instant>,
+    samples: Vec<std::time::Duration>,
+}
+
+impl FrameTimes {
+    fn record(&mut self, now: std::time::Instant) {
+        if let Some(previous) = self.previous.replace(now) {
+            self.samples.push(now.saturating_duration_since(previous));
+        }
+    }
+
+    /// Returns nearest-rank p50 and p95, then clears samples but retains the
+    /// previous presentation time so the next interval has no gap.
+    fn take_percentiles(&mut self) -> Option<(std::time::Duration, std::time::Duration)> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        self.samples.sort_unstable();
+        let len = self.samples.len();
+        let percentile = |percent: usize| {
+            let index = (len * percent).div_ceil(100).saturating_sub(1);
+            self.samples[index.min(len - 1)]
+        };
+        let result = (percentile(50), percentile(95));
+        self.samples.clear();
+        Some(result)
+    }
 }
 
 impl Meter {
@@ -1863,6 +1896,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            frame_times: FrameTimes::default(),
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -1875,12 +1909,14 @@ impl Meter {
     fn frame(&mut self, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+        let now = std::time::Instant::now();
+        self.frame_times.record(now);
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let elapsed = now.saturating_duration_since(self.since);
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -1906,12 +1942,23 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let frame_timing = self
+                .frame_times
+                .take_percentiles()
+                .map(|(p50, p95)| {
+                    format!(
+                        "frame time p50/p95 {:.1}/{:.1} ms",
+                        p50.as_secs_f64() * 1000.0,
+                        p95.as_secs_f64() * 1000.0
+                    )
+                })
+                .unwrap_or_else(|| "frame time p50/p95 n/a".into());
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect",
+                 {indirect:.0} indirect; {frame_timing}",
                 making = crate::pipeline::making()
             );
             #[cfg(feature = "diagnostics")]
@@ -1959,6 +2006,41 @@ impl Meter {
                     }
                 });
         });
+    }
+}
+
+#[cfg(test)]
+mod frame_time_tests {
+    use super::FrameTimes;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn reports_nearest_rank_median_and_p95_and_starts_a_fresh_window() {
+        let start = Instant::now();
+        let mut times = FrameTimes::default();
+        for millis in [0, 100, 110, 150, 170, 200] {
+            times.record(start + Duration::from_millis(millis));
+        }
+
+        assert_eq!(
+            times.take_percentiles(),
+            Some((Duration::from_millis(30), Duration::from_millis(100)))
+        );
+        assert_eq!(times.take_percentiles(), None);
+
+        // Clearing a window must not lose the previous presentation time.
+        times.record(start + Duration::from_millis(240));
+        assert_eq!(
+            times.take_percentiles(),
+            Some((Duration::from_millis(40), Duration::from_millis(40)))
+        );
+    }
+
+    #[test]
+    fn first_presentation_has_no_interval_sample() {
+        let mut times = FrameTimes::default();
+        times.record(Instant::now());
+        assert_eq!(times.take_percentiles(), None);
     }
 }
 
