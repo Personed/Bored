@@ -1401,13 +1401,13 @@ fn give_back(snapshot: Snapshot) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(snapshot);
     pool.sort_by_key(|s| std::cmp::Reverse(s.len));
-    pool.truncate(8);
-    let mut total = 0usize;
+    let (mut kept_count, mut total) = (0usize, 0usize);
     let most = pool_most();
     pool.retain(|s| {
         let bytes = s.committed_bytes();
-        let keep = total.saturating_add(bytes) <= most;
+        let keep = kept_count < 8 && total.saturating_add(bytes) <= most;
         if keep {
+            kept_count += 1;
             total += bytes;
         }
         keep
