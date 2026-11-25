@@ -270,6 +270,152 @@ fn title_written_flags(flags: D3D12_RESOURCE_FLAGS) -> bool {
     (flags & host_writable) == D3D12_RESOURCE_FLAG_NONE
 }
 
+/// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
+/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
+/// (a texture streams in whole mips; the small ones lie first). Read
+/// through the kernel, so pages not there count as zeros.
+pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    const WINDOW: usize = 16 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    let mut hasher = blake3::Hasher::new();
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(3 * WINDOW, 0);
+        let mut take = |from: usize, bytes: usize| {
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(
+                read.as_mut_ptr(),
+                (at as usize + from) as *const u8,
+                bytes,
+                false,
+            );
+            hasher.update(&read[..bytes]);
+        };
+        if len <= 3 * WINDOW {
+            take(0, len);
+        } else {
+            take(0, WINDOW);
+            take((len / 2) & !0xfff, WINDOW);
+            take(len - WINDOW, WINDOW);
+        }
+    });
+    let hash = hasher.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
+/// Where a staged title texture's memory is: address and bytes.
+pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    Some((staging.memory as u64, staging.size as u64))
+}
+
+/// Frames after a whole upload of a texture at which its memory is looked
+/// at again, each counted from the look before.
+const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Textures uploaded whole, looked at again while their memory may still
+/// be streaming in with nothing to tell of it: resource -> (address,
+/// bytes, fingerprint at the upload, looks that found it unchanged, frame
+/// of the next look).
+/// (Address, bytes, fingerprint at the upload, looks that found it
+/// unchanged, frame of the next look) of one uploaded texture.
+type Recheck = (u64, u64, u64, u8, u64);
+
+static RECHECKS: Mutex<Option<HashMap<usize, Recheck>>> = Mutex::new(None);
+
+/// Whether uploaded textures are looked at again after their upload
+/// (`VICTORY_HEAP_RECHECK=0`: no).
+fn heap_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// `resource` was uploaded whole: looked at again from frame `due` (the
+/// title may fill the texture's memory only after it wrote the view, with
+/// no descriptor write and nothing from the runtime to tell of it; the
+/// host copy then kept what the memory held at the first look for the
+/// rest of the run).
+fn recheck_later(resource: This, due: u64) {
+    if !heap_recheck() {
+        return;
+    }
+    let Some((at, len)) = staged_memory(resource) else {
+        return;
+    };
+    let print = fingerprint(at, len);
+    let mut map = RECHECKS.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new)
+        .insert(resource as usize, (at, len, print, 0, due));
+}
+
+/// The memory of a texture looked at again at `frame` changed since its
+/// upload: the next refresh re-reads and re-detiles it whole, and the
+/// caller uploads it again. Unchanged: the look is rescheduled
+/// (`RECHECK_FRAMES`), or the looks end.
+pub(crate) fn recheck_due(resource: This, frame: u64) -> bool {
+    if !heap_recheck() {
+        return false;
+    }
+    let entry = {
+        let mut map = RECHECKS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_mut() else {
+            return false;
+        };
+        let Some(entry) = map.get_mut(&(resource as usize)) else {
+            return false;
+        };
+        if frame < entry.4 {
+            return false;
+        }
+        *entry
+    };
+    let (at, len, print, looks, _) = entry;
+    if fingerprint(at, len) == print {
+        let mut map = RECHECKS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut() {
+            match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                Some(wait) => {
+                    if let Some(entry) = map.get_mut(&(resource as usize)) {
+                        entry.3 = looks + 1;
+                        entry.4 = frame + wait;
+                    }
+                }
+                None => {
+                    map.remove(&(resource as usize));
+                }
+            }
+        }
+        return false;
+    }
+    {
+        let mut map = RECHECKS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut() {
+            map.remove(&(resource as usize));
+        }
+    }
+    // The incremental refresh asks the write-watch which pages changed;
+    // this write is one nothing told of. The next refresh re-reads the
+    // memory whole instead.
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(staging) = map.as_ref().and_then(|map| map.get(&(resource as usize))) {
+        staging.last.lock().unwrap_or_else(|e| e.into_inner()).asked = 0;
+    }
+    tracing::warn!(
+        resource = format_args!("{:?}", resource as usize),
+        address = format_args!("{at:#x}"),
+        bytes = len,
+        looks,
+        "a texture changed after its upload with nothing to tell of it: uploaded again"
+    );
+    true
+}
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
@@ -333,6 +479,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
+    recheck_later(resource, crate::queue::presented() + RECHECK_FRAMES[0]);
 }
 
 impl Staging {
