@@ -768,6 +768,9 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Whether the list is closed; the console tolerates a repeated close,
+    /// which host D3D12 fails with the same E_FAIL as an invalid command.
+    closed: std::sync::atomic::AtomicBool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -2933,6 +2936,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                closed: std::sync::atomic::AtomicBool::new(false),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -4518,6 +4522,13 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a host command list closed twice; the second close does nothing")
+            });
+            return;
+        }
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -4539,6 +4550,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.closed.store(false, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
