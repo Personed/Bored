@@ -90,6 +90,10 @@ struct Last {
     hashes: Vec<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
+    /// Generation of the contents in the staging buffer.
+    detiled: u64,
+    /// Generation the host texture was last uploaded from.
+    uploaded: u64,
 }
 
 /// Whether any of `changed` overlaps any of `extents` (both sorted).
@@ -429,58 +433,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging) = staging(resource, texture) else {
         return;
     };
-    const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
-    for (i, footprint) in staging.footprints.iter().enumerate() {
-        #[cfg(feature = "diagnostics")]
-        {
-            let f = footprint.placed.Footprint;
-            // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            list.note_read(
-                || {
-                    format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        d.Width,
-                        d.Height,
-                        d.DepthOrArraySize,
-                        d.Format.0,
-                        d.MipLevels,
-                        staging.footprints.len(),
-                        staging.size,
-                        footprint.placed.Offset,
-                        f.Width,
-                        f.Height,
-                        f.Depth,
-                        f.RowPitch
-                    )
-                },
-                (gpu + footprint.placed.Offset, footprint.range.len() as u64),
-            );
-        }
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: footprint.placed,
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    }
-    // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    // The copy itself is recorded at submission, in the first list prelude
+    // whose refreshed staging generation is not in the host texture yet.
+    list.defer_texture(staging, copy);
     recheck_later(resource, crate::queue::presented() + RECHECK_FRAMES[0]);
 }
 
@@ -521,7 +479,9 @@ impl Staging {
             if before == 0 || last.read.len() != size {
                 last.read.resize(size, 0);
                 crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-                self.detile(&last.read, None);
+                if self.detile(&last.read, None) {
+                    last.detiled += 1;
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
                 return size;
@@ -546,7 +506,9 @@ impl Staging {
                 crate::host::copy_mapped(to, from, r.len(), false);
                 read += r.len();
             }
-            self.detile(&last.read, Some(&changed));
+            if self.detile(&last.read, Some(&changed)) {
+                last.detiled += 1;
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
             return read;
@@ -571,7 +533,9 @@ impl Staging {
             return size;
         }
         let changed = changed_pages(&last.hashes, &hashes, page, size);
-        self.detile(tiled, changed.as_deref());
+        if self.detile(tiled, changed.as_deref()) {
+            last.detiled += 1;
+        }
         last.hashes = hashes;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -581,7 +545,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer: the
     /// subresources whose memory overlaps `changed` (sorted byte ranges),
     /// or all of them.
-    fn detile(&self, tiled: &[u8], changed: Option<&[Range<usize>]>) {
+    fn detile(&self, tiled: &[u8], changed: Option<&[Range<usize>]>) -> bool {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -590,6 +554,7 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        let mut detiled = false;
         for (i, footprint) in self.footprints.iter().enumerate() {
             if changed.is_some_and(|c| !overlaps(&self.extents[i], c)) {
                 continue;
@@ -607,8 +572,46 @@ impl Staging {
                 footprint.depth_pitch,
             ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return detiled;
             }
+            detiled = true;
+        }
+        detiled
+    }
+
+    /// Whether the host texture does not hold the staging buffer's current
+    /// generation; marks it as recorded when true.
+    pub(crate) fn take_upload(&self) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.uploaded == last.detiled {
+            return false;
+        }
+        last.uploaded = last.detiled;
+        true
+    }
+
+    /// Records the copy of every staging subresource into `texture` in an
+    /// open command list whose caller has put the texture in COPY_DEST.
+    pub(crate) fn record_upload(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+        for (i, footprint) in self.footprints.iter().enumerate() {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: i as u32,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint.placed,
+                },
+            };
+            // SAFETY: an open list; both locations name live resources.
+            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
     }
 }

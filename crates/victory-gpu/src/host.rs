@@ -481,8 +481,12 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes. The
+    /// host copy is uploaded in a prelude when the staging generation changed.
+    Texture(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    ),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1177,20 +1181,52 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
+        let uploads: Vec<_> = {
+            let deferred = self.deferred();
+            deferred
+                .copies
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Texture(staging, copy) => Some((staging.clone(), copy.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+        let mut upload_copies = Vec::new();
+        let mut after_uploads: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+        for (first, last, copy) in states.values() {
+            let real = copy.state.swap(*last, Ordering::Relaxed);
+            let upload = uploads
+                .iter()
+                .find(|(_, host)| std::sync::Arc::ptr_eq(host, copy))
+                .and_then(|(staging, _)| staging.take_upload().then_some(staging.clone()));
+            if let Some(staging) = upload {
+                if real != COPY_DEST {
+                    barriers.push(transition(
                         &copy.texture,
                         D3D12_RESOURCE_STATES(real as i32),
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ));
+                }
+                upload_copies.push((staging, copy.texture.clone()));
+                if COPY_DEST != *first {
+                    after_uploads.push(transition(
+                        &copy.texture,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
-            })
-            .collect();
+                    ));
+                }
+            } else if real != *first {
+                barriers.push(transition(
+                    &copy.texture,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                ));
+            }
+        }
         drop(states);
         let shadows = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
         barriers.extend(shadows.values().filter_map(|(first, last, shadow)| {
@@ -1213,7 +1249,7 @@ impl HostList {
                 None
             }
         }));
-        if barriers.is_empty() {
+        if barriers.is_empty() && upload_copies.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1222,7 +1258,15 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                if !barriers.is_empty() {
+                    list.ResourceBarrier(&barriers);
+                }
+                for (staging, texture) in &upload_copies {
+                    staging.record_upload(list, texture);
+                }
+                if !after_uploads.is_empty() {
+                    list.ResourceBarrier(&after_uploads);
+                }
                 list.Close()
             })
         };
@@ -1467,8 +1511,12 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        self.deferred().copies.push(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -1532,7 +1580,7 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
