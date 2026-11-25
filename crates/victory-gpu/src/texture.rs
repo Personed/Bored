@@ -1145,6 +1145,30 @@ impl Staging {
         [self.judged[0].load(Relaxed), self.judged[1].load(Relaxed)]
     }
 
+    /// Records the levels the texture's memory is judged to hold now,
+    /// without writing the staging buffer. Returns the held levels in the
+    /// form [`Staging::detile`] uses.
+    fn note_levels(&self) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.on_demand {
+            return u32::MAX;
+        }
+        let judged = self.judgement();
+        self.judged[0].store(judged[0], Relaxed);
+        self.judged[1].store(judged[1], Relaxed);
+        let held = self.held_levels(judged);
+        self.detiled.store(held, Relaxed);
+        held
+    }
+
+    /// Whether any page the host copy can use is readable. Unmapped pages
+    /// read as zeros through the kernel copy, so an all-zero read with no
+    /// readable page is the absence of the texture, not new zero texels.
+    fn live_memory_readable(&self) -> bool {
+        live_ranges(&self.layout, self.mip_drop)
+            .any(|(at, len)| readable(self.memory as usize + at, len, false).0 != 0)
+    }
+
     /// Levels on demand: the levels that are the title's now, a bit a
     /// level. A level is held if no view starts above it, its bytes end
     /// before the next texture starts, and all of them are mapped. The
@@ -1406,6 +1430,17 @@ impl Staging {
             let mut copied = 0;
             let changed = with_read(size, |read| {
                 copied = self.copy_live_into(read);
+                let zero = live_ranges(&self.layout, self.mip_drop).all(|(at, len)| {
+                    read.get(at..at.saturating_add(len))
+                        .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
+                });
+                if zero && !self.live_memory_readable() {
+                    // Nothing of the texture is there: the zeros are how
+                    // unmapped pages read, not new texels. The judgement is
+                    // still noted, or every list judges the view anew.
+                    self.note_levels();
+                    return false;
+                }
                 let hash = self.hash_live(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1416,12 +1451,8 @@ impl Staging {
                 // view's levels changed, though, it may still hold texels
                 // from the earlier judgement; then zeros must replace them.
                 let blank = !self.filled.load(std::sync::atomic::Ordering::Relaxed);
-                if blank
-                    && live_ranges(&self.layout, self.mip_drop).all(|(at, len)| {
-                        read.get(at..at.saturating_add(len))
-                            .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
-                    })
-                {
+                if zero && blank {
+                    self.note_levels();
                     return false;
                 }
                 self.detile(read);
@@ -1507,17 +1538,7 @@ impl Staging {
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
-        let held = if self.on_demand {
-            use std::sync::atomic::Ordering::Relaxed;
-            let judged = self.judgement();
-            self.judged[0].store(judged[0], Relaxed);
-            self.judged[1].store(judged[1], Relaxed);
-            let held = self.held_levels(judged);
-            self.detiled.store(held, Relaxed);
-            held
-        } else {
-            u32::MAX
-        };
+        let held = self.note_levels();
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
