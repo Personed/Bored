@@ -3681,7 +3681,7 @@ impl<'a> Lower<'a> {
     /// infinite or NaN term gives the plain sum.
     /// shortcut: an f32 denormal along the way (the addend, a partial sum
     /// or the result) follows the host's denormal mode, not the console's,
-    /// which reads it as zero ([`Self::ftz`]).
+    /// which reads it as zero.
     fn sum3_rounded_once(&mut self, a: V, b: V, d: V) -> V {
         let c = self.cur;
         let (uh, ul) = self.two_sum(b, d);
