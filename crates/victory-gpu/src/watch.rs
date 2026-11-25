@@ -331,13 +331,12 @@ pub(crate) fn wrote(at: usize, len: usize) {
     if len == 0 {
         return;
     }
-    // A scan the kernel answered before this copy says nothing of its
-    // bytes: no range covering them is answered from the journal again.
+    // Journal the copy whatever the mode: a scan reused from asked_now
+    // predates it, and only the journal then says its pages are written
+    // (the kernel still would — the bits were never reset — so this
+    // never overstates). The scan stays reusable for the rest of the
+    // allocation, instead of being dropped whole for a one-page copy.
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    j.asked_now.retain(|&(f, l)| l <= first || f >= last);
-    if !j.kept {
-        return;
-    }
     j.asked += 1;
     let now = j.asked;
     for page in first..last {
