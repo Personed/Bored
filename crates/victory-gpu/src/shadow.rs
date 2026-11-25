@@ -1347,7 +1347,12 @@ impl Snapshot {
             .iter()
             .enumerate()
             .filter(|item| *item.1)
-            .map(|(piece, _)| (self.len - piece * PIECE).min(PIECE))
+            .map(|(piece, _)| {
+                let bytes = (self.len - piece * PIECE).min(PIECE);
+                // Windows commits whole 4 KiB pages even when the copy's
+                // final piece ends inside one.
+                bytes.div_ceil(4096) * 4096
+            })
             .sum()
     }
 }
