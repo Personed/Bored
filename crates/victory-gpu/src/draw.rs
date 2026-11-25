@@ -3149,7 +3149,7 @@ impl State {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || made_rects || p.rects) && !p.compute && !p.mesh
             }
-            MESH => !p.compute && p.mesh,
+            MESH => !p.compute && p.mesh && p.mesh_emu.is_none(),
             DISPATCH => p.compute,
             _ => false,
         };
