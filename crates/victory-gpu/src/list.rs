@@ -885,9 +885,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
-            // A destination made level by level gets its levels' memory
-            // ahead of this list (`crate::tiles`).
-            crate::texture::card_writes(list, dst, to, None);
             crate::texture::host_written(dst);
             if same {
                 SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -913,6 +910,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 && a.DepthOrArraySize == b.DepthOrArraySize
                 && a.MipLevels == b.MipLevels
             {
+                // A destination made level by level gets every level's
+                // memory ahead of this list (`crate::tiles`).
+                crate::texture::card_writes(list, dst, to, None);
                 list.flush_barriers();
                 // SAFETY: an open list and matching live textures.
                 unsafe { list.list.CopyResource(to, from) };
@@ -962,6 +962,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                                 SubresourceIndex: src_sub,
                             },
                         };
+                        // A destination made level by level gets only this
+                        // surviving level's memory ahead of the copy.
+                        crate::texture::card_writes(list, dst, to, Some(dst_sub));
                         list.flush_barriers();
                         // SAFETY: an open list and matching surviving subresources.
                         unsafe {
