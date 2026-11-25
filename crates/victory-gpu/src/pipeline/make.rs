@@ -12,8 +12,15 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! Passes over the screen (no vertex input, no depth) have workers of
+//! their own: the title fills its lighting tables with such draws once, at
+//! the world's first frame, and behind a world's worth of pipelines they
+//! could wait out their frame budget before a worker ever reached them.
+//! Each kind keeps its own budget, but both use the same limit: a
+//! misclassified pass can only move to the other pool, never wait longer.
+//!
+//! The default budget is half a second per title frame and kind. A pass the
+//! title runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -29,6 +36,8 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    /// A pass over the screen (see [`GraphicsState::screen_pass`]).
+    screen: bool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -56,6 +65,7 @@ impl Pending {
                 .as_bytes(),
         );
         Pending {
+            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -172,11 +182,14 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    // taken by a thread waiting now), per pipeline kind. Screen passes keep
+    // a budget of their own so a world's ordinary pipelines cannot spend it.
+    static SPENT: [Mutex<(u64, Duration)>; 2] =
+        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let shared = shared_budget();
+    let spent_for_kind = &SPENT[usize::from(p.screen)];
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_for_kind.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -205,7 +218,7 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_for_kind.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -271,8 +284,8 @@ impl Queue {
     }
 }
 
-static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
-static AVAILABLE: Condvar = Condvar::new();
+static QUEUES: [Mutex<Queue>; 2] = [const { Mutex::new(Queue::new()) }; 2];
+static AVAILABLE: [Condvar; 2] = [const { Condvar::new() }; 2];
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -280,13 +293,14 @@ fn start(p: &Arc<Pending>, priority: u8) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
-    if !workers() {
+    let kind = usize::from(p.screen);
+    if !workers(p.screen) {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
             p.make();
         }
         return;
     }
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queue = QUEUES[kind].lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
             PEAK.fetch_max(
@@ -294,45 +308,56 @@ fn start(p: &Arc<Pending>, priority: u8) {
                 Ordering::Relaxed,
             );
         }
-        AVAILABLE.notify_one();
+        AVAILABLE[kind].notify_one();
     }
 }
 
-fn next() -> Arc<Pending> {
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+fn next(screen: bool) -> Arc<Pending> {
+    let kind = usize::from(screen);
+    let mut queue = QUEUES[kind].lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(p) = queue.pop() {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = AVAILABLE[kind]
+            .wait(queue)
+            .unwrap_or_else(|e| e.into_inner());
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
-fn workers() -> bool {
-    static RUNNING: OnceLock<bool> = OnceLock::new();
-    *RUNNING.get_or_init(|| {
+/// Starts the workers of one pipeline kind on first use: half the logical
+/// processors (2 to 8) for ordinary pipelines, and two for screen passes.
+fn workers(screen: bool) -> bool {
+    static RUNNING: [OnceLock<bool>; 2] = [const { OnceLock::new() }; 2];
+    *RUNNING[usize::from(screen)].get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = if screen {
+            2
+        } else {
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+        };
         for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            let name = if screen {
+                format!("victory-pipelines-screen-{i}")
+            } else {
+                format!("victory-pipelines-{i}")
+            };
+            let spawned = std::thread::Builder::new().name(name).spawn(move || {
+                // Below the title's own threads (loading, recording).
+                // SAFETY: a plain call on our own thread.
+                unsafe {
+                    use windows::Win32::System::Threading::*;
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
+                loop {
+                    next(screen).make();
+                    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        drained();
+                    } else {
+                        super::library::save(false);
                     }
-                    loop {
-                        next().make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
+                }
+            });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
@@ -377,6 +402,18 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn screen_passes_are_classified_for_their_own_pool() {
+        let ordinary = Pending::new(Vec::new(), None);
+        assert!(!ordinary.screen);
+
+        let screen = Pending::new(
+            Vec::new(),
+            Some(Box::new(GraphicsState::screen_triangle_state())),
+        );
+        assert!(screen.screen);
     }
 
     #[test]
