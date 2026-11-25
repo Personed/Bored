@@ -87,20 +87,41 @@ fn build() -> [u8; 32] {
 /// the run will have (`victory_shader::emit::translation_fingerprint`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
+    // The translation depends on the view-index cap as at runtime.
+    crate::descriptor::host::probe_view_limit();
     let ran = AtomicBool::new(false);
     // The mode the runtime translates with on this machine: an emulated
     // mesh shader's cache entry is another key than the native one's, so a
     // warm-up in only the native mode left emulation hardware (no mesh
-    // shader support) to translate every mesh program on first use.
-    let mesh = match crate::host::host() {
-        Some(h) if h.emulate_mesh_shaders() => MeshMode::Emulate,
-        _ => MeshMode::Native,
+    // shader support) to translate every mesh program on first use. Only a
+    // mesh program's container keys by it: everything else translates in
+    // the native mode whatever the host (`pipeline::translate`).
+    let mesh = if container_is_mesh(container)
+        && crate::host::host().is_some_and(crate::host::Host::emulate_mesh_shaders)
+    {
+        MeshMode::Emulate
+    } else {
+        MeshMode::Native
     };
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
         victory_shader::emit::translate_with(c, mesh).map_err(|e| e.to_string())
     };
     cached(cache, &build(), mesh, container, translate).map(|_| ran.load(Ordering::Relaxed))
+}
+
+/// Whether the container's program is a mesh program: the only stage the
+/// mesh mode keys and translates differently.
+fn container_is_mesh(container: &[u8]) -> bool {
+    let Ok(c) = victory_shader::Container::parse(container) else {
+        return false;
+    };
+    let Some(dxil) = c.part(victory_shader::FourCC::DXIL) else {
+        return false;
+    };
+    victory_shader::native_programs(dxil.data)
+        .map(|ps| ps.iter().any(|p| p.stage == victory_shader::HwStage::Ms))
+        .unwrap_or(false)
 }
 
 /// The translation of a console shader container, from the cache when
