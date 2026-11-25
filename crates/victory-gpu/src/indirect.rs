@@ -782,6 +782,254 @@ void main() {
         }
     }
 
+    const COUNT_PRODUCER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer count_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    count_buf.Store(0, 1);
+}
+"#;
+
+    /// The mesh prep must charge the groups it emits, not those it discards
+    /// at the output-buffer limit. A later indirect dispatch in the same list
+    /// must still run. Exercise both a CPU-filled count and a GPU-produced
+    /// count; the latter stays UAV and is ordered before prep by a UAV barrier.
+    fn run_mesh_budget_case(warp: &mut WarpHarness, gpu_count: bool) {
+        const STRIDE: u32 = 12;
+        const RECORDS: u32 = 2;
+        const ATTEMPTS: u32 = 16;
+        const GROUP_CAP: u32 = 16;
+        const COUNTED_GROUPS: u32 = 5;
+        const EXPECTED_MESH_BUDGET: u32 =
+            COUNTED_GROUPS * 128 + ATTEMPTS * GROUP_CAP * 128;
+        const DISPATCH_GROUPS: u32 = 64;
+
+        let prep = compile_cs(&warp.device, crate::mesh_emu::PREP_SOURCE)
+            .expect("mesh indirect prep shader must compile on WARP");
+        let producer = compile_cs(&warp.device, COUNT_PRODUCER_CS)
+            .expect("count producer shader must compile on WARP");
+        let (args, args_ptr, args_gpu) = warp.shared_buffer(u64::from(STRIDE * RECORDS));
+        let (count, count_ptr, count_gpu) = warp.shared_buffer(256);
+        let (budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (prepared, _, prepared_gpu) = warp.shared_buffer(256);
+        let (slot_map, slot_map_ptr, slot_map_gpu) = warp.shared_buffer(64 << 10);
+        let (next_args, next_args_ptr, _) = warp.shared_buffer(256);
+        let (hits, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+        let scratch = warp.default_uav(256);
+        let signature = warp.signature(2, STRIDE);
+
+        // SAFETY: these mapped buffers all hold at least the written bytes.
+        unsafe {
+            let words = args_ptr.cast::<u32>();
+            words.write_volatile(COUNTED_GROUPS);
+            words.add(1).write_volatile(1);
+            words.add(2).write_volatile(1);
+            words.add(3).write_volatile(65_535);
+            words.add(4).write_volatile(1);
+            words.add(5).write_volatile(1);
+            count_ptr.cast::<u32>().write_volatile(u32::from(!gpu_count));
+            budget_ptr.cast::<u32>().write_volatile(0);
+            next_args_ptr.cast::<u32>().write_volatile(DISPATCH_GROUPS);
+            next_args_ptr.cast::<u32>().add(1).write_volatile(1);
+            next_args_ptr.cast::<u32>().add(2).write_volatile(1);
+            hits_ptr.cast::<u32>().write_volatile(0);
+
+            warp.list.ResourceBarrier(&[
+                transition(
+                    &args,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+                transition(
+                    &count,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+                transition(
+                    &budget,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+                transition(
+                    &prepared,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+                transition(
+                    &slot_map,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+                transition(
+                    &next_args,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+                transition(
+                    &hits,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+            ]);
+            if gpu_count {
+                warp.list.SetComputeRootSignature(&producer.root);
+                warp.list.SetPipelineState(&producer.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, count_gpu);
+                warp.list.Dispatch(1, 1, 1);
+                warp.list.ResourceBarrier(&[uav_barrier()]);
+            }
+
+            warp.list.ResourceBarrier(&[uav_barrier()]);
+            warp.list.SetComputeRootSignature(&prep.root);
+            warp.list.SetPipelineState(&prep.pso);
+            let constants = [STRIDE, RECORDS, 1, GROUP_CAP, 1, 1];
+            warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootUnorderedAccessView(1, args_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, count_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, prepared_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(4, slot_map_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(5, budget_gpu);
+            warp.list.Dispatch(1, 1, 1);
+            warp.list.ResourceBarrier(&[
+                uav_barrier(),
+                transition(
+                    &prepared,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ),
+                transition(
+                    &slot_map,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+            ]);
+            warp.list.SetComputeRootSignature(&warp.worker.root);
+            warp.list.SetPipelineState(&warp.worker.pso);
+            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            warp.list
+                .ExecuteIndirect(&signature, 1, &prepared, 0, None, 0);
+            warp.list.ResourceBarrier(&[
+                transition(
+                    &prepared,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+                transition(
+                    &slot_map,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+            ]);
+
+            for _ in 0..ATTEMPTS {
+                warp.list.ResourceBarrier(&[uav_barrier()]);
+                warp.list.SetComputeRootSignature(&prep.root);
+                warp.list.SetPipelineState(&prep.pso);
+                let constants = [STRIDE, RECORDS, 1, GROUP_CAP, 0, 1];
+                warp.list
+                    .SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootUnorderedAccessView(1, args_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, count_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, prepared_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, slot_map_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(5, budget_gpu);
+                warp.list.Dispatch(1, 1, 1);
+                warp.list.ResourceBarrier(&[
+                    uav_barrier(),
+                    transition(
+                        &prepared,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    ),
+                    transition(
+                        &slot_map,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    ),
+                ]);
+                warp.list.SetComputeRootSignature(&warp.worker.root);
+                warp.list.SetPipelineState(&warp.worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                warp.list
+                    .ExecuteIndirect(&signature, 1, &prepared, 0, None, 0);
+                warp.list.ResourceBarrier(&[
+                    transition(
+                        &prepared,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                    transition(
+                        &slot_map,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                ]);
+            }
+
+            assert!(record_clamp(
+                &warp.clamp,
+                &warp.list,
+                &scratch,
+                budget_gpu,
+                (&next_args, 0),
+                None,
+                (2, STRIDE, 1),
+            ));
+            warp.list.SetComputeRootSignature(&warp.worker.root);
+            warp.list.SetPipelineState(&warp.worker.pso);
+            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            warp.list
+                .ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
+        }
+        warp.submit_and_wait();
+
+        // SAFETY: the fence has completed and all mapped buffers remain live.
+        let (spent, count_value, hit_count, source, mapped_groups) = unsafe {
+            (
+                budget_ptr.cast::<u32>().read_volatile(),
+                count_ptr.cast::<u32>().read_volatile(),
+                hits_ptr.cast::<u32>().read_volatile(),
+                std::slice::from_raw_parts(args_ptr.cast_const(), 24).to_vec(),
+                std::slice::from_raw_parts(slot_map_ptr.cast::<u32>(), 16).to_vec(),
+            )
+        };
+        assert_eq!(count_value, 1, "prep must honor the active record count");
+        assert_eq!(
+            source,
+            [
+                5, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0, 1, 0,
+                0, 0,
+            ],
+            "prep must leave the source arguments unchanged"
+        );
+        assert_eq!(
+            mapped_groups,
+            [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "slot map must retain each emitted group's record-local id"
+        );
+        assert_eq!(
+            spent,
+            EXPECTED_MESH_BUDGET + DISPATCH_GROUPS * 64,
+            "discarded mesh groups must not starve later indirect work"
+        );
+        assert_eq!(
+            hit_count,
+            COUNTED_GROUPS + ATTEMPTS * GROUP_CAP + DISPATCH_GROUPS,
+            "mesh prep must emit the bounded dispatch and preserve later indirect work"
+        );
+    }
+
+    #[test]
+    fn warp_mesh_prep_budgets_only_emitted_groups_for_cpu_and_gpu_counts() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        run_mesh_budget_case(&mut warp, false);
+        run_mesh_budget_case(&mut warp, true);
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed

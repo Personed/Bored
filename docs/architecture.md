@@ -97,10 +97,11 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. On GPUs with SM 6.6 that lack hardware mesh shaders (or with
 `VICTORY_MESH_EMULATION=1`), console mesh programs (`HwStage::Ms`) lower to a
 compute pass (`cs_6_6`) writing packed primitive indices and attributes into a
-VRAM buffer read back by a generated unpack vertex shader (`vs_6_6`). Indirect
-mesh work first runs a preparation pass over the clamped records: it compacts
-the requested groups into host dispatch/draw arguments and, for multi-record
-calls, a slot map that preserves each record-local mesh group id.
+VRAM buffer read back by a generated unpack vertex shader (`vs_6_6`). The
+indirect-mesh preparation pass compacts records to one output-buffer chunk and
+charges only those runnable groups against the shared per-list work budget.
+For multi-record calls it also writes a slot map that preserves each
+record-local mesh group id.
 `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
