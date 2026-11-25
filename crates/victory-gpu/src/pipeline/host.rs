@@ -931,7 +931,7 @@ fn emulated_mesh_pipeline(
     let group_bytes = u64::from(emu.max_primitives) * 4
         + u64::from(emu.max_vertices) * u64::from(emu.vertex_dwords) * 4
         + u64::from(emu.max_primitives) * u64::from(emu.prim_dwords) * 4;
-    if group_bytes != u64::from(emu.group_bytes()) {
+    if group_bytes > u64::from(u32::MAX) {
         tracing::warn!(?shaders, "emulated mesh group layout overflows u32");
         return None;
     }
