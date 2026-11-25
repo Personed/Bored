@@ -438,7 +438,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use victory_pipeline::CacheKey;
 
     fn shader() -> HostShader {
         HostShader {
