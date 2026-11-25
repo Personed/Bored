@@ -1025,8 +1025,28 @@ impl Staging {
 
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
+    /// `VICTORY_TEXTURE_REFRESH_EVERY`: a texture is read once every N
+    /// frames at most, round-robin by its own address, instead of every
+    /// frame (1 or unset: every frame, as before). A title whose world is a
+    /// frame a second spends most of that frame reading title memory for
+    /// textures; spreading the reads costs at most N frames of staleness per
+    /// texture and divides the cost.
+    fn due(&self) -> bool {
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_REFRESH_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(1)
+        });
+        every <= 1 || (crate::frame::current() + ((self.memory as usize >> 16) as u64)) % every == 0
+    }
+
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        if !self.due() {
+            return;
+        }
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
