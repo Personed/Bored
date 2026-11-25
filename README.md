@@ -111,6 +111,12 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+With `VICTORY_MOUSE=1` (a number sets the sensitivity, e.g. `0.5` or `2`) the
+mouse adds to that pad too: movement turns the right stick (the camera), the
+left button pulls the right trigger and the right button the left one. While
+the title's window has focus the cursor stays in its centre; switching to
+another window releases it.
+
 ### Linux (Proton)
 
 VIctory also runs on Linux under Proton Experimental, built with
