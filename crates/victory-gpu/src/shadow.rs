@@ -3194,7 +3194,7 @@ mod window_tests {
             let at = base + i * 0x1_0000;
             map.insert((at, 100 + i as usize), entry(at, 0x1_0000));
         }
-        let ask = base + 96 * 0x1_0000;
+        let ask = base + 128 * 0x1_0000;
         assert_eq!(
             enclosing(&map, 256 << 20, ask, ask + 4),
             Some((base, 1)),
