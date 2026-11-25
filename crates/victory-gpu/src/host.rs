@@ -1636,15 +1636,22 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-        }
+        let started_flush = std::time::Instant::now();
+        let ((), pieces) = crate::copy_pool::queued(|| {
+            for (shadow, from, to) in self.refreshes.drain(..) {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
+        });
+        crate::copy_pool::run(pieces);
+        PREPARING[0].fetch_add(
+            started_flush.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
