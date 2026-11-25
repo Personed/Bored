@@ -56,6 +56,13 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// Whether the staging buffer has been detiled at least once. The
+    /// refresh interval never applies before then: an initial upload must
+    /// not copy an empty buffer.
+    filled: std::sync::atomic::AtomicBool,
+    /// Frame of the last completed refresh attempt after the first fill:
+    /// an eligible frame is still checked once, not once per submission.
+    checked_frame: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
@@ -1023,10 +1030,44 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// `VICTORY_TEXTURE_REFRESH_EVERY`, 1 or unset: refresh every frame.
+    fn refresh_every() -> u64 {
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_REFRESH_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(1)
+        })
+    }
+
+    /// Whether this texture's contents may be read on this frame. With
+    /// `VICTORY_TEXTURE_REFRESH_EVERY=<n>`, already-filled textures are
+    /// read at most once every n frames, round-robin by address; the first
+    /// fill is always due, so a new staging buffer is never uploaded empty.
+    fn due(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let every = Self::refresh_every();
+        every <= 1
+            || !self.filled.load(Relaxed)
+            || crate::frame::current()
+                .wrapping_add((self.memory as usize >> 16) as u64)
+                .is_multiple_of(every)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
+    /// since the last time (and is mapped at all). The refresh interval
+    /// trades up to N frames of texture staleness for spreading expensive
+    /// memory reads over frames.
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        if !self.due() {
+            return;
+        }
+        let frame = crate::frame::current();
+        if self.filled.load(Relaxed) && self.checked_frame.swap(frame, Relaxed) == frame {
+            return;
+        }
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
@@ -1082,7 +1123,10 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            // When an explicit refresh interval is active, this is already
+            // the texture's turn: hash then, rather than multiplying the two
+            // schedules and hiding alias writes for many intervals.
+            if unwritten && !turn && Self::refresh_every() <= 1 {
                 return 0;
             }
         }
@@ -1201,6 +1245,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.filled.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1561,6 +1606,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        filled: std::sync::atomic::AtomicBool::new(false),
+        checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
