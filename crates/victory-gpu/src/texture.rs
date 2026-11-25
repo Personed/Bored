@@ -542,14 +542,27 @@ thread_local! {
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
-/// contents are whatever the last texture left).
+/// contents are whatever the last texture left). Buffers over 32 MiB are
+/// not kept for the next texture: they are rare, while keeping one per
+/// worker tied up memory a 16 GB host needs for the title and its copies.
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    const KEPT: usize = 32 << 20;
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        if read.len() < size {
+        let len = read.len();
+        if len < size {
+            if read.capacity() < size {
+                // Exact: doubling a nearly full scratch would pass the
+                // kept-memory cap for a read still under it.
+                read.reserve_exact(size - len);
+            }
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let out = f(&mut read[..size]);
+        if read.capacity() > KEPT {
+            *read = Vec::new();
+        }
+        out
     })
 }
 
@@ -1988,7 +2001,7 @@ mod title_memory_tests {
 
 #[cfg(test)]
 mod mip_drop_read_tests {
-    use super::{hash_live, live_bytes, live_ranges, live_slice_bytes};
+    use super::{READ, hash_live, live_bytes, live_ranges, live_slice_bytes, with_read};
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
 
     fn layout(width: u32, array: u32) -> victory_formats::texture::Layout {
@@ -2037,5 +2050,28 @@ mod mip_drop_read_tests {
         assert_eq!(before, hash_live(&layout, 1, &tiled));
         tiled[0] = 1;
         assert_ne!(before, hash_live(&layout, 1, &tiled));
+    }
+
+    /// Read scratch over 32 MiB is dropped after use; smaller scratch is
+    /// kept for the next texture on the same worker thread.
+    #[test]
+    fn large_read_scratch_is_not_kept() {
+        std::thread::spawn(|| {
+            with_read(24 << 20, |read| assert_eq!(read.len(), 24 << 20));
+            with_read(28 << 20, |read| assert_eq!(read.len(), 28 << 20));
+            READ.with(|read| assert!(read.borrow().capacity() <= (32 << 20)));
+
+            let large = (32 << 20) + 1;
+            with_read(large, |read| assert_eq!(read.len(), large));
+            READ.with(|read| assert_eq!(read.borrow().capacity(), 0));
+            with_read(1 << 20, |read| assert_eq!(read.len(), 1 << 20));
+            READ.with(|read| {
+                let capacity = read.borrow().capacity();
+                assert!(capacity >= 1 << 20);
+                assert!(capacity <= (32 << 20));
+            });
+        })
+        .join()
+        .unwrap();
     }
 }
