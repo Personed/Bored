@@ -2632,6 +2632,7 @@ impl State {
             list.note_op(|| self.op_text(format!("mesh-emu {chunk} (base {base})"), false));
             // SAFETY: open list with the emulated compute pipeline bound and
             // `output` in unordered-access state.
+            list.flush_barriers();
             unsafe {
                 list.list.Dispatch(chunk, 1, 1);
                 list.list.ResourceBarrier(&[transition(
@@ -2662,6 +2663,7 @@ impl State {
                 return false;
             };
             self.mesh_scissor(list, true);
+            list.flush_barriers();
             unsafe {
                 list.list.DrawInstanced(vertices, 1, 0, 0);
                 list.list.ResourceBarrier(&[transition(

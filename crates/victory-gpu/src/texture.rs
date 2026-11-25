@@ -226,6 +226,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return true;
     }
     crate::list::ensure_state(list, placed, COPY_DEST);
+    list.flush_barriers();
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -275,6 +276,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         && before & TARGET_OR_UNORDERED != 0
     {
         crate::list::ensure_state(list, source, before);
+        list.flush_barriers();
     }
     true
 }
@@ -590,6 +592,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
+    list.flush_barriers();
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {

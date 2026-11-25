@@ -1082,6 +1082,7 @@ fn read_back(
         crate::texture::upload(list, src.resource, texture);
     }
     ensure_state(list, src.resource, COPY_SOURCE);
+    list.flush_barriers();
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
     let mut to = dst;

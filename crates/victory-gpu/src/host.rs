@@ -4917,6 +4917,9 @@ impl HostList {
         };
         drop(states);
         if let Some(before) = before {
+            // Queued texture transitions ordered before this one run first:
+            // the before-state read above assumed them applied.
+            self.flush_barriers();
             let barrier = transition(
                 &copy.texture,
                 D3D12_RESOURCE_STATES(before as i32),
@@ -5071,6 +5074,7 @@ impl HostList {
             .collect();
         drop(twins);
         for (depth, twin, copy) in &written {
+            self.flush_barriers();
             if *copy {
                 self.twin_copy(depth, twin, false);
             }
