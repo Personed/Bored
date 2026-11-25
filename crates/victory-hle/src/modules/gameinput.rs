@@ -1206,10 +1206,13 @@ mod host {
         /// The cursor was put in the window's centre at the last poll, so its
         /// distance from there is the mouse's movement since.
         mouse_centred: bool,
-        /// Movement not yet fully reported: polls outnumber the title's
-        /// frames, so a movement sliced over several polls would mostly
-        /// never reach a frame. The stick reports the accumulator and the
-        /// accumulator decays, spreading the movement over a few polls.
+        /// Smoothed mouse velocity in pixels per poll: an exponential
+        /// moving average (half-life 50 ms of wall time) of the per-poll
+        /// deltas. Polls outnumber the title's frames, so raw per-poll
+        /// slices mostly never reach a frame; the average keeps the
+        /// stick proportional to the mouse's speed across the slow
+        /// frames, and unlike a sum it neither saturates on steady
+        /// sweeps nor lingers once the mouse stops.
         mouse_x: f32,
         mouse_y: f32,
         mouse_decayed: Option<Instant>,
@@ -1332,21 +1335,21 @@ mod host {
             };
             // The first poll after gaining focus only centres the cursor.
             let moved = std::mem::replace(&mut self.mouse_centred, true) && read;
-            if moved {
-                self.mouse_x += (at.x - centre.0) as f32;
-                self.mouse_y += (at.y - centre.1) as f32;
-            }
-            let (x, y) = (self.mouse_x, self.mouse_y);
-            // The accumulator decays once reported — halves per 100 ms,
-            // independent of the poll rate, so movement spans the title's
-            // slow frames yet fades instead of repeating.
+            // v = alpha*delta + (1-alpha)*v, with alpha set by the wall
+            // time since the last poll (half-life 50 ms).
             let now = Instant::now();
-            let factor = self
+            let keep = self
                 .mouse_decayed
                 .replace(now)
-                .map_or(0.0, |then| 0.5f32.powf((now - then).as_secs_f32() / 0.1));
-            self.mouse_x *= factor;
-            self.mouse_y *= factor;
+                .map_or(0.0, |then| 0.5f32.powf((now - then).as_secs_f32() / 0.05));
+            self.mouse_x *= keep;
+            self.mouse_y *= keep;
+            if moved {
+                let alpha = 1.0 - keep;
+                self.mouse_x += (at.x - centre.0) as f32 * alpha;
+                self.mouse_y += (at.y - centre.1) as f32 * alpha;
+            }
+            let (x, y) = (self.mouse_x, self.mouse_y);
             let scale = STICK_PER_PIXEL * sensitivity;
             MouseState {
                 x: x * scale,
