@@ -1410,19 +1410,11 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
-                // Never uploaded: zeros, as a committed texture starts (one
-                // in a heap of textures starts with whatever the range
-                // held, `crate::placement`).
-                let never = last.hash.is_none();
                 last.hash = Some(hash);
                 if live_ranges(&self.layout, self.mip_drop).all(|(at, len)| {
                     read.get(at..at.saturating_add(len))
                         .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
                 }) {
-                    if never {
-                        self.detile(read);
-                        return true;
-                    }
                     return false;
                 }
                 self.detile(read);
