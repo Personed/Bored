@@ -150,6 +150,20 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    mesh: emit::MeshMode,
+}
+
+fn mesh_mode(host: Option<&Host>) -> emit::MeshMode {
+    match std::env::var("VICTORY_MESH_EMULATION")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => emit::MeshMode::Emulate,
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => emit::MeshMode::Native,
+        _ if host.is_some_and(|h| !h.mesh_shaders()) => emit::MeshMode::Emulate,
+        _ => emit::MeshMode::Native,
+    }
 }
 
 /// `translate --warm <file>`: the containers whose hash the file names are
@@ -243,7 +257,10 @@ pub fn run(
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         victory_shader::emit::set_host_max_wave(n);
     }
     let dll = validate.then(Validator::default_path).flatten();
@@ -255,15 +272,19 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    let probe_host = if pipelines || !pairs.is_empty() {
+        Some(Host::new(false).map_err(anyhow::Error::msg)?)
+    } else {
+        None
+    };
+    let mesh = mesh_mode(probe_host.as_ref());
+    drop(probe_host);
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -297,6 +318,7 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            mesh,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -363,11 +385,15 @@ pub fn run(
         for (v, p) in &pairs {
             let made = match (find(v), find(p)) {
                 (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
+                    if vs.mesh_emu.is_some() {
+                        host.emulated_mesh_pipelines(vs, ps).map(drop)
+                    } else {
+                        host.mesh_pipeline(vs, ps).map(drop)
+                    }
                 } else {
-                    host.pipeline(vs, ps)
+                    host.pipeline(vs, ps).map(drop)
                 }
-                .map(|_| "pipeline created".to_owned())
+                .map(|()| "pipeline created".to_owned())
                 .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
@@ -434,7 +460,10 @@ fn translate(
         && let Some((dir, texts)) = spec.split_once(';')
     {
         let line = example();
-        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+        if texts
+            .split('|')
+            .any(|text| !text.is_empty() && line.contains(text))
+        {
             let name: String = source
                 .label()
                 .chars()
@@ -443,7 +472,10 @@ fn translate(
                 .take(70)
                 .collect();
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+            let _ = std::fs::write(
+                std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")),
+                &bytes[..],
+            );
         }
     }
     if !lock(seen).insert(code) {
@@ -460,21 +492,36 @@ fn translate(
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before: Option<BTreeMap<String, usize>> = dump
+        .as_ref()
+        .map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
             if *n > was && was < 3 {
-                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
+                let stem: String = reason
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .take(60)
+                    .collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                let _ = std::fs::write(
+                    std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")),
+                    &bytes[..],
+                );
             }
         }
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -538,7 +585,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    match emit::emit_with(container, &p, &program, &s, &i, &r, checks.mesh) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
@@ -573,7 +620,11 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
         let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
         Some(Mutex::new(file))
     }) else {
         return;
@@ -598,7 +649,12 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         console[k] += 1;
     }
     let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
-    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
+    for (name, n) in [
+        "c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other",
+    ]
+    .iter()
+    .zip(console)
+    {
         line.push_str(&format!("\t{name}={n}"));
     }
     for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
@@ -635,6 +691,9 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+            HwStage::Ms if shader.mesh_emu.is_some() => {
+                h.emulated_mesh_pipelines(&shader, stub_ps).map(drop)
+            }
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
@@ -651,7 +710,14 @@ fn check(
     let Some(v) = checks.validator.as_mut() else {
         return;
     };
-    match v.validate(&mut shader.dxil) {
+    let res = v.validate(&mut shader.dxil).and_then(|()| {
+        if let Some(emu) = &shader.mesh_emu {
+            let mut unpack = emit::unpack_vertex_shader(emu, None).map_err(|e| e.to_string())?;
+            v.validate(&mut unpack)?;
+        }
+        Ok(())
+    });
+    match res {
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
             if t.list {

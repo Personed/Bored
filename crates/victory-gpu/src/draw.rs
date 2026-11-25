@@ -89,9 +89,15 @@ fn early_budgets() -> (u64, u64) {
     static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
         let ms = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (
+            ms("VICTORY_EARLY_TEXTURES_MS", 12),
+            ms("VICTORY_BAKE_TEXTURES_MS", 1500),
+        )
     })
 }
 
@@ -99,8 +105,12 @@ fn early_budgets() -> (u64, u64) {
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
-    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+const BAKE_PIXEL_SHADERS: [&str; 4] = [
+    "c0a7fe77b1862e10",
+    "0d1575a396dfe513",
+    "b7cfd8dda91ebb6b",
+    "280967ad158cee0b",
+];
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -119,7 +129,7 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
-/// A run of indirect records clamped in one pass ([`windows`]): the host
+/// A run of indirect records clamped in one pass (`windows()`): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
 /// holds them clamped, record `i` at `i * step`.
@@ -129,14 +139,14 @@ struct Window {
     kind: u32,
     stride: u32,
     /// How far apart the records are in the copy, and in the scratch
-    /// buffer: what the title walks them by ([`windows`]).
+    /// buffer: what the title walks them by (`windows()`).
     step: u32,
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
 }
 
-/// The most records clamped in one pass ([`windows`]).
+/// The most records clamped in one pass (`windows()`).
 const WINDOW_MOST: u64 = 64;
 
 /// Whether indirect draws that read record after record of one argument
@@ -221,7 +231,7 @@ pub(crate) struct State {
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
     /// The indirect records clamped last, if later draws may still read
-    /// them ([`windows`]).
+    /// them (`windows()`).
     window: Option<Window>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
@@ -267,7 +277,9 @@ impl State {
         }
         if self.tables_gone {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
+            ONCE.call_once(|| {
+                tracing::warn!("a list ran again after its descriptor tables were given back")
+            });
         }
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
@@ -314,7 +326,10 @@ fn mesh_kept(pipeline: usize) -> bool {
     let Some((last, before)) = KEEP.get_or_init(|| {
         let value = std::env::var("VICTORY_MESH_TEST").ok()?;
         let mut parts = value.strip_prefix("keep:")?.split(':');
-        Some((parts.next()?.to_owned(), parts.next().unwrap_or("").to_owned()))
+        Some((
+            parts.next()?.to_owned(),
+            parts.next().unwrap_or("").to_owned(),
+        ))
     }) else {
         return true;
     };
@@ -818,7 +833,12 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        compute: bool,
+        writes: bool,
+    ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -1093,7 +1113,9 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set")
+                            }
                         }
                         continue;
                     }
@@ -1161,7 +1183,10 @@ impl State {
                 let address = match self.roots_ref(title_compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
-                        once!(slot, "a shader writes through a root view the title did not set");
+                        once!(
+                            slot,
+                            "a shader writes through a root view the title did not set"
+                        );
                         None
                     }
                 };
@@ -1175,7 +1200,6 @@ impl State {
         list.twins_written();
         true
     }
-
     /// Binds a root UAV: a raw unordered access view of the title buffer's
     /// host copy from `address` on, as a one-view table (a null view
     /// without an address, without a host copy shaders can write, or at an
@@ -1267,7 +1291,12 @@ impl State {
                     // not on 16 bytes got a null view at first: the
                     // builder's counters are at such addresses.)
                     let bias = offset & 15;
-                    host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
+                    host.raw_uav_at(
+                        index,
+                        &s.buffer,
+                        offset - bias,
+                        s.left(*a).min(limit) + bias,
+                    );
                 }
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
@@ -1459,10 +1488,16 @@ impl State {
                 GONE.store(true, Ordering::Relaxed);
                 let last: Vec<String> = slots[n - 63..=n]
                     .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .filter_map(|&i| {
+                        crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
+                    })
                     .map(|s| s.chars().take(200).collect())
                     .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                tracing::error!(
+                    why,
+                    slot = index,
+                    "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                );
                 crate::host::log_removal_context();
             }
             // The copy the slot shows (`buffer_copy`), not the one the
@@ -1478,11 +1513,15 @@ impl State {
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+        let mut spans: std::collections::HashMap<
+            usize,
+            (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+        > = std::collections::HashMap::new();
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+            let span = spans
+                .entry(key)
+                .or_insert_with(|| (shadow.clone(), *from, *to));
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
@@ -1655,7 +1694,11 @@ impl State {
                         Some(texture) => crate::resource::copy_state(texture),
                         // No title texture was made for it: the pass never
                         // got as far as making one.
-                        None => Some((0, crate::resource::placed_bytes(&resource).unwrap_or(0), address)),
+                        None => Some((
+                            0,
+                            crate::resource::placed_bytes(&resource).unwrap_or(0),
+                            address,
+                        )),
                     }
                 }
                 Some(View::Shader(object, _)) if crate::resource::title_fills(object as This) => {
@@ -1790,21 +1833,30 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(250)
         }));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let catchup = *CATCHUP
+            .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+        let (per_frame, span) = if catchup && due.len() >= 1024 {
+            (per_frame * 3, span * 3)
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
-            }
+            Some((ms, bytes)) => (
+                std::time::Duration::from_millis(ms),
+                SPENT.load(Ordering::Relaxed).saturating_add(bytes),
+            ),
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
@@ -1835,9 +1887,15 @@ impl State {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
+                        Some(wait) => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + wait,
+                            (at, len),
+                            print,
+                            looks + 1,
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
@@ -2007,7 +2065,15 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    host.texture_slot_recheck(
+                        index,
+                        write,
+                        frame + RECHECK_FRAMES[0],
+                        (at, len),
+                        print,
+                        0,
+                        frame,
+                    );
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -2050,6 +2116,79 @@ impl State {
         });
     }
 
+    fn bind_emulated_cs(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        buffers: &crate::mesh_emu::Buffers,
+        base_group: u32,
+        slot_map_gpu: u64,
+    ) -> bool {
+        let Some(emu) = &p.mesh_emu else {
+            return false;
+        };
+        if !self.bind_parts(
+            list,
+            p,
+            &emu.cs_root,
+            &emu.cs_pso,
+            &p.name,
+            std::slice::from_ref(&emu.cs_stage),
+            false,
+            true,
+        ) {
+            return false;
+        }
+        let l = &list.list;
+        // SAFETY: an open list; emulation buffers are static and also kept
+        // with the list below.
+        unsafe {
+            l.SetComputeRootUnorderedAccessView(emu.cs_uav_param, buffers.output_gpu);
+            if let Some(param) = emu.cs_cbv_param {
+                let constants = [base_group, 0, 0, 0];
+                l.SetComputeRoot32BitConstants(param, 4, constants.as_ptr().cast(), 0);
+            }
+            if let Some(param) = emu.cs_srv_param {
+                l.SetComputeRootShaderResourceView(param, slot_map_gpu);
+            }
+        }
+        list.keep(&buffers.output);
+        list.keep(&buffers.slot_map);
+        list.keep(&buffers.dummy_srv);
+        true
+    }
+
+    fn bind_emulated_gfx(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        buffers: &crate::mesh_emu::Buffers,
+    ) -> bool {
+        let Some(emu) = &p.mesh_emu else {
+            return false;
+        };
+        if !self.bind_parts(list, p, &p.root, &p.pso, &p.name, &p.stages, false, false) {
+            return false;
+        }
+        let l = &list.list;
+        // SAFETY: an open list; `output` is live and in non-pixel shader
+        // resource state when the draw is recorded.
+        unsafe {
+            l.SetGraphicsRootShaderResourceView(emu.draw_srv_param, buffers.output_gpu);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        }
+        self.ensure_targets(list);
+        true
+    }
+
+    fn restore_mesh_emu_state(&mut self, list: &HostList) {
+        if self.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 {
+            self.set_topology(list, self.topology);
+        }
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2071,7 +2210,9 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::pipeline::note_why(
+                    "a stage of the ray-tracing structure builder, which is off".to_owned(),
+                );
                 self.list_dropped_roots([x, y, z]);
             }
             return;
@@ -2104,6 +2245,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.flush_barriers();
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2249,27 +2391,44 @@ impl State {
                 Some(_) => {}
                 // A texture read through the table: the title slot it sits in.
                 None => {
-                    let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else {
+                    let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot))
+                    else {
                         continue;
                     };
                     match heap.index(table + u64::from(u.table_offset_dwords) * 4) {
-                        Some(index) => text.push_str(&Self::slot_line(heap, &format!("table:{label}"), 0, index)),
+                        Some(index) => text.push_str(&Self::slot_line(
+                            heap,
+                            &format!("table:{label}"),
+                            0,
+                            index,
+                        )),
                         None => {
-                            let _ = write!(text, "\n    ~table {label} title=[{}]", view_state(Some(&view)));
+                            let _ = write!(
+                                text,
+                                "\n    ~table {label} title=[{}]",
+                                view_state(Some(&view))
+                            );
                         }
                     }
                 }
             }
         }
         let uses = |slot: u8, dwords: u32| {
-            t.used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.table_offset_dwords == dwords)
+            t.used.iter().any(|u| {
+                u.root == RootType::Table && u.slot == slot && u.table_offset_dwords == dwords
+            })
         };
         if let Some(at) = material
             && uses(0, MATERIALS)
-            && let Some((base, len)) = entry(0, MATERIALS).as_ref().and_then(crate::descriptor::host::buffer_range)
+            && let Some((base, len)) = entry(0, MATERIALS)
+                .as_ref()
+                .and_then(crate::descriptor::host::buffer_range)
         {
             let at = u64::from(at);
-            let _ = write!(text, "\n    ~material record at {at:#x} of the buffer at {base:#x} bytes {len}");
+            let _ = write!(
+                text,
+                "\n    ~material record at {at:#x} of the buffer at {base:#x} bytes {len}"
+            );
             if at + 64 <= len {
                 Self::slot_words(&mut text, heap, "M", base + at, 64);
             }
@@ -2296,15 +2455,26 @@ impl State {
     /// line), and a `~slot` line for every word of them that names a
     /// texture view in `heap`.
     #[cfg(feature = "diagnostics")]
-    fn slot_words(text: &mut String, heap: &crate::descriptor::Heap, label: &str, address: u64, len: usize) {
+    fn slot_words(
+        text: &mut String,
+        heap: &crate::descriptor::Heap,
+        label: &str,
+        address: u64,
+        len: usize,
+    ) {
         use std::fmt::Write;
         let mut bytes = vec![0u8; len.min(512) & !3];
         if bytes.is_empty() || !crate::host::read_into(address as *const u8, &mut bytes) {
-            let _ = write!(text, "\n    ~raw {label} at {address:#x} bytes {len}: unreadable");
+            let _ = write!(
+                text,
+                "\n    ~raw {label} at {address:#x} bytes {len}: unreadable"
+            );
             return;
         }
-        let words: Vec<u32> =
-            bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
         let _ = write!(text, "\n    ~raw {label} at {address:#x} bytes {len}:");
         for w in &words {
             let _ = write!(text, " {w:08x}");
@@ -2348,15 +2518,21 @@ impl State {
 
     /// A mesh draw under `VICTORY_MESH_TEST=scissor` rasterises one pixel:
     /// the scissors before it (`on`), the title's after it.
-    fn mesh_scissor(&self, list: &HostList, on: bool) {
+    fn mesh_scissor(&mut self, list: &HostList, on: bool) {
         if mesh_test() != 2 {
             return;
         }
         if on {
-            let one = RECT { left: 0, top: 0, right: 1, bottom: 1 };
+            let one = RECT {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            };
             crate::draw::scissors(list, &vec![one; self.scissors.len().max(1)]);
         } else if !self.scissors.is_empty() {
-            crate::draw::scissors(list, &self.scissors);
+            let rects = self.scissors.clone();
+            self.set_scissors(list, &rects);
         }
     }
 
@@ -2384,6 +2560,7 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    list.flush_barriers();
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
@@ -2462,83 +2639,19 @@ impl State {
                 }
             }
         } else if self.targets.iter().filter(|&&t| t != 0).count() >= 4 {
-            let r = self.scissors.first().map_or([0; 4], |r| [r.left, r.top, r.right, r.bottom]);
+            let r = self
+                .scissors
+                .first()
+                .map_or([0; 4], |r| [r.left, r.top, r.right, r.bottom]);
             *census.1.entry(r).or_insert(0) += 1;
         }
     }
 
-    fn bind_emulated_cs(
-        &mut self,
-        list: &HostList,
-        p: &HostPipeline,
-        buffers: &crate::mesh_emu::Buffers,
-        base_group: u32,
-        slot_map_gpu: u64,
-    ) -> bool {
-        let Some(emu) = &p.mesh_emu else {
-            return false;
-        };
-        if !self.bind_parts(
-            list,
-            p,
-            &emu.cs_root,
-            &emu.cs_pso,
-            &p.name,
-            std::slice::from_ref(&emu.cs_stage),
-            false,
-            true,
-        ) {
-            return false;
-        }
-        let l = &list.list;
-        // SAFETY: an open list; emulation buffers are static and also kept
-        // with the list below.
-        unsafe {
-            l.SetComputeRootUnorderedAccessView(emu.cs_uav_param, buffers.output_gpu);
-            if let Some(param) = emu.cs_cbv_param {
-                let constants = [base_group, 0, 0, 0];
-                l.SetComputeRoot32BitConstants(param, 4, constants.as_ptr().cast(), 0);
-            }
-            if let Some(param) = emu.cs_srv_param {
-                l.SetComputeRootShaderResourceView(param, slot_map_gpu);
-            }
-        }
-        list.keep(&buffers.output);
-        list.keep(&buffers.slot_map);
-        list.keep(&buffers.dummy_srv);
-        true
-    }
+    
 
-    fn bind_emulated_gfx(
-        &mut self,
-        list: &HostList,
-        p: &HostPipeline,
-        buffers: &crate::mesh_emu::Buffers,
-    ) -> bool {
-        let Some(emu) = &p.mesh_emu else {
-            return false;
-        };
-        if !self.bind_parts(list, p, &p.root, &p.pso, &p.name, &p.stages, false, false) {
-            return false;
-        }
-        let l = &list.list;
-        // SAFETY: an open list; `output` is live and in non-pixel shader
-        // resource state when the draw is recorded.
-        unsafe {
-            l.SetGraphicsRootShaderResourceView(emu.draw_srv_param, buffers.output_gpu);
-            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        }
-        self.ensure_targets(list);
-        true
-    }
+    
 
-    fn restore_mesh_emu_state(&mut self, list: &HostList) {
-        if self.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 {
-            self.set_topology(list, self.topology);
-        }
-        self.host_pipeline = 0;
-        self.host_roots = [0; 2];
-    }
+    
 
     fn dispatch_mesh_emulated(&mut self, list: &HostList, p: &HostPipeline, x: u32) -> bool {
         #[cfg(feature = "diagnostics")]
@@ -3102,6 +3215,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.flush_barriers();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3203,6 +3317,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.flush_barriers();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3386,14 +3501,23 @@ impl State {
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            (
+                                step as u32,
+                                (if w.records == 1 { 16 } else { w.records * 2 })
+                                    .min(fit)
+                                    .max(1),
+                            )
                         } else {
                             (stride, max)
                         }
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                args.refresh(
+                    list,
+                    arguments,
+                    len.max(u64::from(step) * u64::from(records)),
+                );
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
@@ -3404,9 +3528,18 @@ impl State {
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step, records),
+                    )
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                    )
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -3439,11 +3572,15 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        list.flush_barriers();
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3469,6 +3606,7 @@ impl State {
         }
         true
     }
+    
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -3792,7 +3930,9 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     #[cfg(feature = "diagnostics")]
-    crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
+    crate::capture::op(std::ptr::from_ref(list) as usize, || {
+        format!("STENCIL REF {reference:#x}")
+    });
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }

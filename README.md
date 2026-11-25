@@ -278,7 +278,7 @@ status section describes upstream, not this fork.
 
 # VIctory
 
-Runs the title (Xbox Series X|S) natively on Windows, from files
+Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
@@ -299,7 +299,9 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on one machine: Windows 11, AMD RX 6700 XT; and on Linux under
+Proton Experimental: CachyOS, AMD RX 9070 XT (see
+[docs/linux-proton.md](docs/linux-proton.md)).
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -318,25 +320,49 @@ What each part does today and what it still needs:
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | Merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+Community reports show the Windows-target build running on Linux under
+Wine/Proton with vkd3d-proton. This is experimental; see
+[Linux + Wine/Proton](docs/linux-wine.md) for the reported setup and caveats.
+The project does not currently build as a native Linux application; cross-build
+the Windows executable and run it under Wine/Proton instead.
+
+Windows requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
+shader model 6.6 (hardware mesh shaders or the SM 6.6 compute + vertex
+fallback for the world), Rust (pinned in `rust-toolchain.toml`).
+
+Under Wine or Proton, indirect execution also needs DXC's `dxcompiler.dll` (with
+its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile the indirect-argument
+clamp. It is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
+`dxil.dll` that shader validation finds, then the executable's folder and System32.
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
+On Linux, enter the Nix development shell and build the Windows executable:
+
+```sh
+nix-shell
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+./scripts/run-ge-proton.sh
+```
+
+The launch helper defaults to the supplied game path and uses an installed
+GE-Proton release; pass a different executable path to override it.
+
+On Windows, run the workspace tests and install the asset-policy hook:
+
 ```powershell
+cargo test --workspace                   # needs no game data
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
@@ -362,6 +388,25 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+With `VICTORY_MOUSE=1` (a number sets the sensitivity, e.g. `0.5` or `2`) the
+mouse adds to that pad too: movement turns the right stick (the camera), the
+left button pulls the right trigger and the right button the left one. While
+the title's window has focus the cursor stays in its centre; switching to
+another window releases it.
+
+### Linux (Proton)
+
+VIctory also runs on Linux under Proton Experimental, built with
+`cargo-xwin`, and gets as far there as on Windows: see
+[docs/linux-proton.md](docs/linux-proton.md) and `scripts/proton-run.sh`.
+
+Tests on a Linux host, under Wine: `cargo xtask wine-test` cross-builds the
+Windows test binaries (clang-cl, lld-link and llvm-lib on `PATH`, the MSVC CRT
+and Windows SDK from `xwin splat --output ~/.xwin`) and runs them in a Wine
+prefix of their own under `target/`. `--vkd3d-proton <dir>` puts that
+folder's `d3d12.dll` and `d3d12core.dll` into the prefix (Wine's own D3D12
+has no shader model 6.6); arguments after `--` go to `cargo test`.
 
 ## Commands
 
@@ -400,10 +445,15 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
+| `VICTORY_PIPELINE_WORKERS=16` | use this many pipeline worker threads (1-64) instead of half the logical processors, 2-8 by default |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_TEXTURE_MIP_DROP=0..=3` | override texture mip dropping (default: 1 on adapters with at most 8.5 GiB dedicated VRAM, then raised after allocation out-of-memory) |
+| `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE=1024` | smallest post-drop texture dimension eligible for mip dropping |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^14 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_MESH_EMULATION=1\|0` | forces compute (`cs_6_6`) + unpack vertex (`vs_6_6`) mesh shader emulation (`1`) or disables the automatic fallback on GPUs without hardware mesh shaders (`0`) |
+| `VICTORY_MESH_BUFFER_MB=<n>` | size in MiB (`1..=1024`, default `128` with fallback down to `16`) of the intermediate buffer for emulated mesh shaders |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

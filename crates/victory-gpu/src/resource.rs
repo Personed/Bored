@@ -249,7 +249,7 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
-/// itself in the 16-bit format are skipped ([`stands_in`]); convert them
+/// itself in the 16-bit format are skipped (`stands_in`); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
     const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
