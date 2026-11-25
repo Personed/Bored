@@ -44,6 +44,17 @@ pub struct MeshComputeLayout {
     pub primitive_params: Vec<(u32, u64)>,
 }
 
+/// Checked resource and draw sizes for one mesh-compute dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshComputeDispatch {
+    /// Number of mesh workgroups represented by this dispatch.
+    pub groups: u32,
+    /// Bytes needed for all workgroup output slots.
+    pub output_bytes: u64,
+    /// Vertex count for the fallback's single non-indexed triangle draw.
+    pub draw_vertices: u32,
+}
+
 /// Computes the 16-byte-aligned slot layout used by the mesh-as-compute
 /// fallback. Parameter locations are sorted and duplicate rows are stored
 /// only once.
@@ -121,9 +132,29 @@ pub fn mesh_compute_layout(
     })
 }
 
+/// Computes the output-buffer allocation and non-indexed draw count for
+/// `groups` workgroups. Returns `None` if the allocation overflows `u64` or
+/// the draw count cannot be represented by D3D12's `DrawInstanced` arguments.
+pub fn mesh_compute_dispatch(
+    layout: &MeshComputeLayout,
+    groups: u32,
+) -> Option<MeshComputeDispatch> {
+    let output_bytes = layout.slot_bytes.checked_mul(u64::from(groups))?;
+    let draw_vertices = u64::from(groups)
+        .checked_mul(u64::from(layout.max_primitives))?
+        .checked_mul(3)?;
+    Some(MeshComputeDispatch {
+        groups,
+        output_bytes,
+        draw_vertices: u32::try_from(draw_vertices).ok()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MeshComputeLayout, mesh_compute_layout};
+    use super::{
+        MeshComputeDispatch, MeshComputeLayout, mesh_compute_dispatch, mesh_compute_layout,
+    };
 
     #[test]
     fn aligns_records_and_sorts_unique_parameter_locations() {
@@ -161,5 +192,41 @@ mod tests {
     #[test]
     fn rejects_layouts_whose_size_overflows() {
         assert!(mesh_compute_layout(u32::MAX, u32::MAX, u32::MAX, 0, &[], &[]).is_none());
+    }
+
+    #[test]
+    fn sizes_the_output_buffer_and_raster_draw_for_all_groups() {
+        let layout = mesh_compute_layout(2, 3, 5, 1, &[8, 2, 8], &[6, 4, 6]).unwrap();
+        assert_eq!(
+            mesh_compute_dispatch(&layout, 4),
+            Some(MeshComputeDispatch {
+                groups: 4,
+                output_bytes: 1408,
+                draw_vertices: 36,
+            })
+        );
+    }
+
+    #[test]
+    fn zero_groups_need_no_buffer_or_draw() {
+        let layout = mesh_compute_layout(2, 3, 0, 0, &[], &[]).unwrap();
+        assert_eq!(
+            mesh_compute_dispatch(&layout, 0),
+            Some(MeshComputeDispatch {
+                groups: 0,
+                output_bytes: 0,
+                draw_vertices: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_overflow_and_unrepresentable_draw_counts() {
+        let mut layout = mesh_compute_layout(1, 1, 0, 0, &[], &[]).unwrap();
+        layout.slot_bytes = u64::MAX;
+        assert!(mesh_compute_dispatch(&layout, 2).is_none());
+
+        let layout = mesh_compute_layout(1, u32::MAX, 0, 0, &[], &[]).unwrap();
+        assert!(mesh_compute_dispatch(&layout, 1).is_none());
     }
 }
