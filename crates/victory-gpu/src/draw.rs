@@ -2600,6 +2600,9 @@ impl State {
         let Some(emu_pipe) = &p.mesh_emu else {
             return false;
         };
+        if mesh_test() == 1 || !mesh_kept(self.pipeline) {
+            return false;
+        }
         if x == 0 {
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -2648,6 +2651,7 @@ impl State {
             }
             // SAFETY: open list with the unpack graphics pipeline bound and
             // `output` readable as a shader resource.
+            self.mesh_scissor(list, true);
             unsafe {
                 list.list
                     .DrawInstanced(chunk * emu_pipe.emu.max_primitives * 3, 1, 0, 0);
@@ -2657,6 +2661,7 @@ impl State {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
+            self.mesh_scissor(list, false);
             base += chunk;
         }
         self.restore_mesh_emu_state(list);
