@@ -22,7 +22,7 @@ const INDIRECT_ARGS_BYTES: u64 = 256;
 const OUTPUT_FALLBACK_SIZES: &[u64] = &[128 << 20, 64 << 20, 32 << 20, 16 << 20];
 
 const PREP_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=6, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
 cbuffer Info : register(b0) {
     uint stride;
     uint max_records;
@@ -31,10 +31,10 @@ cbuffer Info : register(b0) {
     uint has_count;
     uint build_map;
 };
-ByteAddressBuffer args : register(t0);
-ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer out_args : register(u0);
-RWByteAddressBuffer slot_map : register(u1);
+RWByteAddressBuffer args : register(u0);
+RWByteAddressBuffer count_buf : register(u1);
+RWByteAddressBuffer out_args : register(u2);
+RWByteAddressBuffer slot_map : register(u3);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
@@ -274,8 +274,8 @@ impl Buffers {
             l.SetComputeRootSignature(prep_root);
             l.SetPipelineState(prep_pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, args_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu.unwrap_or(args_gpu));
+            l.SetComputeRootUnorderedAccessView(1, args_gpu);
+            l.SetComputeRootUnorderedAccessView(2, count_gpu.unwrap_or(args_gpu));
             l.SetComputeRootUnorderedAccessView(3, self.indirect_args_gpu);
             l.SetComputeRootUnorderedAccessView(4, self.slot_map_gpu);
             l.Dispatch(1, 1, 1);
