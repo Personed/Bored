@@ -119,7 +119,7 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
-/// A run of indirect records clamped in one pass ([`windows`]): the host
+/// A run of indirect records clamped in one pass (`windows()`): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
 /// holds them clamped, record `i` at `i * step`.
@@ -129,14 +129,14 @@ struct Window {
     kind: u32,
     stride: u32,
     /// How far apart the records are in the copy, and in the scratch
-    /// buffer: what the title walks them by ([`windows`]).
+    /// buffer: what the title walks them by (`windows()`).
     step: u32,
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
 }
 
-/// The most records clamped in one pass ([`windows`]).
+/// The most records clamped in one pass (`windows()`).
 const WINDOW_MOST: u64 = 64;
 
 /// Whether indirect draws that read record after record of one argument
@@ -215,7 +215,7 @@ pub(crate) struct State {
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
     /// The indirect records clamped last, if later draws may still read
-    /// them ([`windows`]).
+    /// them (`windows()`).
     window: Option<Window>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
