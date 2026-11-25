@@ -1154,7 +1154,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SetCursorPos,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsWindow, SetCursorPos,
     };
 
     use super::*;
@@ -1212,6 +1212,7 @@ mod host {
         /// accumulator decays, spreading the movement over a few polls.
         mouse_x: f32,
         mouse_y: f32,
+        mouse_decayed: Option<Instant>,
         /// The window capture started on; re-centring pauses while any
         /// other window (a text-entry dialog shares the process, so the
         /// focus check alone passes it) is in front.
@@ -1296,17 +1297,24 @@ mod host {
             };
             if !focused() {
                 self.mouse_centred = false;
+                self.mouse_x = 0.0;
+                self.mouse_y = 0.0;
                 return MouseState::default();
             }
-            // SAFETY: a plain query.
+            // SAFETY: plain queries.
             let window = unsafe { GetForegroundWindow() } as isize;
-            if self.game_window.is_none() {
+            if self.game_window.is_none_or(|w| unsafe { IsWindow(w as _) } == 0) {
+                // Capture starts on the first in-process foreground window;
+                // when that window closes (a startup dialog), capture moves
+                // to whatever is in front then.
                 self.game_window = Some(window);
             }
             if Some(window) != self.game_window {
                 // Another window of ours is in front (the text-entry
                 // dialog shares the process): the user needs the cursor.
                 self.mouse_centred = false;
+                self.mouse_x = 0.0;
+                self.mouse_y = 0.0;
                 return MouseState::default();
             }
             let mut rect = RECT::default();
@@ -1329,10 +1337,16 @@ mod host {
                 self.mouse_y += (at.y - centre.1) as f32;
             }
             let (x, y) = (self.mouse_x, self.mouse_y);
-            // The accumulator decays once reported, so the movement
-            // survives into the title's next frame without repeating.
-            self.mouse_x *= 0.5;
-            self.mouse_y *= 0.5;
+            // The accumulator decays once reported — halves per 100 ms,
+            // independent of the poll rate, so movement spans the title's
+            // slow frames yet fades instead of repeating.
+            let now = Instant::now();
+            let factor = self
+                .mouse_decayed
+                .replace(now)
+                .map_or(0.0, |then| 0.5f32.powf((now - then).as_secs_f32() / 0.1));
+            self.mouse_x *= factor;
+            self.mouse_y *= factor;
             let scale = STICK_PER_PIXEL * sensitivity;
             MouseState {
                 x: x * scale,
