@@ -1075,6 +1075,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Smaller indirect scratch buffers replaced while this list records.
+    /// They stay alive here until its submissions finish, then join the pool.
+    indirect_old: Mutex<Vec<(ID3D12Resource, u64)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -4364,6 +4367,7 @@ impl Host {
             budget: OnceLock::new(),
             card_budget: OnceLock::new(),
             indirect_args: Mutex::default(),
+            indirect_old: Mutex::default(),
             window_check: OnceLock::new(),
             _alive: Counted::new(),
             meter: AtomicU32::new(u32::MAX),
@@ -6960,6 +6964,15 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        let old_indirect: Vec<_> = self
+            .indirect_old
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for (buffer, size) in old_indirect {
+            give_indirect_scratch(buffer, size);
+        }
         if indirect_pool() {
             let indirect = self
                 .indirect_args
@@ -7846,10 +7859,15 @@ impl HostList {
         let (buffer, alloc) = take_indirect_scratch(host()?, wanted)?;
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
-        if let Some((old_buf, _)) = old {
-            // It ends the list common, as every scratch buffer does.
+        if let Some((old_buf, old_size)) = old {
+            // It ends the list common, as every scratch buffer does. The
+            // list keeps it alive until its submissions finish; then it can
+            // serve another list instead of being allocated again.
             self.indirect_common(&old_buf);
-            self.keep(&old_buf);
+            self.indirect_old
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((old_buf, old_size));
         }
         Some(buffer)
     }
