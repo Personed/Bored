@@ -4311,16 +4311,29 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
 /// lower in the cell later makes a longer tail, which every ask from then
 /// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `VICTORY_WINDOW_TAILS=1`. A longer tail is another
-/// host buffer than the shorter one: what was bound to the shorter stays
-/// right only because every list brings up to date the copy it bound
-/// (`draw.rs` keeps a root view's copy with its slot). It pays only
-/// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
-/// with a length in the same cell makes the whole cell's window, and the
-/// tail is that.
+/// On by default with a window grid below 4 MiB (the default is 256 KiB);
+/// `VICTORY_WINDOW_TAILS=0` turns it off and `=1` turns it on even on the
+/// 4 MiB grid. A longer tail is another host buffer than the shorter one:
+/// what was bound to the shorter stays right only because every list brings
+/// up to date the copy it bound (`draw.rs` keeps a root view's copy with
+/// its slot). It pays only together with a grid below 4 MiB: on the 4 MiB
+/// grid an ask with a length in the same cell makes the whole cell's
+/// window, and the tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let setting = std::env::var("VICTORY_WINDOW_TAILS").ok();
+        tails_on(setting.as_deref(), window())
+    })
+}
+
+/// Whether tails are on for an environment setting and window grid.
+fn tails_on(setting: Option<&str>, window: u64) -> bool {
+    match setting {
+        Some("0") => false,
+        Some("1") => true,
+        _ => window < WINDOW,
+    }
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -4562,7 +4575,9 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{BTreeMap, Entry};
-    use super::{WINDOW, cover, enclosing, grid, holder, longest_tail, tail_of, window_of};
+    use super::{
+        WINDOW, cover, enclosing, grid, holder, longest_tail, tail_of, tails_on, window_of,
+    };
 
     /// A big buffer is found below any number of smaller entries in it.
     #[test]
@@ -4671,6 +4686,17 @@ mod window_tests {
             longest_tail(with_whole.into_iter(), ask, ask + 1),
             Some((cell, WINDOW))
         );
+    }
+
+    /// Tails follow a fine window grid by default and the explicit setting
+    /// wins either way.
+    #[test]
+    fn tails_follow_the_grid_unless_set() {
+        assert!(tails_on(None, 256 << 10));
+        assert!(!tails_on(None, WINDOW));
+        assert!(!tails_on(Some("0"), 256 << 10));
+        assert!(tails_on(Some("1"), WINDOW));
+        assert!(tails_on(Some("unexpected"), 256 << 10));
     }
 
     /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
