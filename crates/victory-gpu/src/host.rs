@@ -104,7 +104,10 @@ pub(crate) fn moment() -> u64 {
 /// for seconds, and at many frames per second not for many frames. (A title
 /// that never waits for frames has no frame count: nothing is then idle.)
 pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
-    let now = self::moment();
+    long_ago_at(moment, self::moment(), ms, frames)
+}
+
+fn long_ago_at(moment: u64, now: u64, ms: u64, frames: u64) -> bool {
     let tenths = (now & 0xffff_ffff).saturating_sub(moment & 0xffff_ffff);
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
@@ -1644,9 +1647,13 @@ impl<T> Spare<T> {
     /// Things not reused for `ms` and `frames`, dropped by the caller
     /// outside the pool's lock: how many, their bytes, and the things.
     fn sweep(&mut self, ms: u64, frames: u64) -> (u64, u64, Vec<T>) {
+        self.sweep_at(moment(), ms, frames)
+    }
+
+    fn sweep_at(&mut self, now: u64, ms: u64, frames: u64) -> (u64, u64, Vec<T>) {
         let (kept, expired): (Vec<_>, Vec<_>) = std::mem::take(&mut self.kept)
             .into_iter()
-            .partition(|(_, _, since)| !long_ago(*since, ms, frames));
+            .partition(|(_, _, since)| !long_ago_at(*since, now, ms, frames));
         let (mut count, mut bytes) = (0u64, 0u64);
         let mut things = Vec::with_capacity(expired.len());
         for (thing, size, _) in expired {
@@ -9661,6 +9668,41 @@ mod spare {
         assert_eq!(things, vec![1]);
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// Mixed-age pools keep entries meeting only one of the time and frame
+    /// thresholds, while entries meeting both are taken once.
+    #[test]
+    fn sweep_keeps_entries_meeting_only_one_threshold() {
+        fn at(frames: u64, tenths: u64) -> u64 {
+            (frames << 32) | tenths
+        }
+        let now = at(10, 1_000);
+        let mut spare: Spare<u32> = Spare::new();
+        for thing in 1..=4 {
+            assert_eq!(spare.give(thing, 1, 10), None);
+        }
+        for entry in &mut spare.kept {
+            entry.2 = match entry.0 {
+                1 => at(10, 999), // neither threshold
+                2 => at(10, 900), // time only
+                3 => at(7, 999),  // frames only
+                4 => at(7, 900),  // both
+                _ => unreachable!(),
+            };
+        }
+        let (count, bytes, things) = spare.sweep_at(now, 5_000, 2);
+        assert_eq!((count, bytes), (1, 1));
+        assert_eq!(things, vec![4]);
+        assert_eq!(spare.bytes, 3);
+        assert_eq!(
+            spare
+                .kept
+                .iter()
+                .map(|(thing, _, _)| *thing)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 }
 
