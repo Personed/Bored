@@ -207,7 +207,7 @@ fn windows() -> bool {
 /// own at once, with the step the title was last seen to walk that
 /// argument buffer by (`VICTORY_WINDOW_JUMP=1`; `alt`: twenty seconds
 /// with, twenty without, in turn, each change said in the log). Off by
-/// default. Needs [`windows`].
+/// default. Needs [`windows()`].
 ///
 /// Run 243 counted, per frame, 2,370 indirect commands read from a window
 /// and 2,370 clamped by a pass of ours; 960 of those passes were for
@@ -279,7 +279,7 @@ fn jump_window(
     (fit > 1).then_some((step, fit))
 }
 
-/// Diagnostics of [`windows`]: indirect commands since the last line, by
+/// Diagnostics of [`windows()`]: indirect commands since the last line, by
 /// what became of their clamp. In order: read from a window (no pass of
 /// ours); then clamped by a pass of ours because: it is a dispatch; it
 /// asks for more than one record; it has a count buffer; its shaders can
