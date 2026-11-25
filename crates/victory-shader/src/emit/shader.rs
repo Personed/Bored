@@ -1121,11 +1121,9 @@ mod tests {
         let dxil = s.finish();
         // The SFI0 part's feature bits (the container's own assertion:
         // `finish` consumes the shader, so the flags are read back).
-        let at = dxil
-            .windows(4)
-            .position(|w| w == b"SFI0")
-            .expect("an SFI0 part");
-        let features = u64::from_le_bytes(dxil[at + 8..at + 16].try_into().unwrap());
+        let c = crate::dxbc::Container::parse(&dxil).expect("a valid container");
+        let part = c.part(crate::dxbc::FourCC::SFI0).expect("an SFI0 part");
+        let features = u64::from_le_bytes(part.data[..8].try_into().unwrap());
         (dxil, features)
     }
 
@@ -1138,6 +1136,10 @@ mod tests {
     fn uavs_outside_pixel_and_compute_programs_are_declared() {
         // The flags assertion runs everywhere; the validator check only
         // where dxil.dll is found.
+        let mut validator = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
         for (name, stage, heap, want) in [
             ("vertex", Stage::Vertex, false, true),
             ("pixel", Stage::Pixel, false, false),
@@ -1148,10 +1150,6 @@ mod tests {
         ] {
             let (mut dxil, features) = marked(stage, heap);
             assert_eq!(features & 0x4 != 0, want, "{name}: SFI0 UAVs at every stage");
-            let mut validator = super::super::validator::Validator::load(
-                super::super::validator::Validator::default_path().as_deref(),
-            )
-            .ok();
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
