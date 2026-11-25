@@ -150,6 +150,11 @@ fn build(op: u8, pair: bool) -> HostShader {
 /// Runs `op` for each (start, data, compare) and checks the old value it
 /// returns and the texel it leaves against `want(start, data, compare)`.
 fn check(name: &str, op: u8, pair: bool, cases: &[[u32; 3]], want: impl Fn(u32, u32, u32) -> u32) {
+    // Adapted from upstream: take the crate-wide GPU test lock - two GPU
+    // tests at once on WARP can end the test process with an access violation.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let shader = build(op, pair);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
