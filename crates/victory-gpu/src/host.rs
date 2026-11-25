@@ -973,8 +973,8 @@ impl LazyCommandList {
         }
     }
 
-    fn pair(&self) -> &(ID3D12CommandAllocator, ID3D12GraphicsCommandList) {
-        let made = self.made.get_or_init(|| {
+    fn cell(&self) -> &windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+        self.made.get_or_init(|| {
             #[cfg(feature = "diagnostics")]
             let before = private_bytes();
             // SAFETY: plain object creation.
@@ -997,8 +997,19 @@ impl LazyCommandList {
                 LISTS[2].fetch_add(private_bytes().wrapping_sub(before), Ordering::Relaxed);
             }
             made
-        });
-        match made {
+        })
+    }
+
+    /// Makes the driver pair now, or says why it could not be made.
+    pub(crate) fn ensure(&self) -> windows::core::Result<()> {
+        match self.cell() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    fn pair(&self) -> &(ID3D12CommandAllocator, ID3D12GraphicsCommandList) {
+        match self.cell() {
             Ok(pair) => pair,
             Err(e) => fail(format_args!("a host command list could not be made ({e})")),
         }
@@ -9090,6 +9101,7 @@ impl Host {
                     .position(|(_, flown)| *flown <= finished)
                     .or_else(|| {
                         let list = self.new_list().ok()?;
+                        list.list.ensure().ok()?;
                         list.close();
                         p.ahead.push((list, 0));
                         Some(p.ahead.len() - 1)
