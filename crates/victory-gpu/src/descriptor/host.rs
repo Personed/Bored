@@ -3056,6 +3056,17 @@ fn adjust_srv_for_mip_drop(srv: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, drop: u32,
     }
 }
 
+/// A host CBV has a 256-byte-aligned address and size.
+fn constant_desc(gpu: u64, size: u32) -> Option<D3D12_CONSTANT_BUFFER_VIEW_DESC> {
+    if !gpu.is_multiple_of(256) {
+        return None;
+    }
+    Some(D3D12_CONSTANT_BUFFER_VIEW_DESC {
+        BufferLocation: gpu,
+        SizeInBytes: size.next_multiple_of(256),
+    })
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3065,16 +3076,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
+            let Some(desc) = constant_desc(gpu, size) else {
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
                 );
                 return None;
-            }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3477,6 +3484,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The captured CBV is 0x30 bytes off alignment: it must not be rounded
+    /// down, which would make the shader read a different constant buffer.
+    #[test]
+    fn constant_buffer_views_require_a_256_byte_gpu_address() {
+        let aligned = constant_desc(0xd6833ff00, 80).expect("aligned CBV");
+        assert_eq!(aligned.BufferLocation, 0xd6833ff00);
+        assert_eq!(aligned.SizeInBytes, 256);
+        assert!(constant_desc(0xd6833ff30, 80).is_none());
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

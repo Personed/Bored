@@ -441,6 +441,15 @@ pub(crate) struct State {
     tables_gone: bool,
 }
 
+/// The number of groups in a mesh grid, or `None` when their scalar ids
+/// cannot be represented. Any zero dimension launches no groups.
+fn mesh_grid_groups(x: u32, y: u32, z: u32) -> Option<u32> {
+    if x == 0 || y == 0 || z == 0 {
+        return Some(0);
+    }
+    x.checked_mul(y).and_then(|xy| xy.checked_mul(z))
+}
+
 impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
@@ -2830,19 +2839,31 @@ impl State {
         }
     }
 
-    /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
-    /// programs are one-dimensional).
-    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+    /// Runs a mesh dispatch with the caller's three-dimensional group grid.
+    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.window = None;
         if self.may_store() {
             list.gather_close();
         }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        // Translated mesh shaders expose the console's scalar group input,
+        // not the host's three `SV_GroupID` components: launch the grid as
+        // one flattened sequence on both native and emulated mesh pipelines.
+        let Some(groups) = mesh_grid_groups(x, y, z) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        };
+        if groups == 0 {
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
             && p.mesh_emu.is_some()
         {
-            if !self.dispatch_mesh_emulated(list, p, x) {
+            if !self.dispatch_mesh_emulated(list, p, groups) {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 dropped(self.pipeline);
@@ -2855,11 +2876,11 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z} as {groups}"), false));
                     self.mesh_scissor(list, true);
                     list.flush_barriers();
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    unsafe { l6.DispatchMesh(groups, 1, 1) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2945,7 +2966,7 @@ impl State {
         }
     }
 
-    fn dispatch_mesh_emulated(&mut self, list: &HostList, p: &HostPipeline, x: u32) -> bool {
+    fn dispatch_mesh_emulated(&mut self, list: &HostList, p: &HostPipeline, groups: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -2955,10 +2976,6 @@ impl State {
         };
         if mesh_test() == 1 || !mesh_kept(self.pipeline) {
             return false;
-        }
-        if x == 0 {
-            DRAWN.fetch_add(1, Ordering::Relaxed);
-            return true;
         }
         let Some(buffers) = crate::mesh_emu::buffers() else {
             return false;
@@ -2972,14 +2989,16 @@ impl State {
             return false;
         }
         let mut base = 0u32;
-        while base < x {
-            let chunk = (x - base).min(group_cap);
+        while base < groups {
+            let chunk = (groups - base).min(group_cap);
             if !self.bind_emulated_cs(list, p, buffers, base, buffers.dummy_srv_gpu) {
                 self.restore_mesh_emu_state(list);
                 return false;
             }
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("mesh-emu {chunk} (base {base})"), false));
+            list.note_op(|| {
+                self.op_text(format!("mesh-emu {chunk} of {groups} (base {base})"), false)
+            });
             // SAFETY: open list with the emulated compute pipeline bound and
             // `output` in unordered-access state.
             unsafe {
@@ -3724,10 +3743,7 @@ impl State {
             },
             None => None,
         };
-        if kind == MESH
-            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
-            && p.mesh_emu.is_some()
-        {
+        if kind == MESH && p.mesh_emu.is_some() {
             return self.execute_indirect_mesh_emulated(
                 list,
                 p,
@@ -4413,6 +4429,14 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_grid_counts_every_dimension_without_multiplying_past_zero() {
+        assert_eq!(mesh_grid_groups(2, 3, 4), Some(24));
+        assert_eq!(mesh_grid_groups(2, 0, 4), Some(0));
+        assert_eq!(mesh_grid_groups(u32::MAX, u32::MAX, 0), Some(0));
+        assert_eq!(mesh_grid_groups(u32::MAX, u32::MAX, 2), None);
+    }
 
     #[test]
     fn a_lone_record_opens_a_window_at_the_remembered_step() {

@@ -5893,293 +5893,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
-    /// the code also reads as numbers: the console compiler computes sizes
-    /// from descriptor bits (an image's width, height, depth, levels; a
-    /// buffer's record count) instead of querying them. Those fields are
-    /// rebuilt from the host view's dimensions in the GFX10 layout (image
-    /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
-    /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
-    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
-    // shortcut: the base level reads 0 (the host view starts at its own
-    // level 0, so sizes the code shifts by it come out right) and the other
-    // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
-    fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
-        let Fields::Smem {
-            data: Some(Operand::Scalar { code, .. }),
-            ..
-        } = inst.fields
-        else {
-            return Err("a scalar memory read as data");
-        };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
-        };
-        // How the program uses the descriptor tells the view's kind: an image or buffer
-        // instruction before a scalar buffer load, which reads any buffer.
-        let x = self.x;
-        let uses = |of: Site| {
-            x.res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-                .filter_map(move |d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
-        };
-        let by_scalar_load =
-            |u: &(Site, u8)| matches!(x.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. });
-        let use_of = |of: Site| {
-            uses(of)
-                .find(|u| !by_scalar_load(u))
-                .or_else(|| uses(of).next())
-        };
-        // The console compiler loads a descriptor again wherever it needs it, and for a
-        // size it reads the dwords of a load that nothing uses as a descriptor (a texture
-        // picked from the heap by an index held per lane: one load for its width, one for
-        // its base level, one for each read of the image). Another load of as many dwords
-        // from the same address reads the same descriptor, so what uses that one tells
-        // this one's kind. The handle is still made from this load's own operands, which
-        // hold here.
-        let address = self.scalar.get(&site).copied();
-        let twin = || {
-            let a = address?;
-            let same = |s: Site| x.p.blocks[s.0].insts[s.1].name() == inst.name();
-            x.res
-                .scalar
-                .iter()
-                .filter(|(s, b)| *s != site && *b == a && same(*s))
-                .find_map(|(s, _)| use_of(*s))
-        };
-        let use_at = use_of(site).or_else(twin);
-        // A descriptor nothing uses as one, whose size the code reads all the same (a
-        // texture picked from the heap by an index in a constant buffer, its width and
-        // height turned into a texel size; a buffer tested for being empty by its record
-        // count): the kind from its dwords and its used-resource entry.
-        let unused = if use_at.is_none() {
-            self.unused_descriptor_kind(inst, site, code, count)
-        } else {
-            None
-        };
-        let (first, props, image, uav, used) = if let Some(kind) = unused {
-            kind
-        } else {
-            let Some((at, first)) = use_at else {
-                // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
-                // copies its dwords and compares them, lane against first lane, and every load
-                // that reaches those lanes reads one address. Each dword stands in as its place
-                // in the table, so the lanes compare equal as they do on the console.
-                if self.x.res.lane_copied.contains(&site)
-                    && let Some(a) = self.scalar.get(&site).copied()
-                {
-                    for k in 0..count {
-                        let x = self.s.m.i32(a.offset / 4 + k);
-                        self.write(inst, Reg::S(code + k as u8), x, None);
-                    }
-                    return Ok(());
-                }
-                // A sampler's descriptor: no program reads its dwords as numbers, so where one
-                // meets numbers at a join the register is dead on that path (`dead`), as a
-                // descriptor's address or format is.
-                let sampler = x.res.descriptors.iter().any(|d| {
-                    d.role == Role::Sampler
-                        && d.source
-                            .leaves()
-                            .into_iter()
-                            .any(|l| matches!(*l, Source::Loaded { load, .. } if load == site))
-                });
-                if sampler {
-                    self.stale.extend(inst.writes.iter().map(|w| w.1));
-                    return Err("a sampler's descriptor read as data");
-                }
-                // A buffer view the code only takes the address of, to walk
-                // the memory behind it (a ray-tracing structure): the address
-                // from the host, the other dwords have no value.
-                if count <= 4
-                    && let Some((lo, hi)) = self.view_address(site)
-                {
-                    for k in 0..count {
-                        let reg = Reg::S(code + k as u8);
-                        match k {
-                            0 => self.write(inst, reg, lo, None),
-                            1 => self.write(inst, reg, hi, None),
-                            _ => {
-                                if let Some(v) = inst.write(reg) {
-                                    self.vals.insert(v, Val::Missing(OTHER));
-                                    self.stale.insert(v);
-                                }
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-                if std::env::var_os("VICTORY_DESC_WHY").is_some() {
-                    eprintln!(
-                        "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
-                        inst.machine.offset,
-                        inst.name(),
-                        address,
-                        self.x.res.lane_copied.contains(&site)
-                    );
-                }
-                return Err("a descriptor read only as data");
-            };
-            let src = Source::Loaded { load: site, first };
-            let used = self.used_kind(&src);
-            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-            let un = ui.name();
-            let uav = un.contains("store")
-                || un.contains("atomic")
-                || used.is_some_and(|u| u.kind == ResourceType::Uav);
-            let u = if uav { 0x1000 } else { 0 };
-            let (props, image) = match &ui.fields {
-                // A ray-tracing structure in a buffer of the host: read raw.
-                Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-                Fields::Image { dim, .. } => {
-                    let kind = match dim {
-                        0 => 1,
-                        1 => 2,
-                        2 => 4,
-                        4 => 6,
-                        5 => 7,
-                        _ => return Err("an image dimension (cube or MSAA)"),
-                    };
-                    ((kind | u, 0x409), Some(kind))
-                }
-                Fields::Buffer { idxen, format, .. } => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    let props = if un.starts_with("buffer_load_format")
-                        || un.starts_with("buffer_store_format")
-                    {
-                        (10 | u, 0x409)
-                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
-                    {
-                        (12 | u, stride)
-                    } else {
-                        (11 | u, 0)
-                    };
-                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                        self.stale.extend(inst.writes.iter().map(|w| w.1));
-                        return Err("a constant buffer's descriptor read as data");
-                    }
-                    (props, None)
-                }
-                // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-                Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                    ((11, 0), None)
-                }
-                // A constant buffer: nothing of its descriptor is a number.
-                Fields::Smem { .. } => {
-                    self.stale.extend(inst.writes.iter().map(|w| w.1));
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                _ => return Err("a scalar memory read as data"),
-            };
-            (first, props, image, uav, used)
-        };
-        let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
-        } else {
-            self.s.m.undef(i32t)
-        };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
-            Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) = (
-                    less(self, w),
-                    less(self, height),
-                    less(self, depth),
-                    less(self, levels),
-                );
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) = (
-                    k(self, 30),
-                    k(self, 2),
-                    k(self, 14),
-                    k(self, 16),
-                    k(self, 0x3FFF),
-                );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
-            }
-            None => {
-                // A raw view counts bytes; the descriptor's record count is in elements.
-                let n = field(self, 0);
-                let stride = used.map_or(0, |u| u.stride);
-                let n = if props.0 & 0xFF == 11 && stride > 1 {
-                    let k = self.s.m.i32(stride);
-                    self.s.m.bin(c, Bin::UDiv, n, k)
-                } else {
-                    n
-                };
-                let mut words = vec![(2, n)];
-                // Its address too, where the code computes with it and the
-                // host can tell it.
-                let computed = (0..2u8).any(|k| {
-                    inst.write(Reg::S(code + first + k))
-                        .is_some_and(|v| self.computed_with(v, 6))
-                });
-                // (A descriptor nothing uses as one gets it whenever the host can tell it, as
-                // a buffer whose address alone is read does.)
-                if first == 0
-                    && (computed || unused.is_some())
-                    && let Some((lo, hi)) = self.view_address(site)
-                {
-                    words.extend([(0, lo), (1, hi)]);
-                }
-                words
-            }
-        };
-        for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
-                None => {
-                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
-                        self.stale.insert(v);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
+
 
     /// What [`Self::descriptor_data`] makes of a descriptor load that nothing uses as a
     /// descriptor but whose dwords the code reads: the first dword, the handle properties,
@@ -7044,6 +6758,117 @@ impl<'a> Lower<'a> {
         Ok((r, enable))
     }
 
+    /// Ceil or floor a binary64 value in its two 32-bit register words.
+    fn round_directed_f64(&mut self, inst: &Inst, guard: Option<V>, ceil: bool) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("binary64 rounding modifiers");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a binary64 destination pair");
+        };
+        let dst_hi = reg
+            .checked_add(1)
+            .ok_or("a missing destination high word")?;
+        let source = *v.src.first().ok_or("a missing binary64 source")?;
+        let pair = |l: &mut Self, high: Reg| -> Result<(V, V), Why> {
+            let high = inst.read(high).ok_or("an unread high word")?;
+            Ok((l.operand(inst, &source)?, l.i32_of(high)?))
+        };
+        let (lo, mut hi) = match source {
+            Operand::Vector { reg, .. } => pair(
+                self,
+                Reg::V(reg.checked_add(1).ok_or("a missing high word")?),
+            )?,
+            Operand::Scalar { code, .. } if code != NULL => pair(
+                self,
+                Reg::S(code.checked_add(1).ok_or("a missing high word")?),
+            )?,
+            Operand::Literal(high) => (self.s.m.i32(0), self.s.m.i32(high)),
+            Operand::Const(code @ 240..=248) => {
+                let bits = if code == 248 {
+                    0x3fc4_5f30_6dc9_c882 // Binary64 1/(2π).
+                } else {
+                    let value = crate::resource::inline(code).ok_or("an unknown inline float")?;
+                    f64::from(f32::from_bits(value)).to_bits()
+                };
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            _ => {
+                let high = if matches!(source, Operand::Const(193..=208)) {
+                    u32::MAX
+                } else {
+                    0
+                };
+                (self.operand(inst, &source)?, self.s.m.i32(high))
+            }
+        };
+        let c = self.cur;
+        let m = &mut self.s.m;
+        let i32t = self.s.t.i32;
+        let zero = m.i32(0);
+        let ones = m.i32(u32::MAX);
+        let sign_mask = m.i32(0x8000_0000);
+        let mag_mask = m.i32(0x7fff_ffff);
+        if v.abs & 1 != 0 {
+            hi = m.bin(c, Bin::And, hi, mag_mask);
+        }
+        if v.neg & 1 != 0 {
+            hi = m.bin(c, Bin::Xor, hi, sign_mask);
+        }
+        let sign = m.bin(c, Bin::And, hi, sign_mask);
+        let away = m.cmp(c, if ceil { pred::EQ } else { pred::NE }, sign, zero);
+
+        let mag_hi = m.bin(c, Bin::And, hi, mag_mask);
+        let k20 = m.i32(20);
+        let exponent = m.bin(c, Bin::LShr, mag_hi, k20);
+        let integral_exponent = m.i32(1023 + 52);
+        let integral = m.cmp(c, pred::IUGE, exponent, integral_exponent);
+        let n = m.bin(c, Bin::Sub, integral_exponent, exponent);
+        let (k31, k32) = (m.i32(31), m.i32(32));
+        let clears_low = m.cmp(c, pred::IUGE, n, k32);
+        let clears_high_bits = m.cmp(c, pred::IUGT, n, k32);
+        let shift = m.bin(c, Bin::And, n, k31);
+        let keep = m.bin(c, Bin::Shl, ones, shift);
+        let discard = m.bin(c, Bin::Xor, keep, ones);
+
+        // Add ones in the discarded bits when rounding away from zero.
+        // Then clearing those bits advances to the next integer only if
+        // the fraction was nonzero.
+        let low_bias = m.select(c, clears_low, ones, discard);
+        let low_bias = m.select(c, away, low_bias, zero);
+        let sum_lo = m.bin(c, Bin::Add, lo, low_bias);
+        let carry = m.cmp(c, pred::IULT, sum_lo, lo);
+        let carry = m.cast(c, Cast::ZExt, carry, i32t);
+        let high_increments = m.bin(c, Bin::And, away, clears_high_bits);
+        let high_bias = m.select(c, high_increments, discard, zero);
+        let sum_hi = m.bin(c, Bin::Add, hi, high_bias);
+        let sum_hi = m.bin(c, Bin::Add, sum_hi, carry);
+        let round_lo = m.bin(c, Bin::And, sum_lo, keep);
+        let round_lo = m.select(c, clears_low, zero, round_lo);
+        let round_hi = m.bin(c, Bin::And, sum_hi, keep);
+        let round_hi = m.select(c, clears_high_bits, round_hi, sum_hi);
+
+        // Below one, the result is signed zero or signed one.
+        let magnitude = m.bin(c, Bin::Or, mag_hi, lo);
+        let nonzero = m.cmp(c, pred::NE, magnitude, zero);
+        let to_one = m.bin(c, Bin::And, away, nonzero);
+        let one_hi = m.i32(0x3ff0_0000);
+        let small_hi = m.select(c, to_one, one_hi, zero);
+        let small_hi = m.bin(c, Bin::Or, small_hi, sign);
+        let bias = m.i32(1023);
+        let below_one = m.cmp(c, pred::IULT, exponent, bias);
+        let round_hi = m.select(c, below_one, small_hi, round_hi);
+
+        let result_lo = m.select(c, integral, lo, round_lo);
+        let result_hi = m.select(c, integral, hi, round_hi);
+        self.write(inst, Reg::V(reg), result_lo, guard);
+        self.write(inst, Reg::V(dst_hi), result_hi, guard);
+        Ok(())
+    }
+
     fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -7577,6 +7402,9 @@ impl<'a> Lower<'a> {
                 let a = f(self, 0)?;
                 let (_, exp) = self.frexp_f32(a);
                 int(self, exp)
+            }
+            "v_ceil_f64" | "v_floor_f64" => {
+                self.round_directed_f64(inst, guard, name == "v_ceil_f64")
             }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
                 let mut a = f(self, 0)?;
@@ -12099,6 +11927,8 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
         Barycentric::PerspectivePullModel => return None,
     })
 }
+
+include!("lower/descriptor_data.rs");
 
 include!("lower/ds.rs");
 

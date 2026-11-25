@@ -175,6 +175,33 @@ impl GraphicsState {
         }
     }
 
+    /// Whether this state describes a pass over the screen: no vertex input,
+    /// no depth or stencil testing, triangle topology. Such passes fill
+    /// lighting tables once at world entry; their shaders are few.
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth_bounds
+                    && !self.depth.DepthEnable.as_bool()
+                    && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
+    /// A screen-pass state like the lighting tables' fills, for tests of
+    /// the routing to the screen pool in `make`.
+    #[cfg(test)]
+    pub(crate) fn screen_triangle_state() -> GraphicsState {
+        GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            depth: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: false.into(),
+                StencilEnable: false.into(),
+                ..Default::default()
+            },
+            ..GraphicsState::default()
+        }
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -1461,6 +1488,31 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn screen_pass_requires_triangle_without_inputs_or_depth() {
+        let mut g = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            depth_format: DXGI_FORMAT_UNKNOWN,
+            ..Default::default()
+        };
+        assert!(g.screen_pass());
+
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        g.depth.DepthEnable = true.into();
+        assert!(!g.screen_pass());
+
+        g.depth.DepthEnable = false.into();
+        g.depth.StencilEnable = false.into();
+        assert!(g.screen_pass());
+
+        g.depth_bounds = true;
+        assert!(!g.screen_pass());
+        g.depth_bounds = false;
+
+        g.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
+        assert!(!g.screen_pass());
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
