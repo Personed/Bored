@@ -328,12 +328,19 @@ pub(crate) fn ask_once_end() {
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
+    if len == 0 {
+        return;
+    }
+    // A scan the kernel answered before this copy says nothing of its
+    // bytes: no range covering them is answered from the journal again.
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    j.asked_now.retain(|&(f, l)| l <= first || f >= last);
+    if !j.kept {
         return;
     }
     j.asked += 1;
     let now = j.asked;
-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+    for page in first..last {
         j.written.insert(page, now);
     }
 }
