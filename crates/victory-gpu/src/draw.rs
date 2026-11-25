@@ -2847,10 +2847,23 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        // Translated mesh shaders expose the console's scalar group input,
+        // not the host's three `SV_GroupID` components: launch the grid as
+        // one flattened sequence on both native and emulated mesh pipelines.
+        let Some(groups) = mesh_grid_groups(x, y, z) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        };
+        if groups == 0 {
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
             && p.mesh_emu.is_some()
         {
-            if !self.dispatch_mesh_emulated(list, p, x, y, z) {
+            if !self.dispatch_mesh_emulated(list, p, groups) {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 dropped(self.pipeline);
@@ -2863,11 +2876,11 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
+                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z} as {groups}"), false));
                     self.mesh_scissor(list, true);
                     list.flush_barriers();
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, y, z) };
+                    unsafe { l6.DispatchMesh(groups, 1, 1) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2953,14 +2966,7 @@ impl State {
         }
     }
 
-    fn dispatch_mesh_emulated(
-        &mut self,
-        list: &HostList,
-        p: &HostPipeline,
-        x: u32,
-        y: u32,
-        z: u32,
-    ) -> bool {
+    fn dispatch_mesh_emulated(&mut self, list: &HostList, p: &HostPipeline, groups: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -2970,16 +2976,6 @@ impl State {
         };
         if mesh_test() == 1 || !mesh_kept(self.pipeline) {
             return false;
-        }
-        // The emulated compute grid is one-dimensional, so the console's
-        // scalar mesh-group input is the flattened grid index. A zero in any
-        // dimension launches no groups, as on the host mesh path.
-        let Some(groups) = mesh_grid_groups(x, y, z) else {
-            return false;
-        };
-        if groups == 0 {
-            DRAWN.fetch_add(1, Ordering::Relaxed);
-            return true;
         }
         let Some(buffers) = crate::mesh_emu::buffers() else {
             return false;
