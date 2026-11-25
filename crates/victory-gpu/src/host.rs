@@ -8422,6 +8422,12 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// Dedicated video memory of the adapter the device is on, in bytes.
+    pub(crate) fn dedicated_memory(&self) -> Option<u64> {
+        // SAFETY: a live DXGI adapter.
+        Some(unsafe { self.adapter.as_ref()?.GetDesc1() }.ok()?.DedicatedVideoMemory as u64)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

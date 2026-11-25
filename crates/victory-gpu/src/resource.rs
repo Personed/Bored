@@ -1131,6 +1131,11 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// Mip levels in the title texture.
+    pub(crate) title_mips: u32,
+    /// Top title mips omitted from the host copy.
+    mip_drop: u32,
+    is_3d: bool,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1348,10 +1353,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Some(texture),
+            Some(texture) => Some((texture, 0)),
             None => host_texture(&r.desc, r.host.state, clear),
         };
-        let Some(texture) = texture else {
+        let Some((texture, mip_drop)) = texture else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1370,7 +1375,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
-            None => HostTexture::new(texture, state),
+            None => HostTexture::new_title(
+                texture,
+                state,
+                mip_count(&r.desc),
+                mip_drop,
+                r.desc.dimension == TEXTURE_3D,
+            ),
         };
         host.filled = fills(&r.desc);
         if host.filled {
@@ -1782,6 +1793,7 @@ pub(crate) fn let_go_idle() {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
+                crate::texture::unstage_alias(at as This);
                 made.take()
             } else {
                 None
@@ -1945,6 +1957,25 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 #[cfg(windows)]
 impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        Self::new_title(
+            texture,
+            state,
+            u32::from(desc.MipLevels).max(1),
+            0,
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+        )
+    }
+
+    fn new_title(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+        title_mips: u32,
+        mip_drop: u32,
+        is_3d: bool,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
@@ -1955,25 +1986,189 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            title_mips: title_mips.max(1),
+            mip_drop,
+            is_3d,
         }
     }
 
     /// A texture made without memory of its own (`crate::tiles`): counted
-    /// as a host texture of no bytes.
+    /// as a host texture of no bytes. Reserved textures are not mip-dropped.
     fn new_tiled(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
         tiled: crate::tiles::Tiled,
     ) -> HostTexture {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            title_mips: u32::from(desc.MipLevels).max(1),
+            mip_drop: 0,
+            is_3d: desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D,
         }
     }
+
+    pub(crate) fn mip_drop(&self) -> u32 {
+        self.mip_drop
+    }
+
+    pub(crate) fn host_mips(&self) -> u32 {
+        self.title_mips.saturating_sub(self.mip_drop).max(1)
+    }
+
+    /// The host subresource of a console subresource, or `None` when it
+    /// names one of the dropped top mips.
+    pub(crate) fn host_subresource(&self, console_sub: u32) -> Option<u32> {
+        remap_subresource(console_sub, self.title_mips, self.mip_drop, self.is_3d)
+    }
+}
+
+/// A console subresource index as the index of the host texture whose top
+/// `mip_drop` mips were omitted; `None` for a dropped mip.
+#[cfg(windows)]
+pub(crate) fn remap_subresource(
+    console_sub: u32,
+    title_mips: u32,
+    mip_drop: u32,
+    is_3d: bool,
+) -> Option<u32> {
+    if mip_drop == 0 {
+        return Some(console_sub);
+    }
+    let title_mips = title_mips.max(1);
+    let host_mips = title_mips.saturating_sub(mip_drop).max(1);
+    if is_3d {
+        if !(mip_drop..title_mips).contains(&console_sub) {
+            return None;
+        }
+        return Some(console_sub - mip_drop);
+    }
+    let mip = console_sub % title_mips;
+    let slice = console_sub / title_mips;
+    if mip < mip_drop {
+        return None;
+    }
+    Some(slice * host_mips + mip - mip_drop)
+}
+
+/// A texture's host mip-drop count and surviving host mip count.
+#[cfg(windows)]
+pub(crate) fn host_mip_info(this: This) -> (u32, u32) {
+    host_copy(this).map_or((0, 0), |h| (h.mip_drop, h.host_mips()))
+}
+
+/// Most top mips a sampled texture may lose.
+const MAX_MIP_DROP: u32 = 3;
+
+/// Automatic mip-drop pressure raised when a host texture allocation runs
+/// out of memory.
+#[cfg(windows)]
+static OOM_MIP_PRESSURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `VICTORY_TEXTURE_MIP_DROP`, if set (`0..=3`; invalid values count as unset).
+#[cfg(windows)]
+fn configured_mip_drop() -> Option<u32> {
+    static CONFIGURED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|n| n.min(MAX_MIP_DROP))
+    })
+}
+
+/// Baseline mip drop: the user's setting, otherwise one level on adapters
+/// with at most 8.5 GiB of dedicated memory (RX 580-class budgets).
+#[cfg(windows)]
+fn requested_mip_drop() -> u32 {
+    let automatic = match crate::host::host().and_then(|h| h.dedicated_memory()) {
+        Some(memory) if memory > 0 && memory <= (17 << 29) => 1,
+        _ => 0,
+    };
+    configured_mip_drop()
+        .unwrap_or(automatic)
+        .max(OOM_MIP_PRESSURE.load(std::sync::atomic::Ordering::Relaxed))
+        .min(MAX_MIP_DROP)
+}
+
+/// Smallest largest-dimension a texture may keep after a drop
+/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default 1024).
+#[cfg(windows)]
+fn mip_drop_floor() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            .max(64)
+    })
+}
+
+/// How many of `requested` top mips may be dropped without touching render
+/// targets, depth textures, UAVs, MSAA, non-power-of-two artwork, small
+/// textures or BC-misaligned mips.
+#[cfg(windows)]
+pub(crate) fn compute_mip_drop(desc: &ResourceDesc, requested: u32) -> u32 {
+    compute_mip_drop_with_floor(desc, requested, mip_drop_floor())
+}
+
+#[cfg(windows)]
+fn compute_mip_drop_with_floor(desc: &ResourceDesc, requested: u32, floor: u64) -> u32 {
+    const TEXTURE_1D: u32 = 2;
+    if requested == 0 || desc.dimension == BUFFER || desc.flags & 0x7 != 0 || desc.sample_count > 1 {
+        return 0;
+    }
+    let height = u64::from(desc.height);
+    let depth = u64::from(desc.depth_or_array_size);
+    if !desc.width.is_power_of_two()
+        || (desc.dimension != TEXTURE_1D && !height.is_power_of_two())
+        || (desc.dimension == TEXTURE_3D && !depth.is_power_of_two())
+    {
+        return 0;
+    }
+    let total_mips = mip_count(desc);
+    if total_mips <= 1 {
+        return 0;
+    }
+    let block = element(pc_format(desc.format)).map_or(1, |(_, block)| block);
+    let cap = requested.min(total_mips - 1);
+    let mut best = 0;
+    for drop in 1..=cap {
+        let width = (desc.width >> drop).max(1);
+        let height = if desc.dimension == TEXTURE_1D { 1 } else { (height >> drop).max(1) };
+        let depth = if desc.dimension == TEXTURE_3D { (depth >> drop).max(1) } else { 1 };
+        let large_enough = width.max(height).max(depth) >= floor;
+        let aligned = width.is_multiple_of(block) && height.is_multiple_of(block);
+        if large_enough && aligned {
+            best = drop;
+        }
+    }
+    best
+}
+
+/// Shrinks `desc` to the mip that survives as host mip 0.
+#[cfg(windows)]
+fn apply_mip_drop(desc: &mut ResourceDesc, title_mips: u32, drop: u32) {
+    const TEXTURE_1D: u32 = 2;
+    if drop == 0 {
+        return;
+    }
+    desc.width = (desc.width >> drop).max(1);
+    if desc.dimension != TEXTURE_1D {
+        desc.height = (desc.height >> drop).max(1);
+    }
+    if desc.dimension == TEXTURE_3D {
+        desc.depth_or_array_size = (desc.depth_or_array_size >> drop).max(1);
+    }
+    desc.mip_levels = u16::try_from(title_mips.saturating_sub(drop).max(1)).unwrap_or(1);
 }
 
 #[cfg(windows)]
@@ -2043,12 +2238,13 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_as(desc, state, clear, false)
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    host_texture_impl(desc, state, clear, false)
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
-/// tiles level by level (`crate::tiles`).
+/// tiles level by level (`crate::tiles`). Reserved textures are not
+/// mip-dropped: their levels are the memory unit already.
 #[cfg(windows)]
 fn host_texture_as(
     desc: &ResourceDesc,
@@ -2056,6 +2252,16 @@ fn host_texture_as(
     clear: *const c_void,
     reserved: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    host_texture_impl(desc, state, clear, reserved).map(|(texture, _)| texture)
+}
+
+#[cfg(windows)]
+fn host_texture_impl(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    reserved: bool,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2105,6 +2311,10 @@ fn host_texture_as(
         }
         value
     });
+    let title_mips = mip_count(desc);
+    let base = d;
+    let mut drop = if reserved { 0 } else { compute_mip_drop(&base, requested_mip_drop()) };
+    apply_mip_drop(&mut d, title_mips, drop);
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -2126,31 +2336,53 @@ fn host_texture_as(
             )
         }
     } else {
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(
-                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-                ),
-                // The same layout: format, then color or depth and stencil.
-                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-                &mut texture,
-            )
+        loop {
+            let mut attempt = None;
+            // SAFETY: the description has the host layout (checked size, same
+            // fields); the out pointer is ours.
+            let made = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    (&raw const d).cast(),
+                    D3D12_RESOURCE_STATES(
+                        crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                    ),
+                    // The same layout: format, then color or depth and stencil.
+                    clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                    &mut attempt,
+                )
+            };
+            if made.is_ok() {
+                texture = attempt;
+                break made;
+            }
+            let Err(e) = &made else { unreachable!() };
+            if e.code().0 != E_OUTOFMEMORY || drop >= MAX_MIP_DROP {
+                break made;
+            }
+            let pressure = OOM_MIP_PRESSURE
+                .fetch_max(drop + 1, std::sync::atomic::Ordering::Relaxed)
+                .max(drop + 1);
+            let next = compute_mip_drop(&base, requested_mip_drop().max(pressure));
+            if next <= drop {
+                break made;
+            }
+            drop = next;
+            d = base;
+            apply_mip_drop(&mut d, title_mips, drop);
+            tracing::warn!(drop, "host texture allocation out of memory; dropping another top mip");
         }
     };
     if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
+        tracing::warn!(error = %e, desc = ?d, reserved, drop, "no host texture");
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|texture| (texture, drop))
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -3986,5 +4218,36 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn mip_drop_eligibility_and_subresource_remapping() {
+        let tex2d = |width, height, mips, format, flags| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels: mips,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        fn eligible(desc: &ResourceDesc, requested: u32) -> u32 {
+            compute_mip_drop_with_floor(desc, requested, 1024)
+        }
+        assert_eq!(eligible(&tex2d(2048, 2048, 0, 28, 0), 1), 1);
+        assert_eq!(eligible(&tex2d(1024, 1024, 0, 28, 0), 2), 0);
+        assert_eq!(eligible(&tex2d(1920, 1080, 0, 28, 0), 1), 0);
+        assert_eq!(eligible(&tex2d(2048, 2048, 0, 28, 1), 1), 0);
+        assert_eq!(eligible(&tex2d(2048, 2048, 1, 28, 0), 1), 0);
+        assert_eq!(remap_subresource(0, 11, 2, false), None);
+        assert_eq!(remap_subresource(2, 11, 2, false), Some(0));
+        assert_eq!(remap_subresource(13, 11, 2, false), Some(9));
+        assert_eq!(remap_subresource(4, 11, 0, false), Some(4));
+        assert_eq!(remap_subresource(2, 11, 2, true), Some(0));
+        assert_eq!(remap_subresource(1, 11, 2, true), None);
     }
 }
