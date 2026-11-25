@@ -246,7 +246,7 @@ mod tests {
         );
         assert!(mesh_compute_dispatch(&layout, 2).is_none());
 
-        layout.slot_bytes = (u64::from(u32::MAX) + 1) / 2 + 1;
+        layout.slot_bytes = u64::from(u32::MAX).div_ceil(2) + 1;
         assert!(mesh_compute_dispatch(&layout, 2).is_none());
     }
 }
