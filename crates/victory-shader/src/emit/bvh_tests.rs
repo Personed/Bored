@@ -402,7 +402,7 @@ mod gpu {
             0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
             0xF408_0302,
             0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
-            0x1602_00B0, // v_mul_u32_u24 v1, 48, v0
+            0x3402_0086, // v_lshlrev_b32 v1, 6, v0
             0xE038_1000,
             0x8002_0201, // buffer_load_dwordx4 v[2:5], v1, s[8:11], 0 offen
             0xE038_1010,
@@ -435,7 +435,7 @@ mod gpu {
                 "s_mov_b32",
                 "s_load_dwordx4",
                 "s_load_dwordx4",
-                "v_mul_u32_u24",
+                "v_lshlrev_b32",
                 "buffer_load_dwordx4",
                 "buffer_load_dwordx4",
                 "buffer_load_dwordx4",
@@ -489,11 +489,7 @@ mod gpu {
                     slot: 1,
                 },
             ],
-            used: vec![
-                table(ResourceType::Srv, 0),
-                table(ResourceType::Srv, 4),
-                table(ResourceType::Uav, 8),
-            ],
+            used: vec![table(ResourceType::Srv, 0), table(ResourceType::Uav, 8)],
             io: StageIo::Cs(ComputeIo {
                 rsrc2: 5 << 1,
                 threads: [32, 1, 1],
@@ -559,16 +555,21 @@ mod gpu {
     fn bvh_intersection_matches_the_model_on_the_gpu() {
         let (bvh, ..) = scene();
         let cases = cases();
-        let rays: Vec<u32> = cases
+        // One buffer like the upstream tests: 64-byte records, then the
+        // nodes. A record's node pointer counts the records region in, so
+        // `(pointer >> 3) << 6` lands on the node's byte in the buffer.
+        let records = cases.len() * 64;
+        let data: Vec<u32> = cases
             .iter()
             .flat_map(|(node, r)| {
-                let mut w = vec![*node, r.extent.to_bits()];
+                let mut w = vec![(records / 8) as u32 + node, r.extent.to_bits()];
                 w.extend(f3(r.origin));
                 w.extend(f3(r.dir));
                 w.extend(f3(r.inv));
-                w.push(0);
+                w.extend([0; 5]);
                 w
             })
+            .chain(bvh.iter().copied())
             .collect();
         let _one = super::super::valu_tests::ONE_AT_A_TIME
             .lock()
@@ -579,10 +580,11 @@ mod gpu {
                 continue;
             };
             for (sort, ij) in [(true, true), (false, true)] {
-                // Heap slot 1 holds the nodes from title address BVH on.
-                // Set before `build`: the hook fires while the DXIL is
-                // lowered, not at dispatch time.
-                TEST_MEMORY.set(Some((1, BVH)));
+                // Heap slot 0: the records and nodes; the buffer's bytes
+                // map to title address BVH on, so a node read lands on
+                // its byte past the records region. Set before `build`:
+                // the hook fires while the DXIL is lowered.
+                TEST_MEMORY.set(Some((0, BVH)));
                 let shader = build(sort, ij);
                 let (root, pso) = host
                     .compute_pipeline(&shader)
@@ -595,11 +597,7 @@ mod gpu {
                             roots: vec![(0, Root::Constants(vec![0; 5]))],
                             views: &[
                                 View::Buffer {
-                                    data: &rays,
-                                    stride: Stride::Raw,
-                                },
-                                View::Buffer {
-                                    data: &bvh,
+                                    data: &data,
                                     stride: Stride::Raw,
                                 },
                                 View::RawUav(128),
