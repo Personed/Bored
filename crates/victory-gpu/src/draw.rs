@@ -3724,10 +3724,7 @@ impl State {
             },
             None => None,
         };
-        if kind == MESH
-            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
-            && p.mesh_emu.is_some()
-        {
+        if kind == MESH && p.mesh_emu.is_some() {
             return self.execute_indirect_mesh_emulated(
                 list,
                 p,
