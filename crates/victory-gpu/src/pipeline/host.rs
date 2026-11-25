@@ -928,6 +928,13 @@ fn emulated_mesh_pipeline(
     shaders: &[Arc<Shader>],
 ) -> Option<HostPipeline> {
     let host = host()?;
+    let group_bytes = u64::from(emu.max_primitives) * 4
+        + u64::from(emu.max_vertices) * u64::from(emu.vertex_dwords) * 4
+        + u64::from(emu.max_primitives) * u64::from(emu.prim_dwords) * 4;
+    if group_bytes != u64::from(emu.group_bytes()) {
+        tracing::warn!(?shaders, "emulated mesh group layout overflows u32");
+        return None;
+    }
     let mut cs_params = Vec::new();
     let mut cs_ranges = Vec::new();
     let mut cs_samplers = Vec::new();

@@ -2651,10 +2651,16 @@ impl State {
             }
             // SAFETY: open list with the unpack graphics pipeline bound and
             // `output` readable as a shader resource.
+            let Some(vertices) = chunk
+                .checked_mul(emu_pipe.emu.max_primitives)
+                .and_then(|n| n.checked_mul(3))
+            else {
+                self.restore_mesh_emu_state(list);
+                return false;
+            };
             self.mesh_scissor(list, true);
             unsafe {
-                list.list
-                    .DrawInstanced(chunk * emu_pipe.emu.max_primitives * 3, 1, 0, 0);
+                list.list.DrawInstanced(vertices, 1, 0, 0);
                 list.list.ResourceBarrier(&[transition(
                     &buffers.output,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
