@@ -1871,6 +1871,11 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// Bytes in one gathered-indirect scratch buffer.
+const fn gather_scratch_bytes() -> u64 {
+    crate::indirect::GATHER_MOST as u64 * crate::indirect::GATHER_STRIDE as u64
+}
+
 /// Device-local indirect-argument scratch no list holds. Lists may grow
 /// these to the largest indirect execution they ever record; sharing them
 /// after reset keeps one list's peak from staying duplicated in every list.
@@ -7011,8 +7016,16 @@ impl HostList {
             } = &mut *gather;
             *closed = false;
             for set in sets.drain(..) {
-                if spare.len() < GATHER_SETS {
-                    spare.push(set.into_scratch());
+                let scratch = set.into_scratch();
+                if indirect_pool() {
+                    give_indirect_scratch(scratch, gather_scratch_bytes());
+                } else if spare.len() < GATHER_SETS {
+                    spare.push(scratch);
+                }
+            }
+            if indirect_pool() {
+                for scratch in spare.drain(..) {
+                    give_indirect_scratch(scratch, gather_scratch_bytes());
                 }
             }
         }
@@ -7513,21 +7526,30 @@ impl HostList {
                     name(&budget, || "indirect budget of gathered records".to_owned());
                     gather.budget = Some(budget);
                 }
-                let scratch = match gather.spare.pop() {
-                    Some(scratch) => scratch,
-                    None => {
-                        let Some(scratch) = host.uav_buffer(
-                            u64::from(crate::indirect::GATHER_MOST)
-                                * u64::from(crate::indirect::GATHER_STRIDE),
-                        ) else {
-                            return none(4);
-                        };
-                        name(&scratch, || "indirect arguments, gathered".to_owned());
-                        scratch
+                let scratch = if indirect_pool() {
+                    let Some((scratch, _)) = take_indirect_scratch(host, gather_scratch_bytes())
+                    else {
+                        return none(4);
+                    };
+                    scratch
+                } else {
+                    match gather.spare.pop() {
+                        Some(scratch) => scratch,
+                        None => {
+                            let Some(scratch) = host.uav_buffer(gather_scratch_bytes()) else {
+                                return none(4);
+                            };
+                            name(&scratch, || "indirect arguments, gathered".to_owned());
+                            scratch
+                        }
                     }
                 };
                 let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4) else {
-                    gather.spare.push(scratch);
+                    if indirect_pool() {
+                        give_indirect_scratch(scratch, gather_scratch_bytes());
+                    } else {
+                        gather.spare.push(scratch);
+                    }
                     return none(4);
                 };
                 gather.sets.push(crate::indirect::GatherSet::new(
