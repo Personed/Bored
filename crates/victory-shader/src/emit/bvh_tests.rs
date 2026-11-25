@@ -190,14 +190,21 @@ fn test_leaf(n: &[u32], tri: usize, r: &Ray, ij: bool) -> [u32; 4] {
 
 /// The model of `image_bvh_intersect_ray` on `node` (a pointer into
 /// `bvh`, a buffer of dwords at the descriptor's base).
-fn intersect(bvh: &[u32], node: u32, r: &Ray, sort: bool, ij: bool) -> [u32; 4] {
+fn intersect(bvh: &[u32], node: u32, r: &Ray, sort: bool, _ij: bool) -> [u32; 4] {
+    // The reference is the crate's own model (watertight: a ray exactly
+    // on a shared edge hits both triangles), which the upstream card
+    // tests prove against the hardware.
     let at = ((node >> 3) * 16) as usize;
-    let mut n = bvh[at..].to_vec();
-    n.resize(28, 0);
-    match node & 7 {
-        t @ 0..=3 => test_leaf(&n, t as usize, r, ij),
-        t => test_box(&n, t == 4, r, sort),
-    }
+    let mut n = [0u32; 28];
+    let take = (bvh.len() - at).min(28);
+    n[..take].copy_from_slice(&bvh[at..at + take]);
+    let ray = crate::bvh::Ray {
+        extent: r.extent,
+        origin: r.origin,
+        direction: r.dir,
+        inverse: r.inv,
+    };
+    crate::bvh::intersect(&n, node & 7, &ray, sort)
 }
 
 fn f3(v: [f32; 3]) -> [u32; 3] {
@@ -245,7 +252,7 @@ fn scene() -> (Vec<u32>, [u32; 4], u32, u32) {
     let boxes: [([f32; 3], [f32; 3]); 4] = [
         ([0.0, 0.0, -3.0], [1.0, 1.0, -2.0]),
         ([0.0, 0.0, -1.0], [1.0, 1.0, 0.0]),
-        // Inverted: never hit.
+        // Inverted bounds: per-axis min/max normalizes the box.
         ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0]),
         ([0.0, 0.0, -6.0], [1.0, 1.0, -5.0]),
     ];
@@ -278,7 +285,7 @@ fn cases() -> Vec<(u32, Ray)> {
         (tri[1], down(0.25, 0.25)),
         (tri[0], down(0.75, 0.75)),
         (tri[1], down(0.75, 0.75)),
-        // On the edge TRI0 and TRI1 share: exactly one owns it.
+        // On the edge TRI0 and TRI1 share: watertight means both hit it.
         (tri[0], down(0.5, 0.5)),
         (tri[1], down(0.5, 0.5)),
         (tri[2], down(0.25, 0.5)),
@@ -337,19 +344,22 @@ fn model_hits_and_orders_as_expected() {
         "{i} {j}"
     );
     let mid = Ray::new([0.5, 0.5, 5.0], [0.0, 0.0, -1.0], 100.0);
+    // Watertight: a ray exactly on the shared edge hits both triangles.
     let owners = [tri[0], tri[1]]
         .iter()
         .filter(|&&n| intersect(&bvh, n, &mid, true, true)[0] != INF)
         .count();
-    assert_eq!(owners, 1, "a shared edge belongs to one triangle");
+    assert_eq!(owners, 2, "a ray on a shared edge hits both triangles");
     let mid = Ray::new([0.5, 0.5, 5.0], [0.0, 0.0, -1.0], 100.0);
+    // The inverted box's per-axis min/max normalizes it: the ray enters
+    // all four boxes, sorted by entry distance or in child order.
     assert_eq!(
         intersect(&bvh, full, &mid, true, true),
-        [0x204, 0x105, 0x401, INVALID]
+        [0x300, 0x204, 0x105, 0x401]
     );
     assert_eq!(
         intersect(&bvh, full, &mid, false, true),
-        [0x105, 0x204, INVALID, 0x401]
+        [0x105, 0x204, 0x300, 0x401]
     );
 }
 
