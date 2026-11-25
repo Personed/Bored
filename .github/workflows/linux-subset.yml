@@ -794,6 +794,7 @@ jobs:
           IGNORED_HERMETIC: >-
             bcpack::tests::bcpack_throughput
             emit::bitcode::tests::bench_write
+            texture::tests::detile_throughput
           IGNORED_EXTERNAL: >-
             bcpack::tests::reference_chunks
             emit::lower::tests::a_missing_value_stays_missing_through_two_live_joins
