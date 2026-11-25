@@ -1515,6 +1515,18 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
+/// The title's depth bounds test range, on hosts that support it (a
+/// pipeline with the test enabled draws nothing outside it).
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    use windows::core::Interface;
+    if crate::host::host().is_some_and(|h| h.depth_bounds())
+        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        // SAFETY: an open list on a device that supports depth bounds.
+        unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
