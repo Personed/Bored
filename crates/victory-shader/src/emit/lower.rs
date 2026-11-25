@@ -8571,16 +8571,29 @@ impl<'a> Lower<'a> {
             // RDNA2), even where the host's own f32-to-f16 conversion rounds
             // toward zero (WARP's does): force f32 infinity past 65520, the
             // midpoint between the largest finite half and the first magnitude
-            // that rounds away. NaN fails the compare and passes through.
+            // that rounds away.
             let ri = self.as_int(r);
             let abs = self.s.m.i32(0x7FFF_FFFF);
             let mag = self.s.m.bin(c, Bin::And, ri, abs);
-            let thresh = self.s.m.i32(0x477F_F000); // 65520.0f32
+            // The threshold scaled by the output modifier's exact power of
+            // two, so the compare measures the value as written, not as
+            // multiplied: with `div:2` a halved overflow still fits.
+            let factor: f32 = match v.omod {
+                1 => 2.0,
+                2 => 4.0,
+                3 => 0.5,
+                _ => 1.0,
+            };
+            let thresh = self.s.m.i32((65520.0f32 / factor).to_bits());
             let over = self.s.m.cmp(c, pred::IUGE, mag, thresh);
+            // NaN's encoding is past the threshold too: only force finite
+            // magnitudes (below f32 infinity, which needs no forcing).
+            let finfbits = self.s.m.i32(0x7F80_0000);
+            let finite = self.s.m.cmp(c, pred::IULT, mag, finfbits);
+            let over = self.s.m.bin(c, Bin::And, over, finite);
             let signbit = self.s.m.i32(0x8000_0000);
             let sign = self.s.m.bin(c, Bin::And, ri, signbit);
-            let finf = self.s.m.i32(0x7F80_0000);
-            let finf = self.s.m.bin(c, Bin::Or, sign, finf);
+            let finf = self.s.m.bin(c, Bin::Or, sign, finfbits);
             let rbits = self.s.m.select(c, over, finf, ri);
             let r = self.as_float(rbits);
             return float_result(self, r);
