@@ -814,7 +814,7 @@ void main() {
         let (count, count_ptr, count_gpu) = warp.shared_buffer(256);
         let (budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
         let (prepared, _, prepared_gpu) = warp.shared_buffer(256);
-        let (slot_map, _, slot_map_gpu) = warp.shared_buffer(64 << 10);
+        let (slot_map, slot_map_ptr, slot_map_gpu) = warp.shared_buffer(64 << 10);
         let (next_args, next_args_ptr, _) = warp.shared_buffer(256);
         let (hits, hits_ptr, hits_gpu) = warp.shared_buffer(256);
         let scratch = warp.default_uav(256);
@@ -986,12 +986,13 @@ void main() {
         warp.submit_and_wait();
 
         // SAFETY: the fence has completed and all mapped buffers remain live.
-        let (spent, count_value, hit_count, source) = unsafe {
+        let (spent, count_value, hit_count, source, mapped_groups) = unsafe {
             (
                 budget_ptr.cast::<u32>().read_volatile(),
                 count_ptr.cast::<u32>().read_volatile(),
                 hits_ptr.cast::<u32>().read_volatile(),
                 std::slice::from_raw_parts(args_ptr.cast_const(), 24).to_vec(),
+                std::slice::from_raw_parts(slot_map_ptr.cast::<u32>(), 16).to_vec(),
             )
         };
         assert_eq!(count_value, 1, "prep must honor the active record count");
@@ -1002,6 +1003,11 @@ void main() {
                 0, 0,
             ],
             "prep must leave the source arguments unchanged"
+        );
+        assert_eq!(
+            mapped_groups,
+            [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "slot map must retain each emitted group's record-local id"
         );
         assert_eq!(
             spent,
