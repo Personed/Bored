@@ -125,7 +125,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[33..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[BUILD_LEN + 1..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
