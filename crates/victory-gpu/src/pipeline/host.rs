@@ -477,8 +477,6 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 #[allow(clippy::vec_box)] // boxed ranges keep stable addresses until the root signature is serialized
-
-
 /// A mesh pipeline emulated as compute plus a generated vertex shader.
 /// The compute step writes the mesh records into the shared emulation
 /// buffer; the graphics step unpacks them with no input assembler data.
@@ -1158,8 +1156,7 @@ impl HostPipeline {
 /// A mesh pipeline emulated as compute plus a generated vertex shader.
 /// The compute step writes the mesh records into the shared emulation
 /// buffer; the graphics step unpacks them with no input assembler data.
-
-
+///
 /// A stream subobject: its type, then its description, pointer-aligned.
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
