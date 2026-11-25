@@ -2480,6 +2480,12 @@ void main() {
                 b3.as_raw(),
                 "without the pool the first list keeps its grown scratch"
             );
+            let retained = list.indirect_scratch(5000 * 20).unwrap();
+            assert_eq!(
+                retained.as_raw(),
+                b3.as_raw(),
+                "without the pool reset must keep the first list's grown scratch"
+            );
         }
         assert_eq!(other.indirect_state(&b4), args);
         other.close();
