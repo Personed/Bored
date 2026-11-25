@@ -336,7 +336,7 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
-        self.copy(from, to);
+        self.copy_queued(from, to);
         to - from
     }
 
@@ -367,23 +367,24 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy_queued((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy_queued((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
         bytes
     }
 
-    /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    /// Copies title memory into the copy, queued where the caller collects a
+    /// submission's refreshes; outside that collection the copy is made at once.
+    fn copy_queued(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        crate::copy_pool::copy(at, from as *const u8, to - from);
         to - from
     }
 }
