@@ -203,10 +203,10 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it became idle.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -234,6 +234,40 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 // 8 ms to make and more to free, on the thread that submits.)
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// Lets go of idle host lists not reused lately. Their driver pairs cost
+/// most of a list's private memory, and the count/upload caps do not bound
+/// that driver memory. Lists in active rotation are never idle long enough
+/// to expire; resources are dropped outside the pool lock.
+#[cfg(windows)]
+pub(crate) fn sweep_idle() {
+    if !pools() {
+        return;
+    }
+    const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let (count, bytes, expired) = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let (kept, expired): (Vec<_>, Vec<_>) = std::mem::take(&mut idle.0)
+            .into_iter()
+            .partition(|Idle(_, _, since)| !crate::host::long_ago(*since, idle_ms, IDLE_FRAMES));
+        let count = expired.len() as u64;
+        let bytes = expired.iter().map(|Idle(_, bytes, _)| *bytes).sum::<u64>();
+        idle.1 = kept.iter().map(|Idle(_, bytes, _)| *bytes).sum();
+        idle.0 = kept;
+        (count, bytes, expired)
+    };
+    if count == 0 {
+        return;
+    }
+    drop(expired);
+    crate::host::trail(|| {
+        format!(
+            "sweep: {count} idle host lists let go ({} KiB upload scratch)",
+            bytes / 1024
+        )
+    });
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -249,13 +283,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -292,7 +326,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, crate::host::moment()));
             idle.1 += bytes;
         }
     }

@@ -207,6 +207,7 @@ fn sweep() {
     sweep_scratch_chunks();
     sweep_indirect_scratch();
     sweep_preludes();
+    crate::list::sweep_idle();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
