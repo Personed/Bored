@@ -1050,8 +1050,9 @@ mod tests {
         assert_eq!(out.samplers, vec![[0; 4]; 2]);
         assert_eq!(out.static_samplers, vec![sampler, comparison]);
         #[cfg(windows)]
-        if let Some(path) = super::validator::Validator::default_path() {
-            let mut v = super::validator::Validator::load(Some(&path)).unwrap();
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
     }
