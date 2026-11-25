@@ -262,7 +262,7 @@ fn jump_windows() -> bool {
 /// such records, in place of a pass of ours in front of its draw
 /// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
 /// seconds with, twenty without, in turn, each change said in the log).
-/// Off by default. Needs [`windows`].
+/// Off by default. Needs [`windows()`].
 fn gathers() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -2365,7 +2365,7 @@ impl State {
     /// (or the pipeline is not known): a draw with them may write the
     /// arguments of draws after it, which ends a list's gathering
     /// (`crate::indirect::gather`). The same test keeps such a draw out of
-    /// a window ([`windows`]).
+    /// a window ([`windows()`]).
     fn may_store(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This)
             .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
