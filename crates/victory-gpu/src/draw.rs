@@ -735,6 +735,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.flush_barriers();
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -822,6 +823,7 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.flush_barriers();
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1113,6 +1115,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.flush_barriers();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1200,6 +1203,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.flush_barriers();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1321,6 +1325,7 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        list.flush_barriers();
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
