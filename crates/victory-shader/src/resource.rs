@@ -148,7 +148,7 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     /// Scalar loads of one descriptor the code keeps per lane in VGPRs
-    /// ([`Tracer::lane_copies`]): they read one address, so their dwords
+    /// (`Tracer::lane_copies`): they read one address, so their dwords
     /// stand in for each other.
     pub lane_copied: Vec<Site>,
     pub waterfall: Waterfall,
@@ -235,7 +235,7 @@ pub fn track(
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
-                // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
+                // A descriptor the code keeps per lane (`Tracer::lane_copies`)
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
                 if !t.kept_per_lane(inst, op) {
