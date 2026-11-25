@@ -1312,14 +1312,23 @@ impl Snapshot {
             return;
         }
         assert!(to <= self.len, "snapshot write past its copy");
-        for piece in from / PIECE..=(to - 1) / PIECE {
+        let last = (to - 1) / PIECE;
+        let mut piece = from / PIECE;
+        while piece <= last {
             if self.committed[piece] {
+                piece += 1;
                 continue;
             }
-            let at = piece * PIECE;
-            let bytes = (self.len - at).min(PIECE);
-            // SAFETY: inside the reservation, whose page this commits once
-            // (`committed` is under the snapshot's lock).
+            let start = piece;
+            while piece <= last && !self.committed[piece] {
+                piece += 1;
+            }
+            let end = piece - 1;
+            let at = start * PIECE;
+            let bytes = (self.len - at).min((end - start + 1).saturating_mul(PIECE));
+            // SAFETY: inside the reservation, whose pages this commits once
+            // (`committed` is under the snapshot's lock). The pieces are
+            // contiguous, so the run takes one commit call.
             let made = unsafe {
                 VirtualAlloc(
                     (self.base + at) as *const _,
@@ -1329,7 +1338,7 @@ impl Snapshot {
                 )
             };
             assert!(!made.is_null(), "no memory for {bytes} snapshot bytes");
-            self.committed[piece] = true;
+            self.committed[start..=end].fill(true);
         }
     }
 
@@ -1341,7 +1350,7 @@ impl Snapshot {
         self.base as *mut u8
     }
 
-    /// Bytes committed in the pieces in use, rounded up to whole pieces.
+    /// Bytes committed in the pieces in use, rounded up to whole pages.
     fn committed_bytes(&self) -> usize {
         self.committed
             .iter()
