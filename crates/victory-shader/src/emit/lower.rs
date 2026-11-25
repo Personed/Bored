@@ -1315,6 +1315,30 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Where a program's constant table starts: after its instructions, unless
+/// a fixed-offset load reads below it.
+fn code_table_start(
+    p: &crate::ir::Program,
+    addresses: &[&crate::resource::Address],
+    lowest: u32,
+) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses
+        .iter()
+        .any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1701,22 +1725,26 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
+                    .collect();
+                let lowest = addresses
+                    .iter()
                     .map(|a| a.offset & !3)
                     .min()
                     .ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -12291,3 +12319,6 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+include!("lower/code_table_tests.rs");
