@@ -220,7 +220,10 @@ fn make() -> Option<Buffers> {
     let prep = compile_prep(&host.device)
         .inspect_err(|e| tracing::warn!(error = %e, "mesh_indirect_prep pipeline failed"))
         .ok();
-    let (prep_root, prep_pso) = (prep.as_ref().map(|p| p.0.clone()), prep.as_ref().map(|p| p.1.clone()));
+    let (prep_root, prep_pso) = (
+        prep.as_ref().map(|p| p.0.clone()),
+        prep.as_ref().map(|p| p.1.clone()),
+    );
     name(&output, || format!("mesh emu output {output_bytes:#x}"));
     name(&slot_map, || "mesh emu slot_map".into());
     name(&indirect_args, || "mesh emu indirect_args".into());

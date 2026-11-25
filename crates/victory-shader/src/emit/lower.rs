@@ -1665,7 +1665,9 @@ impl<'a> Lower<'a> {
                 // first half only the second half reads is gone before lowering.
                 // Only in the second translation of a program the first
                 // one refused for it ([`with_first_half_pairs`]).
-                if FIRST_HALF_PAIRS.get() && std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
+                if FIRST_HALF_PAIRS.get()
+                    && std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0")
+                {
                     for (_, i) in &x.io.interps {
                         if let Interp::Interpolated { first, .. } = i {
                             for s in first {
@@ -2330,9 +2332,16 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let here = self.s.m.bool(true);
-        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
-        let (blo, bhi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
-        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
+        let (blo, bhi) = (
+            self.s.m.extract(c, ballot, 0),
+            self.s.m.extract(c, ballot, 1),
+        );
+        let lane = self
+            .s
+            .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let [zero, k31, k32] = [0, 31, 32].map(|k| self.s.m.i32(k));
         // The lanes of the run of `size` lanes at `base` that are here, from bit 0.
         let present = |l: &mut Self, base: V, size: u32| -> V {
@@ -2355,7 +2364,9 @@ impl<'a> Lower<'a> {
             let base = self.s.m.bin(c, Bin::And, other, run);
             let bits = present(self, base, size);
             // FirstbitLo (dx.op 32): the run's first lane that is here
-            let first = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[bits]);
+            let first = self
+                .s
+                .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[bits]);
             let any = self.s.m.cmp(c, pred::NE, bits, zero);
             let first = self.s.m.select(c, any, first, zero);
             let from = self.s.m.bin(c, Bin::Add, base, first);
@@ -2363,7 +2374,11 @@ impl<'a> Lower<'a> {
             let theirs = self.s.m.select(c, any, theirs, zero);
             sum = self.add_halves(sum, theirs);
         }
-        let (high, low, one) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(1));
+        let (high, low, one) = (
+            self.s.m.i32(0xFFFF_0000),
+            self.s.m.i32(0xFFFF),
+            self.s.m.i32(1),
+        );
         let lane0 = self.s.m.bin(c, Bin::And, blo, one);
         let lane0 = self.s.m.cmp(c, pred::NE, lane0, zero);
         let first = self.read_lane(x, zero);
@@ -6092,117 +6107,118 @@ impl<'a> Lower<'a> {
         let (first, props, image, uav, used) = if let Some(kind) = unused {
             kind
         } else {
-        let Some((at, first)) = use_at else {
-            // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
-            // copies its dwords and compares them, lane against first lane, and every load
-            // that reaches those lanes reads one address. Each dword stands in as its place
-            // in the table, so the lanes compare equal as they do on the console.
-            if self.x.res.lane_copied.contains(&site)
-                && let Some(a) = self.scalar.get(&site).copied()
-            {
-                for k in 0..count {
-                    let x = self.s.m.i32(a.offset / 4 + k);
-                    self.write(inst, Reg::S(code + k as u8), x, None);
+            let Some((at, first)) = use_at else {
+                // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
+                // copies its dwords and compares them, lane against first lane, and every load
+                // that reaches those lanes reads one address. Each dword stands in as its place
+                // in the table, so the lanes compare equal as they do on the console.
+                if self.x.res.lane_copied.contains(&site)
+                    && let Some(a) = self.scalar.get(&site).copied()
+                {
+                    for k in 0..count {
+                        let x = self.s.m.i32(a.offset / 4 + k);
+                        self.write(inst, Reg::S(code + k as u8), x, None);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            // A sampler's descriptor: no program reads its dwords as numbers, so where one
-            // meets numbers at a join the register is dead on that path (`dead`), as a
-            // descriptor's address or format is.
-            let sampler = x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source
-                        .leaves()
-                        .into_iter()
-                        .any(|l| matches!(*l, Source::Loaded { load, .. } if load == site))
-            });
-            if sampler {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a sampler's descriptor read as data");
-            }
-            // A buffer view the code only takes the address of, to walk
-            // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
-            if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
-            {
-                for k in 0..count {
-                    let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
-                        _ => {
-                            if let Some(v) = inst.write(reg) {
-                                self.vals.insert(v, Val::Missing(OTHER));
-                                self.stale.insert(v);
+                // A sampler's descriptor: no program reads its dwords as numbers, so where one
+                // meets numbers at a join the register is dead on that path (`dead`), as a
+                // descriptor's address or format is.
+                let sampler = x.res.descriptors.iter().any(|d| {
+                    d.role == Role::Sampler
+                        && d.source
+                            .leaves()
+                            .into_iter()
+                            .any(|l| matches!(*l, Source::Loaded { load, .. } if load == site))
+                });
+                if sampler {
+                    self.stale.extend(inst.writes.iter().map(|w| w.1));
+                    return Err("a sampler's descriptor read as data");
+                }
+                // A buffer view the code only takes the address of, to walk
+                // the memory behind it (a ray-tracing structure): the address
+                // from the host, the other dwords have no value.
+                if count <= 4
+                    && let Some((lo, hi)) = self.view_address(site)
+                {
+                    for k in 0..count {
+                        let reg = Reg::S(code + k as u8);
+                        match k {
+                            0 => self.write(inst, reg, lo, None),
+                            1 => self.write(inst, reg, hi, None),
+                            _ => {
+                                if let Some(v) = inst.write(reg) {
+                                    self.vals.insert(v, Val::Missing(OTHER));
+                                    self.stale.insert(v);
+                                }
                             }
                         }
                     }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            if std::env::var_os("VICTORY_DESC_WHY").is_some() {
-                eprintln!(
-                    "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
-                    inst.machine.offset,
-                    inst.name(),
-                    address,
-                    self.x.res.lane_copied.contains(&site)
-                );
-            }
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            // A ray-tracing structure in a buffer of the host: read raw.
-            Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+                    eprintln!(
+                        "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
+                        inst.machine.offset,
+                        inst.name(),
+                        address,
+                        self.x.res.lane_copied.contains(&site)
+                    );
+                }
+                return Err("a descriptor read only as data");
+            };
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = match &ui.fields {
+                // A ray-tracing structure in a buffer of the host: read raw.
+                Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
+                Fields::Image { dim, .. } => {
+                    let kind = match dim {
+                        0 => 1,
+                        1 => 2,
+                        2 => 4,
+                        4 => 6,
+                        5 => 7,
+                        _ => return Err("an image dimension (cube or MSAA)"),
+                    };
+                    ((kind | u, 0x409), Some(kind))
+                }
+                Fields::Buffer { idxen, format, .. } => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if un.starts_with("buffer_load_format")
+                        || un.starts_with("buffer_store_format")
+                    {
+                        (10 | u, 0x409)
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
+                    {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        self.stale.extend(inst.writes.iter().map(|w| w.1));
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    (props, None)
+                }
+                // Read by scalar buffer loads alone: the raw view `smem` reads it through.
+                Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+                    ((11, 0), None)
+                }
+                // A constant buffer: nothing of its descriptor is a number.
+                Fields::Smem { .. } => {
                     self.stale.extend(inst.writes.iter().map(|w| w.1));
                     return Err("a constant buffer's descriptor read as data");
                 }
-                (props, None)
-            }
-            // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
-            }
-            // A constant buffer: nothing of its descriptor is a number.
-            Fields::Smem { .. } => {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a constant buffer's descriptor read as data");
-            }
-            _ => return Err("a scalar memory read as data"),
-        };
-        (first, props, image, uav, used)
+                _ => return Err("a scalar memory read as data"),
+            };
+            (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
         let h = self.handle(site, &src, false, props)?;
@@ -6320,9 +6336,10 @@ impl<'a> Lower<'a> {
         if self.x.res.lane_copied.contains(&site)
             || self.x.res.descriptors.iter().any(|d| {
                 d.role == Role::Sampler
-                    && d.source.leaves().into_iter().any(
-                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
-                    )
+                    && d.source
+                        .leaves()
+                        .into_iter()
+                        .any(|l| matches!(*l, Source::Loaded { load, .. } if load == site))
             })
         {
             return None;
@@ -11881,7 +11898,6 @@ include!("lower/mesh_emulation.rs");
 
 #[cfg(test)]
 include!("lower/tests.rs");
-
 
 #[cfg(test)]
 include!("lower/code_table_tests.rs");

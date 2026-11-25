@@ -61,7 +61,11 @@ enum Held {
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
     /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    Present(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        u32,
+        u64,
+    ),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -95,18 +99,47 @@ static PRESENTS_HELD: AtomicU64 = AtomicU64::new(0);
 /// reads stays as it was until the submission's fence is signalled, also
 /// across the title's present. On the console the card reads that memory
 /// when it runs the list, after the present call has returned.
+///
+/// `VICTORY_ASYNC_PRESENT=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log, for measuring it in one scene.
 #[cfg(windows)]
 fn present_behind() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_ASYNC_PRESENT").is_some_and(|v| v == "1")
-            && behind()
-            && crate::host::late_free_present();
-        if on {
-            tracing::info!("presents go behind the queue's line and return at once (VICTORY_ASYNC_PRESENT=1)");
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_ASYNC_PRESENT").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        let mode = if asked != 0 && behind() && crate::host::late_free_present() { asked } else { 0 };
+        if mode != 0 {
+            tracing::info!("presents go behind the queue's line and return at once (VICTORY_ASYNC_PRESENT=1; alt: in turn)");
         }
-        on
-    })
+        mode
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs()
+                / 20)
+                % 2
+                == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "presents behind the line from now (VICTORY_ASYNC_PRESENT=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// With [`present_behind`]: puts the present of the next frame behind what
@@ -137,7 +170,8 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     // The state the lists recorded so far leave the texture in: what our
     // copy finds it in when it runs behind them (looked at, not changed).
     const COPY_SOURCE: u32 = 0x800;
-    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    let state = crate::resource::host_transition(resource, COPY_SOURCE)
+        .map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     let texture = texture.clone();
     let sent = hold(this, || {
@@ -208,7 +242,9 @@ fn split() -> bool {
 #[cfg(windows)]
 pub(crate) fn cuts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    waits() && split() && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
+    waits()
+        && split()
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
 }
 
 /// Whether a present runs what queues still hold (on by default: a wait
@@ -457,7 +493,8 @@ pub(crate) fn behind() -> bool {
 
 /// Whether there is something for [`worker`] to look at.
 #[cfg(windows)]
-static WORK: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+static WORK: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
 #[cfg(windows)]
 fn wake() {
@@ -488,9 +525,18 @@ fn worker() {
         }
         release_held_now(false);
         let (user_now, kernel_now) = crate::framelog::thread_times();
-        crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
-        crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
-        crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
+        crate::framelog::add(
+            crate::framelog::T::WorkerUs,
+            started.elapsed().as_micros() as u64,
+        );
+        crate::framelog::add(
+            crate::framelog::T::WorkerUserUs,
+            user_now.saturating_sub(user),
+        );
+        crate::framelog::add(
+            crate::framelog::T::WorkerKernelUs,
+            kernel_now.saturating_sub(kernel),
+        );
     }
 }
 
@@ -498,6 +544,231 @@ fn worker() {
 thread_local! {
     /// This thread is inside [`release_held_now`].
     static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether parts that follow one another in the queues' lines go to the
+/// host as one submission (`VICTORY_JOIN_PARTS=1`; `alt`: twenty seconds
+/// with, twenty without, in turn, each change said in the log). Off by
+/// default. Needs [`behind`].
+///
+/// Why: the title's lists wait for memory values (19 to 20 waits a frame
+/// in the first rooms, each met by the bottom-of-pipe write of the part
+/// before it), and every wait cuts a submission into parts: 29 host
+/// submissions a frame from about 15 of the title's (run 238). Each part
+/// is prepared on its own: 82 askings of the write watch, 666 refresh
+/// steps, a heap sync, a merge under the flights in the air, and on the
+/// card one list of ours that sends changed bytes and one that compares.
+/// The title hands a frame over in one burst at the end of its recording,
+/// then stands still until the line has finished it (its fence wait of
+/// the next frame: run 238), so the parts are all in the lines when our
+/// thread gets to them.
+///
+/// With the switch the thread that runs the lines takes parts off them
+/// in the order they would have run and gives them to the host together:
+/// the same host lists in the same order, prepared once. Between two
+/// parts a wait passes if memory meets it, if a write of a flight in the
+/// air is known to meet it, or if a bottom-of-pipe write of a part taken
+/// before it meets it (that part is ahead of it in the joined
+/// submission, which is the order the wait asks for). A signal met
+/// behind parts not sent yet is delivered right behind the joined
+/// submission: never before the part it followed has run. Anything else
+/// (a wait not known to be met, a present, the end of what is free to
+/// run) sends what was taken first. At most [`join_most`] parts or
+/// [`join_lists`] lists are joined, so that the card has work while the
+/// next ones are prepared. Each queue with a part taken keeps the mark
+/// [`Held::Running`] at the head of its line until the part is sent:
+/// what the title gives the queue meanwhile, signals too, stays behind.
+#[cfg(windows)]
+fn join_parts() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_JOIN_PARTS").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if mode != 0 {
+            tracing::info!(
+                "parts that follow one another in the queues' lines go to the host as one submission, at most {} parts or {} lists (VICTORY_JOIN_PARTS=1; alt: in turn)",
+                join_most(),
+                join_lists()
+            );
+        }
+        mode
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs()
+                / 20)
+                % 2
+                == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "parts joined into one host submission from now (VICTORY_JOIN_PARTS=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`, 4).
+#[cfg(windows)]
+fn join_most() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_JOIN_MOST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(4)
+    })
+}
+
+/// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 48).
+#[cfg(windows)]
+fn join_lists() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_JOIN_LISTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(48)
+    })
+}
+
+/// With [`join_parts`]: parts taken off the queues' lines and not yet
+/// given to the host, in the order they run.
+#[cfg(windows)]
+#[derive(Default)]
+struct Joined {
+    lists: Vec<crate::list::Detached>,
+    order: Vec<usize>,
+    parts: usize,
+    /// Signals met behind those parts: delivered when the parts are sent.
+    signals: Vec<(usize, u64)>,
+    /// The queues with a part here: each has [`Held::Running`] at the
+    /// head of its line.
+    marked: Vec<usize>,
+}
+
+#[cfg(windows)]
+impl Joined {
+    fn is_empty(&self) -> bool {
+        self.parts == 0
+    }
+
+    /// One more part behind those taken: its lists keep their order.
+    fn add(&mut self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+        let (lists, order) = join(
+            std::mem::take(&mut self.lists),
+            std::mem::take(&mut self.order),
+            lists,
+            order,
+        );
+        self.lists = lists;
+        self.order = order;
+        self.parts += 1;
+    }
+
+    fn full(&self) -> bool {
+        self.parts >= join_most() || self.order.len() >= join_lists()
+    }
+
+    /// Whether a bottom-of-pipe write of a part taken meets `wait`.
+    fn meets(&self, wait: &crate::list::ValueWait) -> bool {
+        let (address, bytes) = wait.place();
+        self.order.iter().any(|&i| {
+            self.lists[i]
+                .host()
+                .will_write(address, bytes, |v| wait.holds_for(v))
+        })
+    }
+}
+
+#[cfg(windows)]
+/// The things of one part behind those of another: `order` names places in
+/// `lists`, so the second part's places move up by the first's count.
+fn join<T>(
+    mut lists: Vec<T>,
+    mut order: Vec<usize>,
+    more: Vec<T>,
+    more_order: Vec<usize>,
+) -> (Vec<T>, Vec<usize>) {
+    let base = lists.len();
+    lists.extend(more);
+    order.extend(more_order.into_iter().map(|i| i + base));
+    (lists, order)
+}
+
+/// Parts joined, host submissions they went in, their lists, signals
+/// delivered behind them, and waits passed for a write of a part taken.
+#[cfg(windows)]
+static JOINED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Gives the host what [`Joined`] holds, as one submission, delivers the
+/// signals met behind it, and takes the marks off the lines. Called with
+/// no line locked.
+#[cfg(windows)]
+fn send_joined(joined: &mut Joined) {
+    if joined.parts > 0 {
+        let (lists, order) = (
+            std::mem::take(&mut joined.lists),
+            std::mem::take(&mut joined.order),
+        );
+        JOINED[0].fetch_add(joined.parts as u64, Ordering::Relaxed);
+        let sent = JOINED[1].fetch_add(1, Ordering::Relaxed) + 1;
+        JOINED[2].fetch_add(order.len() as u64, Ordering::Relaxed);
+        JOINED[3].fetch_add(joined.signals.len() as u64, Ordering::Relaxed);
+        if sent.is_multiple_of(2048) {
+            let n: Vec<u64> = JOINED
+                .iter()
+                .map(|n| n.swap(0, Ordering::Relaxed))
+                .collect();
+            tracing::info!(
+                "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet",
+                n[0],
+                n[1],
+                n[0] as f64 / n[1].max(1) as f64,
+                n[2] as f64 / n[1].max(1) as f64,
+                n[3],
+                n[4]
+            );
+        }
+        match crate::host::host() {
+            Some(host) => host.execute_late(lists, order),
+            // (Not reached: parts are only taken with a host.)
+            None => crate::list::recycle(lists, &order),
+        }
+        joined.parts = 0;
+    }
+    // Behind what was just sent, in the order they were met.
+    for (fence, value) in joined.signals.drain(..) {
+        if !crate::host::late_signal(fence, value) {
+            crate::fence::set(fence as This, value);
+        }
+    }
+    for q in joined.marked.drain(..) {
+        // SAFETY: a live queue, as in the loop that marked it.
+        let line = unsafe { &(*(q as *const Queue)).held };
+        let mut held = lock(line);
+        if matches!(held.first(), Some(Held::Running)) {
+            held.remove(0);
+        }
+        if held.is_empty() {
+            lock(&WAITING).retain(|&w| w != q);
+        }
+    }
 }
 
 /// Before a submission of ours that is waited for, with [`behind`]: what
@@ -526,6 +797,11 @@ fn release_held_now(all: bool) {
         }
     }
     let _leave = Leave(was_here);
+    // Parts taken and not sent yet ([`join_parts`]): none when the lines
+    // are forced, and none is left when this returns.
+    let joining =
+        !all && behind() && crate::host::late() && crate::host::host().is_some() && join_parts();
+    let mut joined = Joined::default();
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -534,17 +810,34 @@ fn release_held_now(all: bool) {
             let line = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(line);
             loop {
-                match held.first() {
+                // A queue with a part in `joined` has our mark at the head
+                // of its line: what is looked at is behind the mark.
+                let base = usize::from(joined.marked.contains(&q));
+                match held.get(base) {
                     None | Some(Held::Running) => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
                         break;
                     }
+                    // With parts taken and not sent: only what is known
+                    // without a wait for the card. A wait that stays is
+                    // looked at again when the parts have been sent.
+                    Some(Held::Value(wait)) if !all && !joined.is_empty() => {
+                        if !wait.met() && !crate::host::late_met_known(wait) {
+                            if !joined.meets(wait) {
+                                break;
+                            }
+                            JOINED[4].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    // The frame is shown behind the parts taken: they are
+                    // sent first.
+                    Some(Held::Present(..)) if !joined.is_empty() => break,
                     Some(_) => {}
                 }
-                match held.remove(0) {
+                match held.remove(base) {
                     Held::Wait(..) | Held::Running => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
@@ -574,13 +867,34 @@ fn release_held_now(all: bool) {
                         // each range shaders write compared once).
                         #[cfg(feature = "diagnostics")]
                         {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                            let waits = held
+                                .iter()
+                                .take_while(|h| matches!(h, Held::Value(_)))
+                                .count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && held[..waits]
+                                    .iter()
+                                    .all(|h| matches!(h, Held::Value(w) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
+                        }
+                        if joining {
+                            // Taken, to go with the parts that follow it.
+                            // The line stays open behind our mark.
+                            if !joined.marked.contains(&q) {
+                                held.insert(0, Held::Running);
+                                joined.marked.push(q);
+                            }
+                            joined.add(lists, order);
+                            if joined.full() {
+                                drop(held);
+                                send_joined(&mut joined);
+                                held = lock(line);
+                            }
+                            moved = true;
+                            continue;
                         }
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
@@ -653,7 +967,10 @@ fn release_held_now(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
+                        if !joined.is_empty() {
+                            // Behind parts not sent yet: with them.
+                            joined.signals.push((fence, value));
+                        } else if !crate::host::late_signal(fence, value) {
                             crate::fence::set(fence as This, value);
                         }
                     }
@@ -665,7 +982,12 @@ fn release_held_now(all: bool) {
             }
         }
         if !moved {
-            break;
+            if joined.is_empty() {
+                break;
+            }
+            // Nothing more is free to run behind the parts taken: they go
+            // to the host, and what stood at a wait is looked at again.
+            send_joined(&mut joined);
         }
     }
 }
@@ -795,7 +1117,11 @@ fn execute_now(this: This, count: u32, lists: *const This) {
             if !unmet.is_empty() {
                 static SEEN: AtomicU64 = AtomicU64::new(0);
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
-                    tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
+                    tracing::info!(
+                        kind = queue(this).kind,
+                        ?unmet,
+                        "a submission is held for a memory value"
+                    );
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
                 let mut waiting = lock(&WAITING);
@@ -873,6 +1199,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::fence::pace::signal_called(fence as usize, value);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -905,11 +1233,21 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         {
             static CALLS: AtomicU64 = AtomicU64::new(0);
             if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::info!(kind = queue(this).kind, now, value, "a queue is told to wait for a fence");
+                tracing::info!(
+                    kind = queue(this).kind,
+                    now,
+                    value,
+                    "a queue is told to wait for a fence"
+                );
             }
         }
         #[cfg(feature = "diagnostics")]
-        crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
+        crate::capture::op(this as usize, || {
+            format!(
+                "WAIT queue kind {} for fence {fence:?} value {value} (now {now})",
+                queue(this).kind
+            )
+        });
         let behind = {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
@@ -1024,8 +1362,13 @@ extern "system" fn present(
     let hr = present_now(this, planes, plane_parameters);
     #[cfg(windows)]
     {
-        crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
+        crate::framelog::add(
+            crate::framelog::T::PresentUs,
+            presenting.elapsed().as_micros() as u64,
+        );
         crate::framelog::frame();
+        #[cfg(feature = "diagnostics")]
+        crate::fence::pace::frame();
     }
     hr
 }
@@ -1068,7 +1411,10 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         release_held(forces());
     }
     #[cfg(windows)]
-    crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
+    crate::framelog::add(
+        crate::framelog::T::PresentLineUs,
+        presenting.elapsed().as_micros() as u64,
+    );
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
@@ -1242,7 +1588,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -1303,6 +1651,33 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn joined_parts_keep_their_lists_and_their_order() {
+        // a part of three lists run as 2, 0, 1; then one of two run as 1, 0; then one of one
+        let (lists, order) = join(
+            vec!["a0", "a1", "a2"],
+            vec![2, 0, 1],
+            vec!["b0", "b1"],
+            vec![1, 0],
+        );
+        let (lists, order) = join(lists, order, vec!["c0"], vec![0]);
+        assert_eq!(lists, ["a0", "a1", "a2", "b0", "b1", "c0"]);
+        let run: Vec<&str> = order.iter().map(|&i| lists[i]).collect();
+        assert_eq!(
+            run,
+            ["a2", "a0", "a1", "b1", "b0", "c0"],
+            "each part's lists in its own order, the parts one after the other"
+        );
+        // a part with a list named twice, and an empty one
+        let (lists, order) = join(vec!["a0"], vec![0, 0], Vec::new(), Vec::new());
+        let (lists, order) = join(lists, order, vec!["b0"], vec![0, 0]);
+        assert_eq!(
+            order.iter().map(|&i| lists[i]).collect::<Vec<_>>(),
+            ["a0", "a0", "b0", "b0"]
+        );
+    }
     use crate::object::slot;
 
     /// Where a queue's signal is: newer layouts have it two slots later.

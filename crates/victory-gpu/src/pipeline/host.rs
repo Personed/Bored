@@ -185,7 +185,12 @@ impl GraphicsState {
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
                 )
             })
             .collect();
@@ -750,7 +755,10 @@ impl HostPipeline {
             stages
         };
         if mesh.is_some() && !(host()?.mesh_shaders() || host()?.emulate_mesh_shaders()) {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+            return refuse(
+                "the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+            );
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -825,7 +833,10 @@ impl HostPipeline {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
-                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV)
+                        && !ours
+                        && bounded_root_srvs()
+                    {
                         // A one-view table: the view's size bounds the
                         // reads (and a root UAV's writes), which a root
                         // descriptor leaves unbounded.
@@ -890,13 +901,14 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
-        };
+        let (root, root_blob) =
+            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+                Ok(root) => root,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                    return None;
+                }
+            };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -1026,12 +1038,14 @@ impl HostPipeline {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
-                D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: gs.as_ptr().cast(),
-                    BytecodeLength: gs.len(),
-                }
-            }),
+            GS: rect_gs
+                .as_ref()
+                .map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: gs.as_ptr().cast(),
+                        BytecodeLength: gs.len(),
+                    }
+                }),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -1084,7 +1098,10 @@ impl HostPipeline {
         let mut made = make(&desc, &name(rect_gs.as_ref()));
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
-            tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
+            tracing::warn!(
+                ?shaders,
+                "host pipeline refused with the rectangle geometry stage"
+            );
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
@@ -1126,7 +1143,10 @@ impl HostPipeline {
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
                     format!(
                         "fail {} depth-fail {} pass {} func {}",
-                        f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+                        f.StencilFailOp.0,
+                        f.StencilDepthFailOp.0,
+                        f.StencilPassOp.0,
+                        f.StencilFunc.0
                     )
                 };
                 let bounds = if depth_bounds { " bounds true" } else { "" };
@@ -1384,7 +1404,8 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         return Vec::new();
     }
     // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }
+        .to_vec()
 }
 
 fn root_signature(
@@ -1513,7 +1534,8 @@ mod tests {
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
         mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name)
+            .expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
@@ -1791,6 +1813,10 @@ mod tests {
             eprintln!("host does not enforce the depth bounds test; skipped");
             return;
         }
-        assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+        assert_eq!(
+            run_draw(0.4, 0.6),
+            255,
+            "depth 0.5 inside [0.4, 0.6] must pass"
+        );
     }
 }

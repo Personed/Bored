@@ -207,7 +207,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+    for name in env!("VICTORY_SHADER_SWITCHES")
+        .split(',')
+        .filter(|n| !n.is_empty())
+    {
         out.extend_from_slice(name.as_bytes());
         out.push(b'=');
         if let Some(value) = std::env::var_os(name) {
