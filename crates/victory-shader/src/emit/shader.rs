@@ -120,12 +120,12 @@ pub(crate) struct Geometry {
 /// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
+/// See `VIEW_LIMIT`: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
+/// See `VIEW_LIMIT`: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }

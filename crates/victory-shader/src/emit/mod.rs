@@ -1317,7 +1317,10 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+        #[cfg(windows)]
         let mut dxil = l.dxil;
+        #[cfg(not(windows))]
+        let _ = l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
