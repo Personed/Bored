@@ -1994,6 +1994,11 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// Since when `fetched` has been larger than the fetches needed. A big
+    /// burst's buffer is shrunk after smaller fetches have used it for a
+    /// while, so a peak does not stay alive for the whole run; recording a
+    /// fetch already costs more than the rare new buffer.
+    fetched_small_since: Option<u64>,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -4568,6 +4573,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                fetched_small_since: None,
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() {
@@ -5763,11 +5769,22 @@ impl Host {
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
+            let size = total.next_multiple_of(16 << 20);
+            if work.fetched.as_ref().is_some_and(|f| f.2 > size) {
+                let since = work.fetched_small_since.get_or_insert_with(moment);
+                const SMALL_FRAMES: u64 = 4;
+                if long_ago(*since, 5_000, SMALL_FRAMES) {
+                    work.fetched = None;
+                    work.fetched_small_since = None;
+                }
+            } else {
+                work.fetched_small_since = None;
+            }
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
-                let size = total.next_multiple_of(16 << 20);
                 work.fetched = self
                     .shared_buffer(size)
                     .map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched_small_since = None;
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!(
