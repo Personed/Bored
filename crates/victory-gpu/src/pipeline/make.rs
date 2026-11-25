@@ -447,5 +447,4 @@ mod tests {
         assert_eq!(zero_demands, [false; 3]);
         assert!(nonempty_demand);
     }
-
 }

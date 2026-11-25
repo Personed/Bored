@@ -647,7 +647,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 fn failed_asking(start: usize, end: usize) {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if !N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(2048) {
+    if !N
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(2048)
+    {
         return;
     }
     // SAFETY: plain data filled in by the query.
@@ -1069,7 +1072,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 #[cfg(feature = "diagnostics")]
                 {
                     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(1024) {
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .is_multiple_of(1024)
+                    {
                         tracing::info!(
                             "a block of title memory could not be made read-only (one in 1024): {:#x}: {error}",
                             block * BLOCK
