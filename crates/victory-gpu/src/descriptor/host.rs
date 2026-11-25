@@ -2701,6 +2701,72 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Re-bases a console SRV mip window onto a host texture whose top `drop`
+/// mips were omitted (`host_mips` surviving levels, console levels
+/// `drop..drop + host_mips`).
+fn rebase_mip_window(
+    most_detailed: u32,
+    mip_levels: u32,
+    min_lod: f32,
+    drop: u32,
+    host_mips: u32,
+) -> (u32, u32, f32) {
+    if drop == 0 {
+        return (most_detailed, mip_levels, min_lod);
+    }
+    let host_mips = host_mips.max(1);
+    let title_mips = host_mips.saturating_add(drop);
+    let min_lod = (min_lod - drop as f32).max(0.0);
+    if mip_levels == u32::MAX {
+        let start = most_detailed.saturating_sub(drop).min(host_mips - 1);
+        return (start, u32::MAX, min_lod);
+    }
+    let end = most_detailed.saturating_add(mip_levels).min(title_mips);
+    let start = most_detailed.max(drop);
+    if start < end {
+        (start - drop, end - start, min_lod)
+    } else {
+        // A view naming only dropped mips stays valid at the first surviving
+        // mip; one past the chain uses the smallest survivor.
+        let start = if most_detailed < drop { 0 } else { host_mips - 1 };
+        (start, 1, min_lod)
+    }
+}
+
+/// Adjusts an explicit SRV description for a texture whose top `drop` mips
+/// were omitted on the host.
+fn adjust_srv_for_mip_drop(srv: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, drop: u32, host_mips: u32) {
+    if drop == 0 {
+        return;
+    }
+    // SAFETY: each branch reads and writes only the union arm named by
+    // `srv.ViewDimension`.
+    unsafe {
+        macro_rules! rebase {
+            ($arm:ident) => {{
+                let t = &mut srv.Anonymous.$arm;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) = rebase_mip_window(
+                    t.MostDetailedMip,
+                    t.MipLevels,
+                    t.ResourceMinLODClamp,
+                    drop,
+                    host_mips,
+                );
+            }};
+        }
+        match srv.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => rebase!(Texture1D),
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => rebase!(Texture1DArray),
+            D3D12_SRV_DIMENSION_TEXTURE2D => rebase!(Texture2D),
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => rebase!(Texture2DArray),
+            D3D12_SRV_DIMENSION_TEXTURE3D => rebase!(Texture3D),
+            D3D12_SRV_DIMENSION_TEXTURECUBE => rebase!(TextureCube),
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => rebase!(TextureCubeArray),
+            _ => {}
+        }
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2755,6 +2821,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                let (drop, host_mips) = crate::resource::host_mip_info(resource);
+                if let Some(srv) = desc.as_mut() {
+                    adjust_srv_for_mip_drop(srv, drop, host_mips);
                 }
                 // Levels on demand (`crate::tiles`): a texture made level by
                 // level is shown from the first level that is the title's
@@ -3585,6 +3655,15 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn srv_mip_window_rebasing_handles_partial_full_and_dropped_ranges() {
+        assert_eq!(rebase_mip_window(1, 3, 3.5, 2, 5), (0, 2, 1.5));
+        assert_eq!(rebase_mip_window(3, 2, 1.0, 2, 5), (1, 2, 0.0));
+        assert_eq!(rebase_mip_window(0, u32::MAX, 0.0, 2, 5), (0, u32::MAX, 0.0));
+        assert_eq!(rebase_mip_window(0, 1, 0.0, 2, 5), (0, 1, 0.0));
+        assert_eq!(rebase_mip_window(1, 3, 1.5, 0, 7), (1, 3, 1.5));
     }
 }
 
