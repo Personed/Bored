@@ -2002,6 +2002,9 @@ pub(crate) struct ValueWait {
     comparison: u32,
     reference: u64,
     wide: bool,
+    /// `Wait32BitValueX`'s mask: the memory value is compared masked
+    /// (64-bit waits pass no mask, `u64::MAX`). Upstream 9cc37c5.
+    mask: u64,
 }
 
 impl ValueWait {
@@ -2064,9 +2067,9 @@ impl ValueWait {
     /// for a 32-bit wait).
     pub(crate) fn holds_for(&self, value: u64) -> bool {
         let (value, reference) = if self.wide {
-            (value, self.reference)
+            (value & self.mask, self.reference)
         } else {
-            (value & 0xFFFF_FFFF, self.reference & 0xFFFF_FFFF)
+            (value & self.mask & 0xFFFF_FFFF, self.reference & 0xFFFF_FFFF)
         };
         match self.comparison {
             1 => false,
@@ -2125,12 +2128,13 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
     by
 }
 
-fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool, mask: u64) {
     let wait = ValueWait {
         address,
         comparison,
         reference,
         wide,
+        mask,
     };
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
@@ -2163,11 +2167,11 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         .unwrap_or_else(|e| e.into_inner())
         .push((this as usize, wait));
 }
-extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
-    wait_for(this, address, comparison, reference, false);
+extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64, mask: u32, _flags: u32) {
+    wait_for(this, address, comparison, reference, false, u64::from(mask));
 }
-extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64) {
-    wait_for(this, address, comparison, reference, true);
+extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64, _flags: u32) {
+    wait_for(this, address, comparison, reference, true, u64::MAX);
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
