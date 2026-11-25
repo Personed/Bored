@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -391,6 +391,9 @@ pub(crate) struct HostList {
     /// Texture transition barriers not yet recorded; coalesced and flushed
     /// before the next command that may depend on them.
     pending_barriers: Mutex<Vec<D3D12_RESOURCE_BARRIER>>,
+    /// Whether the list is closed; the console tolerates a repeated close,
+    /// while host D3D12 fails it with the same E_FAIL as an invalid command.
+    closed: AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -604,6 +607,7 @@ impl Host {
                 states: Mutex::default(),
                 shadow_states: Mutex::default(),
                 pending_barriers: Mutex::default(),
+                closed: AtomicBool::new(false),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -1034,6 +1038,13 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a host command list closed twice; the second close does nothing")
+            });
+            return;
+        }
         self.flush_barriers();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
