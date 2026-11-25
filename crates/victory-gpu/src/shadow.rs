@@ -46,9 +46,9 @@ pub(crate) struct Shadow {
     flights: Mutex<Flights>,
     /// The copy's bytes before the submission ran, for the ranges its
     /// shaders write (`pending`), each at its offset in the copy: what the
-    /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
-    /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    /// GPU wrote differs. Address room for the whole copy; memory is
+    /// committed only for the pieces those ranges use.
+    before: Mutex<Option<Snapshot>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -1276,44 +1276,199 @@ mod relay_tests {
     }
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// A snapshot's virtual address room. The whole copy has an address in it,
+/// as the copy-back code expects, but memory is committed only in 64 KiB
+/// pieces a declared shader-write range uses: a small write range of the
+/// 174 MB heap no longer reserves another 174 MB of RAM beside the copy.
+struct Snapshot {
+    base: usize,
+    len: usize,
+    committed: Vec<bool>,
+}
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one
-/// of about that size: a small copy's snapshot took the 174 MB buffer kept
-/// for the big heap's, which then got another, until eight of them were
-/// reserved (1.4 GB in run 24).
-fn pooled(n: usize) -> Vec<u8> {
+impl Snapshot {
+    fn new(len: usize) -> Self {
+        use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
+        let len = len.max(1);
+        // SAFETY: plain reservation of `len` bytes; no page can be read or
+        // written until `commit` commits it.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(
+            !base.is_null(),
+            "no virtual room for a host-copy snapshot of {len} bytes"
+        );
+        let pieces = len.div_ceil(PIECE);
+        Self {
+            base: base as usize,
+            len,
+            committed: vec![false; pieces],
+        }
+    }
+
+    /// Commits the snapshot pieces that hold copy offsets `[from, to)`.
+    fn commit(&mut self, from: usize, to: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+        if from >= to {
+            return;
+        }
+        assert!(to <= self.len, "snapshot write past its copy");
+        let last = (to - 1) / PIECE;
+        let mut piece = from / PIECE;
+        while piece <= last {
+            if self.committed[piece] {
+                piece += 1;
+                continue;
+            }
+            let start = piece;
+            while piece <= last && !self.committed[piece] {
+                piece += 1;
+            }
+            let end = piece - 1;
+            let at = start * PIECE;
+            let bytes = (self.len - at).min((end - start + 1).saturating_mul(PIECE));
+            // SAFETY: inside the reservation, whose pages this commits once
+            // (`committed` is under the snapshot's lock). The pieces are
+            // contiguous, so the run takes one commit call.
+            let made = unsafe {
+                VirtualAlloc(
+                    (self.base + at) as *const _,
+                    bytes,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!made.is_null(), "no memory for {bytes} snapshot bytes");
+            self.committed[start..=end].fill(true);
+        }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.base as *const u8
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.base as *mut u8
+    }
+
+    /// Bytes committed in the pieces in use, rounded up to whole pages.
+    fn committed_bytes(&self) -> usize {
+        self.committed
+            .iter()
+            .enumerate()
+            .filter(|item| *item.1)
+            .map(|(piece, _)| {
+                let bytes = (self.len - piece * PIECE).min(PIECE);
+                // Windows commits whole 4 KiB pages even when the copy's
+                // final piece ends inside one.
+                bytes.div_ceil(4096) * 4096
+            })
+            .sum()
+    }
+}
+
+/// Snapshot address rooms kept for reuse. Their virtual room is cheap;
+/// what matters is the committed memory in their used pieces, so reuse
+/// does not bring back the whole-copy duplication the old byte pool had.
+static POOL: Mutex<Vec<Snapshot>> = Mutex::new(Vec::new());
+
+/// A snapshot with room for `n` bytes, reused if one of about that size is
+/// in the pool: a small copy's snapshot must not take the big heap's room,
+/// whose committed pieces would otherwise stay charged to the pool.
+fn pooled(n: usize) -> Snapshot {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
+        .filter(|(_, s)| s.len >= n && s.len <= most)
+        .min_by_key(|(_, s)| s.len)
         .map(|(i, _)| i);
-    let mut v = match fit {
+    match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+        None => Snapshot::new(n),
+    }
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
-fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+/// The most committed bytes pooled snapshots may hold (`VICTORY_SNAPSHOT_POOL_MB`,
+/// 512 unless set, the old contiguous pool's cap). The cap now counts only
+/// committed pieces, not the whole address room, so a pool under it usually
+/// holds much less RAM than before.
+fn pool_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(512)
+            << 20
+    })
+}
+
+/// Returns a snapshot to the pool: at most 8, the largest address rooms
+/// first, within [`pool_most`] committed bytes in all.
+fn give_back(snapshot: Snapshot) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
-    pool.retain(|v| {
-        seen += 1;
-        total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+    pool.push(snapshot);
+    pool.sort_by_key(|s| std::cmp::Reverse(s.len));
+    let (mut kept_count, mut total) = (0usize, 0usize);
+    let most = pool_most();
+    pool.retain(|s| {
+        let bytes = s.committed_bytes();
+        let keep = kept_count < 8 && total.saturating_add(bytes) <= most;
+        if keep {
+            kept_count += 1;
+            total += bytes;
+        }
+        keep
     });
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: the reservation's base and size zero releases it all.
+        unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(all(test, windows))]
+mod snapshot_tests {
+    use super::{PIECE, Snapshot};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+
+    fn state(at: usize) -> u32 {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        assert_ne!(n, 0);
+        info.State
+    }
+
+    #[test]
+    fn commits_only_the_pieces_a_range_uses() {
+        let mut snapshot = Snapshot::new(4 * PIECE);
+        snapshot.commit(PIECE + 17, PIECE + 31);
+        assert_eq!(state(snapshot.base), MEM_RESERVE);
+        assert_eq!(state(snapshot.base + PIECE), MEM_COMMIT);
+        assert_eq!(state(snapshot.base + 2 * PIECE), MEM_RESERVE);
+        assert_eq!(snapshot.committed_bytes(), PIECE);
+        snapshot.commit(2 * PIECE + 1, 3 * PIECE + 17);
+        assert_eq!(state(snapshot.base + 2 * PIECE), MEM_COMMIT);
+        assert_eq!(state(snapshot.base + 3 * PIECE), MEM_COMMIT);
+        assert_eq!(snapshot.committed_bytes(), 3 * PIECE);
+
+        snapshot.commit(10, 2 * PIECE + 1);
+        assert_eq!(state(snapshot.base), MEM_COMMIT);
+        assert_eq!(snapshot.committed_bytes(), 4 * PIECE);
+
+        let mut partial = Snapshot::new(4097);
+        partial.commit(0, 4097);
+        assert_eq!(state(partial.base + 4096), MEM_COMMIT);
+        assert_eq!(partial.committed_bytes(), 8192);
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2501,7 +2656,7 @@ pub(crate) fn let_go_idle() {
 
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
-/// buffers kept for reuse and the bytes they reserve.
+/// address rooms kept for reuse with the bytes committed in them.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
@@ -2519,7 +2674,7 @@ pub(crate) fn memory() -> [u64; 6] {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         (
             pool.len() as u64,
-            pool.iter().map(|v| v.capacity() as u64).sum::<u64>(),
+            pool.iter().map(|s| s.committed_bytes() as u64).sum::<u64>(),
         )
     };
     [
@@ -2664,9 +2819,8 @@ impl Shadow {
     /// one snapshot per copy and submission, each byte taken once, when the
     /// first range holding it is declared (the world declares overlapping
     /// views of its 174 MB heap dozens of times, from different offsets: a
-    /// snapshot grown to cover each was copied whole every time), in reused
-    /// memory (fresh snapshots cost ~2.3 million page faults per world
-    /// frame).
+    /// snapshot grown to cover each was copied whole every time), in virtual
+    /// memory committed only where a declared range uses it.
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() {
             return;
@@ -2722,6 +2876,9 @@ impl Shadow {
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
+        for &(from, to) in &parts {
+            snapshot.commit(from, to);
+        }
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a
@@ -2775,8 +2932,9 @@ impl Shadow {
         }
         for (from, to) in parts {
             if from < to {
-                // SAFETY: the copy's mapping and the snapshot's allocation
-                // (`pooled`) both hold `total` bytes, and `to <= total`.
+                // SAFETY: the copy's mapping and the snapshot's reservation
+                // both hold `total` bytes, `to <= total`, and `writing`
+                // committed the pieces holding `[from, to)`.
                 unsafe {
                     copy_wide(
                         self.data.add(from),
@@ -3182,8 +3340,8 @@ impl Shadow {
             // the snapshot's.)
             kept.0.clear();
         }
-        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            give_back(bytes);
+        if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            give_back(snapshot);
         }
     }
 
