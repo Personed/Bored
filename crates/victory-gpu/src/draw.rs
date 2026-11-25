@@ -1573,7 +1573,8 @@ mod tests {
         let guest = heap(title_heap);
         let view_heap = guest.host().unwrap();
         // SAFETY: a live heap.
-        let capacity = unsafe { view_heap.heap.GetDesc() }.NumDescriptors - view_heap.count();
+        // The heap itself runs past them to the null slot view indices clamp to.
+        let capacity = view_heap.dynamic_slots();
 
         let mut state = State::default();
         state.heaps[0] = title_heap as usize;
