@@ -84,8 +84,9 @@ In every build, a draw of depth-tested geometry whose pixel shader does
 not translate (or that the host refuses) is drawn with that debug shader
 instead of dropped; `VICTORY_PS_FALLBACK=0` turns that off.
 `VICTORY_PIPELINE_WAIT_MS` sets how long a frame may wait for pipelines
-being made (500 by default; 0 never waits, pipelines then appear a few
-frames later).
+of each kind being made (500 by default; ordinary and screen-pass pipelines
+have separate pools, so sequential waits can total twice that; 0 never
+waits, pipelines then appear a few frames later).
 
 ## Tests
 
