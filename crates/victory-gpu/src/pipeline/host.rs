@@ -9,7 +9,8 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use victory_shader::emit::{
-    ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+    ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, MESH_EMU_SPACE, MeshEmu, ROOT_CBV_SPACE,
+    SAMPLER_SPACE, USER_DATA_SPACE, unpack_vertex_shader,
 };
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -408,6 +409,19 @@ impl Stage {
     }
 }
 
+/// Additional pipelines and binding slots of a mesh pipeline emulated as
+/// compute plus a generated vertex shader.
+pub(crate) struct EmulatedMeshPipeline {
+    pub(crate) emu: MeshEmu,
+    pub(crate) cs_pso: ID3D12PipelineState,
+    pub(crate) cs_root: ID3D12RootSignature,
+    pub(crate) cs_stage: Stage,
+    pub(crate) cs_uav_param: u32,
+    pub(crate) cs_cbv_param: Option<u32>,
+    pub(crate) cs_srv_param: Option<u32>,
+    pub(crate) draw_srv_param: u32,
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
@@ -415,8 +429,12 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
-    /// Vertex, then pixel stage, or the compute stage.
+    /// Vertex, then pixel stage, or the compute stage. For an emulated
+    /// mesh pipeline this holds only the pixel stage; the mesh compute
+    /// stage lives in `mesh_emu`.
     pub(crate) stages: Vec<Stage>,
+    /// Compute and unpack-vertex pipeline state for emulated mesh shaders.
+    pub(crate) mesh_emu: Option<EmulatedMeshPipeline>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -447,6 +465,140 @@ pub(crate) fn debug_ps() -> bool {
 fn ps_fallback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_PS_FALLBACK").map_or(true, |v| v != "0"))
+}
+
+// The boxes keep each range's address stable while later ranges are pushed;
+// root signature serialization reads through those raw pointers.
+#[allow(clippy::vec_box)]
+fn push_stage_params(
+    shader: &Arc<Shader>,
+    visibility: D3D12_SHADER_VISIBILITY,
+    params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
+    samplers: &mut Vec<D3D12_STATIC_SAMPLER_DESC>,
+) -> Option<Stage> {
+    let t = &shader.translated()?.host;
+    let mut stage = Stage {
+        shader: shader.clone(),
+        user_data: None,
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        address_map: None,
+        descriptor_words: None,
+    };
+    let dwords = t.user_data_dwords();
+    if dwords > 0 {
+        stage.user_data = Some((params.len() as u32, dwords));
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: dwords,
+                },
+            },
+            ShaderVisibility: visibility,
+        });
+    }
+    for (slots, kind, out) in [
+        (
+            &t.root_cbvs,
+            D3D12_ROOT_PARAMETER_TYPE_CBV,
+            &mut stage.root_cbvs,
+        ),
+        (
+            &t.root_srvs,
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            &mut stage.root_srvs,
+        ),
+    ] {
+        for &slot in slots {
+            out.push((slot, params.len() as u32));
+            // A root SRV is a raw address the GPU reads without
+            // bounds: the console's reads past the title buffer
+            // land in other title memory, ours past its host copy
+            // in unmapped memory (a GPU page fault and a lost
+            // device in the world). A table of one raw view sized
+            // to the copy reads zeros there instead; the shader's
+            // binding (`t<slot>`, a ByteAddressBuffer) is the same.
+            if kind == D3D12_ROOT_PARAMETER_TYPE_SRV {
+                ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    NumDescriptors: 1,
+                    BaseShaderRegister: u32::from(slot),
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                        | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                    OffsetInDescriptorsFromTableStart: 0,
+                }));
+                let range: &D3D12_DESCRIPTOR_RANGE1 = ranges.last().expect("just pushed");
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: range,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+                continue;
+            }
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: kind,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: u32::from(slot),
+                        RegisterSpace: ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
+        }
+    }
+    for (wanted, space, out) in [
+        (t.address_map, ADDRESS_MAP_SPACE, &mut stage.address_map),
+        (
+            t.descriptor_words,
+            DESCRIPTOR_WORDS_SPACE,
+            &mut stage.descriptor_words,
+        ),
+    ] {
+        if wanted {
+            *out = Some(params.len() as u32);
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: space,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
+        }
+    }
+    for (n, s) in t.static_samplers.iter().enumerate() {
+        samplers.push(D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER(s.filter as i32),
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+            MipLODBias: s.mip_lod_bias,
+            MaxAnisotropy: s.max_anisotropy,
+            ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+            BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
+            MinLOD: s.min_lod,
+            MaxLOD: s.max_lod,
+            ShaderRegister: n as u32,
+            RegisterSpace: SAMPLER_SPACE,
+            ShaderVisibility: visibility,
+        });
+    }
+    Some(stage)
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -529,7 +681,8 @@ impl HostPipeline {
             }
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        let host = host()?;
+        if mesh.is_some() && !(host.mesh_shaders() || host.emulate_mesh_shaders()) {
             return refuse(
                 "the host GPU has no mesh shaders (or no shader model 6.6)",
                 shaders,
@@ -538,7 +691,31 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
-        let host = host()?;
+        // The debug view's pixel shader, one output per colour target.
+        let debug_ps_shader = (compute.is_none() && debug)
+            .then(|| victory_shader::emit::debug_ps(g.map_or(1, |g| g.targets.NumRenderTargets)));
+        if let Some(ms) = mesh {
+            let ms_translated = ms.translated()?;
+            if let Some(emu) = ms_translated.host.mesh_emu.as_ref() {
+                let Some(g) = g else {
+                    return refuse("graphics state not kept (plain description)", shaders);
+                };
+                return emulated_mesh_pipeline(
+                    ms,
+                    if debug { None } else { find("pixel") },
+                    emu,
+                    g,
+                    shaders,
+                    debug_ps_shader.as_ref(),
+                );
+            }
+            if !host.mesh_shaders() {
+                return refuse(
+                    "the host GPU has no mesh shaders (or no shader model 6.6)",
+                    shaders,
+                );
+            }
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -548,128 +725,13 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
-            let mut stage = Stage {
-                shader: shader.clone(),
-                user_data: None,
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                address_map: None,
-                descriptor_words: None,
-            };
-            let dwords = t.user_data_dwords();
-            if dwords > 0 {
-                stage.user_data = Some((params.len() as u32, dwords));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
-                            Num32BitValues: dwords,
-                        },
-                    },
-                    ShaderVisibility: visibility,
-                });
-            }
-            for (slots, kind, out) in [
-                (
-                    &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
-                    &mut stage.root_cbvs,
-                ),
-                (
-                    &t.root_srvs,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    &mut stage.root_srvs,
-                ),
-            ] {
-                for &slot in slots {
-                    out.push((slot, params.len() as u32));
-                    // A root SRV is a raw address the GPU reads without
-                    // bounds: the console's reads past the title buffer
-                    // land in other title memory, ours past its host copy
-                    // in unmapped memory (a GPU page fault and a lost
-                    // device in the world). A table of one raw view sized
-                    // to the copy reads zeros there instead; the shader's
-                    // binding (`t<slot>`, a ByteAddressBuffer) is the same.
-                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV {
-                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                            NumDescriptors: 1,
-                            BaseShaderRegister: u32::from(slot),
-                            RegisterSpace: ROOT_CBV_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        }));
-                        let range: &D3D12_DESCRIPTOR_RANGE1 = ranges.last().expect("just pushed");
-                        params.push(D3D12_ROOT_PARAMETER1 {
-                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
-                                },
-                            },
-                            ShaderVisibility: visibility,
-                        });
-                        continue;
-                    }
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
-                }
-            }
-            for (wanted, space, out) in [
-                (t.address_map, ADDRESS_MAP_SPACE, &mut stage.address_map),
-                (
-                    t.descriptor_words,
-                    DESCRIPTOR_WORDS_SPACE,
-                    &mut stage.descriptor_words,
-                ),
-            ] {
-                if wanted {
-                    *out = Some(params.len() as u32);
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: 0,
-                                RegisterSpace: space,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
-                }
-            }
-            for (n, s) in t.static_samplers.iter().enumerate() {
-                samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
-                    AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
-                    AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
-                    AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
-                    ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
-                    BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
-                    MinLOD: s.min_lod,
-                    MaxLOD: s.max_lod,
-                    ShaderRegister: n as u32,
-                    RegisterSpace: SAMPLER_SPACE,
-                    ShaderVisibility: visibility,
-                });
-            }
-            bound.push(stage);
+            bound.push(push_stage_params(
+                shader,
+                visibility,
+                &mut params,
+                &mut ranges,
+                &mut samplers,
+            )?);
         }
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some()) {
@@ -679,9 +741,6 @@ impl HostPipeline {
                     return None;
                 }
             };
-        // The debug view's pixel shader, one output per colour target.
-        let debug = (compute.is_none() && debug)
-            .then(|| victory_shader::emit::debug_ps(g.map_or(1, |g| g.targets.NumRenderTargets)));
         for (s, _) in &stages {
             if crate::breadcrumb::enabled() {
                 crate::breadcrumb::note_stage(&s.container, &format!("{shaders:?}"));
@@ -689,7 +748,7 @@ impl HostPipeline {
         }
         let code = |i: usize| {
             if i == 1
-                && let Some(d) = &debug
+                && let Some(d) = &debug_ps_shader
             {
                 return D3D12_SHADER_BYTECODE {
                     pShaderBytecode: d.dxil.as_ptr().cast(),
@@ -735,6 +794,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                mesh_emu: None,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -790,6 +850,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                mesh_emu: None,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -870,11 +931,242 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
+            mesh_emu: None,
             name: format!("{shaders:?}"),
             slots: layout.slots(),
             inputs,
         })
     }
+}
+
+/// A mesh pipeline emulated as compute plus a generated vertex shader.
+/// The compute step writes the mesh records into the shared emulation
+/// buffer; the graphics step unpacks them with no input assembler data.
+fn emulated_mesh_pipeline(
+    ms: &Arc<Shader>,
+    ps: Option<&Arc<Shader>>,
+    emu: &MeshEmu,
+    g: &GraphicsState,
+    shaders: &[Arc<Shader>],
+    debug_ps: Option<&victory_shader::emit::HostShader>,
+) -> Option<HostPipeline> {
+    let host = host()?;
+    let mut cs_params = Vec::new();
+    let mut cs_ranges = Vec::new();
+    let mut cs_samplers = Vec::new();
+    let cs_stage = push_stage_params(
+        ms,
+        D3D12_SHADER_VISIBILITY_ALL,
+        &mut cs_params,
+        &mut cs_ranges,
+        &mut cs_samplers,
+    )?;
+    let cs_uav_param = cs_params.len() as u32;
+    cs_params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: 0,
+                RegisterSpace: MESH_EMU_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    });
+    let (cs_cbv_param, cs_srv_param) = if emu.reads_group_id {
+        let cbv = cs_params.len() as u32;
+        cs_params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: MESH_EMU_SPACE,
+                    Num32BitValues: 4,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+        let srv = cs_params.len() as u32;
+        cs_params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: MESH_EMU_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+        (Some(cbv), Some(srv))
+    } else {
+        (None, None)
+    };
+    let (cs_root, cs_root_blob) = match root_signature(&host.device, &cs_params, &cs_samplers, true)
+    {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::warn!(error = %e, ?shaders, "emulated mesh CS root signature refused");
+            return None;
+        }
+    };
+    let cs_dxil = &ms.translated()?.host.dxil;
+    let cs_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        // SAFETY: borrowed root signature pointer for the Create/Load call.
+        pRootSignature: unsafe { std::mem::transmute_copy(&cs_root) },
+        CS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: cs_dxil.as_ptr().cast(),
+            BytecodeLength: cs_dxil.len(),
+        },
+        ..Default::default()
+    };
+    let cs_name = super::library::name("mesh-emu-cs", &cs_root_blob, &[cs_dxil], "");
+    let cs_pso = match super::library::pipeline(
+        &cs_name,
+        // SAFETY: descriptor points at live root signature and CS DXIL bytes.
+        |library, name| unsafe { library.LoadComputePipeline(name, &cs_desc) },
+        // SAFETY: as above.
+        || unsafe { host.device.CreateComputePipelineState(&cs_desc) },
+    ) {
+        Ok(pso) => pso,
+        Err(e) => {
+            tracing::warn!(error = %e, ?shaders, "emulated mesh CS pipeline refused");
+            host.log_messages();
+            return None;
+        }
+    };
+    crate::host::name(&cs_pso, || format!("{shaders:?} [mesh-emu cs]"));
+
+    let title_ps_dxil = match ps {
+        Some(ps) => Some(ps.translated()?.host.dxil.as_slice()),
+        None => None,
+    };
+    let ps_dxil = debug_ps.map(|d| d.dxil.as_slice()).or(title_ps_dxil);
+    let unpack_vs = match unpack_vertex_shader(emu, ps_dxil) {
+        Ok(vs) => vs,
+        Err(e) => {
+            tracing::warn!(error = %e, ?shaders, "unpack vertex shader generation failed");
+            return None;
+        }
+    };
+    let mut gfx_params = Vec::new();
+    let mut gfx_ranges = Vec::new();
+    let mut gfx_samplers = Vec::new();
+    let mut gfx_stages = Vec::new();
+    if let Some(ps) = ps {
+        gfx_stages.push(push_stage_params(
+            ps,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+            &mut gfx_params,
+            &mut gfx_ranges,
+            &mut gfx_samplers,
+        )?);
+    }
+    let draw_srv_param = gfx_params.len() as u32;
+    gfx_params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: 0,
+                RegisterSpace: MESH_EMU_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+    });
+    let (gfx_root, gfx_root_blob) = match root_signature(
+        &host.device,
+        &gfx_params,
+        &gfx_samplers,
+        false,
+    ) {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::warn!(error = %e, ?shaders, "emulated mesh graphics root signature refused");
+            return None;
+        }
+    };
+    let ps_code = ps_dxil.map_or_else(D3D12_SHADER_BYTECODE::default, |b| D3D12_SHADER_BYTECODE {
+        pShaderBytecode: b.as_ptr().cast(),
+        BytecodeLength: b.len(),
+    });
+    let gfx_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        // SAFETY: borrowed root signature pointer for the Create/Load call.
+        pRootSignature: unsafe { std::mem::transmute_copy(&gfx_root) },
+        VS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: unpack_vs.as_ptr().cast(),
+            BytecodeLength: unpack_vs.len(),
+        },
+        PS: ps_code,
+        BlendState: host_blend(&g.blend, &g.targets),
+        SampleMask: g.sample_mask,
+        RasterizerState: g.rasterizer,
+        DepthStencilState: g.depth,
+        InputLayout: D3D12_INPUT_LAYOUT_DESC {
+            pInputElementDescs: std::ptr::null(),
+            NumElements: 0,
+        },
+        IBStripCutValue: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: g.targets.NumRenderTargets,
+        RTVFormats: g.targets.RTFormats,
+        DSVFormat: g.depth_format,
+        SampleDesc: g.samples,
+        ..Default::default()
+    };
+    let depth_bounds = if g.depth_bounds {
+        host.depth_bounds()
+    } else {
+        false
+    };
+    let state = g.describe();
+    let gfx_name = super::library::name(
+        "mesh-emu-gfx",
+        &gfx_root_blob,
+        &[&unpack_vs, ps_dxil.unwrap_or(&[])],
+        &state,
+    );
+    let made = if depth_bounds {
+        graphics_depth_bounds_pipeline(&host.device, &gfx_root, &gfx_desc, g.depth1(), &gfx_name)
+    } else {
+        super::library::pipeline(
+            &gfx_name,
+            // SAFETY: descriptor points at live root signature, VS, and PS bytes.
+            |library, name| unsafe { library.LoadGraphicsPipeline(name, &gfx_desc) },
+            // SAFETY: as above.
+            || unsafe { host.device.CreateGraphicsPipelineState(&gfx_desc) },
+        )
+    };
+    let gfx_pso = match made {
+        Ok(pso) => pso,
+        Err(e) => {
+            tracing::warn!(error = %e, ?shaders, "emulated mesh graphics pipeline refused");
+            host.log_messages();
+            return None;
+        }
+    };
+    crate::host::name(&gfx_pso, || format!("{shaders:?} [mesh-emu gfx]"));
+    tracing::info!(?shaders, "host emulated mesh pipeline");
+    Some(HostPipeline {
+        compute: false,
+        mesh: true,
+        pso: gfx_pso,
+        root: gfx_root,
+        stages: gfx_stages,
+        mesh_emu: Some(EmulatedMeshPipeline {
+            emu: emu.clone(),
+            cs_pso,
+            cs_root,
+            cs_stage,
+            cs_uav_param,
+            cs_cbv_param,
+            cs_srv_param,
+            draw_srv_param,
+        }),
+        slots: 0,
+        inputs: Vec::new(),
+        name: format!("{shaders:?}"),
+    })
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state
