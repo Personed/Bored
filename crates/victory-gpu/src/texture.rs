@@ -651,20 +651,24 @@ pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    let (spares, spare_bytes) = {
+    let (spares, spare_bytes, expired) = {
         let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut expired = Vec::new();
         let mut freed = (0u64, 0u64);
         for (&size, buffers) in all.0.iter_mut() {
-            let had = buffers.len() as u64;
-            buffers.retain(|s| !crate::host::long_ago(s.2, idle_ms, IDLE_FRAMES));
-            let went = had - buffers.len() as u64;
-            freed.0 += went;
-            freed.1 += went * size;
+            let (kept, went): (Vec<_>, Vec<_>) = std::mem::take(buffers)
+                .into_iter()
+                .partition(|s| !crate::host::long_ago(s.2, idle_ms, IDLE_FRAMES));
+            freed.0 += went.len() as u64;
+            freed.1 += went.len() as u64 * size;
+            expired.extend(went);
+            *buffers = kept;
         }
         all.0.retain(|_, buffers| !buffers.is_empty());
         all.1 -= freed.1;
-        freed
+        (freed.0, freed.1, expired)
     };
+    drop(expired);
     if spares != 0 {
         crate::host::trail(|| {
             format!(
