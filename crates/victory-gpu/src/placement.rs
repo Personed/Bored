@@ -196,6 +196,17 @@ pub(crate) fn free(resource: ID3D12Resource, p: Placement) {
     }
 }
 
+/// Frees ranges whose last outside holder went away since the last pass,
+/// and releases empty heaps past [`SPARE`]. Placement does this when it is
+/// asked for memory, but a quiescent tail may ask for none: the sweep keeps
+/// the heaps from staying resident then.
+pub(crate) fn sweep() {
+    let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = heaps.as_mut() {
+        h.reap();
+    }
+}
+
 /// Bytes of heap space free for textures (after freeing what nothing
 /// holds now): the card's memory they take is not in use.
 pub(crate) fn free_bytes() -> u64 {
