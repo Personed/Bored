@@ -1366,10 +1366,17 @@ impl Snapshot {
     }
 }
 
+/// A pooled snapshot and the moment it was returned. `since` lets the
+/// once-a-second sweep release memory no submission has reused lately.
+struct PooledSnapshot {
+    snapshot: Snapshot,
+    since: u64,
+}
+
 /// Snapshot address rooms kept for reuse. Their virtual room is cheap;
 /// what matters is the committed memory in their used pieces, so reuse
 /// does not bring back the whole-copy duplication the old byte pool had.
-static POOL: Mutex<Vec<Snapshot>> = Mutex::new(Vec::new());
+static POOL: Mutex<Vec<PooledSnapshot>> = Mutex::new(Vec::new());
 
 /// A snapshot with room for `n` bytes, reused if one of about that size is
 /// in the pool: a small copy's snapshot must not take the big heap's room,
@@ -1380,11 +1387,11 @@ fn pooled(n: usize) -> Snapshot {
     let fit = pool
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.len >= n && s.len <= most)
-        .min_by_key(|(_, s)| s.len)
+        .filter(|(_, s)| s.snapshot.len >= n && s.snapshot.len <= most)
+        .min_by_key(|(_, s)| s.snapshot.len)
         .map(|(i, _)| i);
     match fit {
-        Some(i) => pool.swap_remove(i),
+        Some(i) => pool.swap_remove(i).snapshot,
         None => Snapshot::new(n),
     }
 }
@@ -1408,12 +1415,15 @@ fn pool_most() -> usize {
 /// first, within [`pool_most`] committed bytes in all.
 fn give_back(snapshot: Snapshot) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(snapshot);
-    pool.sort_by_key(|s| std::cmp::Reverse(s.len));
+    pool.push(PooledSnapshot {
+        snapshot,
+        since: crate::host::moment(),
+    });
+    pool.sort_by_key(|s| std::cmp::Reverse(s.snapshot.len));
     let (mut kept_count, mut total) = (0usize, 0usize);
     let most = pool_most();
     pool.retain(|s| {
-        let bytes = s.committed_bytes();
+        let bytes = s.snapshot.committed_bytes();
         let keep = kept_count < 8 && total.saturating_add(bytes) <= most;
         if keep {
             kept_count += 1;
@@ -2615,6 +2625,23 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let (snapshots, snapshot_bytes) = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let before: usize = pool.iter().map(|s| s.snapshot.committed_bytes()).sum();
+        let had = pool.len();
+        pool.retain(|s| !crate::host::long_ago(s.since, idle_ms, IDLE_FRAMES));
+        let left: usize = pool.iter().map(|s| s.snapshot.committed_bytes()).sum();
+        (had - pool.len(), before - left)
+    };
+    if snapshots != 0 {
+        crate::host::trail(|| {
+            format!(
+                "sweep: {snapshots} idle snapshot address rooms let go ({} KiB committed)",
+                snapshot_bytes >> 10
+            )
+        });
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2622,7 +2649,6 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
@@ -2674,7 +2700,9 @@ pub(crate) fn memory() -> [u64; 6] {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         (
             pool.len() as u64,
-            pool.iter().map(|s| s.committed_bytes() as u64).sum::<u64>(),
+            pool.iter()
+                .map(|s| s.snapshot.committed_bytes() as u64)
+                .sum::<u64>(),
         )
     };
     [
