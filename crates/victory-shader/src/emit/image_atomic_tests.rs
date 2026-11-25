@@ -126,6 +126,7 @@ fn build(op: u8, pair: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         crumbs: None,
+        emulate_mesh: false,
     })
     .expect("lower");
     let shader = HostShader {
@@ -140,6 +141,7 @@ fn build(op: u8, pair: bool) -> HostShader {
         descriptor_words: lowered.descriptor_words,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        mesh_emu: None,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

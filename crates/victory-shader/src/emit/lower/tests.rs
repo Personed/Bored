@@ -159,6 +159,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         prims: vec![],
         mesh_stride: 0,
         crumbs: None,
+        emulate_mesh: false,
     })
     .map(|_| ())
 }
@@ -210,6 +211,7 @@ fn lower_wave(
         prims: vec![],
         mesh_stride: 0,
         crumbs: None,
+        emulate_mesh: false,
     })
 }
 
@@ -250,6 +252,7 @@ fn counted_loop(crumbs: Option<u32>) -> Lowered {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        emulate_mesh: false,
         crumbs,
     })
     .unwrap()
@@ -419,6 +422,7 @@ fn perm_features(selector: u32) -> u64 {
         prims: vec![],
         mesh_stride: 0,
         crumbs: None,
+        emulate_mesh: false,
     })
     .unwrap();
 
@@ -1045,6 +1049,7 @@ fn first_half_of_interpolation_stays_missing_when_live_and_lowers_when_overwritt
             prims: vec![],
             mesh_stride: 0,
             crumbs: None,
+            emulate_mesh: false,
         })
     };
     // Overwritten on the s0 != 0 branch: p1 never reaches exp.
@@ -1743,6 +1748,7 @@ fn constant_64_bit_compares_lower_without_int64() {
             prims: vec![],
             mesh_stride: 0,
             crumbs: None,
+            emulate_mesh: false,
         })
         .unwrap();
         let sfi0 = crate::dxbc::Container::parse(&emitted.dxil)

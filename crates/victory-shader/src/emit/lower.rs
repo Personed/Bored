@@ -68,6 +68,7 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    pub mesh_emu: Option<super::MeshEmu>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -93,6 +94,7 @@ pub(crate) struct Parts<'a> {
     /// With breadcrumbs (see [`super::breadcrumbs`]): the shader's slot.
     #[allow(dead_code)]
     pub crumbs: Option<u32>,
+    pub emulate_mesh: bool,
 }
 
 enum Stop {
@@ -370,6 +372,8 @@ struct Lower<'a> {
     /// order met (the word each owns in the shader's slot).
     #[allow(dead_code)]
     crumb_loops: HashMap<usize, u32>,
+    /// Mesh shader lowered to compute + buffer output when emulating.
+    mesh_emu: Option<MeshEmuState>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1672,15 +1676,23 @@ impl<'a> Lower<'a> {
             HashSet::new()
         };
         let mut no_barrier = HashSet::new();
+        let mut mesh_emu = None;
         if let StageIo::Ms(ms) = &x.native.io {
-            s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
-            s.mesh = Some(super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
-                topology: ms.topology,
-            });
+            if x.emulate_mesh {
+                s.inputs.clear();
+                s.outputs.clear();
+                s.prims.clear();
+                mesh_emu = Some(mesh_emu_state(ms, x));
+            } else {
+                s.prims = x.prims.clone();
+                s.mesh = Some(super::shader::Mesh {
+                    max_vertices: ms.max_vertices,
+                    max_primitives: ms.max_primitives,
+                    topology: ms.topology,
+                });
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -1818,6 +1830,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             ret: None,
+            mesh_emu,
         }
     }
 
@@ -2352,6 +2365,20 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
+        self.cur = self.s.entry;
+        self.find_sections();
+        if self.mesh_emu.is_some() {
+            self.mesh_emu_init().map_err(|w| unsupported(0, w))?;
+        }
+        self.inputs()?;
+        if let Some(mesh) = self.s.mesh {
+            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+        } else if self.mesh_emu.is_some() {
+            self.mesh_emu_prologue();
+        }
+        if self.cur != self.s.entry {
+            self.block[order[0]] = Some(self.cur);
+        }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
@@ -2363,13 +2390,6 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
-        }
-        self.cur = self.s.entry;
-        self.find_sections();
-        self.inputs()?;
-        if let Some(mesh) = self.s.mesh {
-            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
-            self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -2435,6 +2455,7 @@ impl<'a> Lower<'a> {
         let wave_size = self.s.wave_size;
         let address_map = self.s.address_map.is_some();
         let descriptor_words = self.s.descriptor_words.is_some();
+        let mesh_emu = self.mesh_emu.take().map(MeshEmuState::finish);
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2443,6 +2464,7 @@ impl<'a> Lower<'a> {
             root_uavs,
             address_map,
             descriptor_words,
+            mesh_emu,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2524,6 +2546,9 @@ impl<'a> Lower<'a> {
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
+                if self.mesh_emu.is_some() {
+                    return self.mesh_group_emu();
+                }
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
                 };
@@ -4676,11 +4701,14 @@ impl<'a> Lower<'a> {
         prev
     }
 
+    fn is_mesh(&self) -> bool {
+        self.s.mesh.is_some() || self.mesh_emu.is_some()
+    }
     /// Code that depends on the lane layout: wave operations, and in compute
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
-        if self.s.mesh.is_some() {
+        if self.is_mesh() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
             // memory if mesh programs turn out to need these.
@@ -4853,7 +4881,7 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
-        if self.s.mesh.is_some() {
+        if self.is_mesh() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
@@ -5026,7 +5054,7 @@ impl<'a> Lower<'a> {
                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
-            let mesh_quad = self.s.mesh.is_some() && quad;
+            let mesh_quad = self.is_mesh() && quad;
             if !mesh_quad {
                 self.cross_lane(quad)?;
             }
@@ -7593,7 +7621,7 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.s.mesh.is_some() && quad;
+        let mesh_quad = self.is_mesh() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
@@ -10037,7 +10065,7 @@ impl<'a> Lower<'a> {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
                     self.s.flags |= flags::WAVE_OPS;
-                } else if self.s.mesh.is_none() {
+                } else if !self.is_mesh() {
                     self.cross_lane(false)?;
                 }
                 let lane = self.console_lane();
@@ -11877,7 +11905,7 @@ impl<'a> Lower<'a> {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
-        let mesh = self.s.mesh.is_some();
+        let mesh = self.is_mesh();
         let c = self.cur;
         if let Some(g) = guard
             && !mesh
@@ -11891,6 +11919,9 @@ impl<'a> Lower<'a> {
                 .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
         }
         if mesh && e.target == Target::Primitive {
+            if self.mesh_emu.is_some() {
+                return self.emit_indices_emu(e, guard);
+            }
             return self.emit_indices(e, guard);
         }
         let param_row = |usage: Usage, row: u8| match usage {
@@ -11903,10 +11934,11 @@ impl<'a> Lower<'a> {
         // outputs are elements of `prims`.
         let mut stores = Vec::new();
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
-        let outputs = if primitive {
-            &self.s.prims
-        } else {
-            &self.s.outputs
+        let outputs = match (&self.mesh_emu, primitive) {
+            (Some(m), true) => &m.prim_sigs,
+            (Some(m), false) => &m.vertex_sigs,
+            (None, true) => &self.s.prims,
+            (None, false) => &self.s.outputs,
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
         // 16-bit vertex outputs: the halves each dword carries, as (output
@@ -12009,7 +12041,13 @@ impl<'a> Lower<'a> {
             }
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
-            if primitive {
+            if let Some(m) = l.mesh_emu.as_mut() {
+                if primitive {
+                    &mut m.prim_sigs
+                } else {
+                    &mut m.vertex_sigs
+                }
+            } else if primitive {
                 &mut l.s.prims
             } else {
                 &mut l.s.outputs
@@ -12020,6 +12058,9 @@ impl<'a> Lower<'a> {
             .any(|s| s.3.is_none() && elements(self, primitive)[s.0].half)
         {
             return Err("a 16-bit output the stage data does not mark");
+        }
+        if self.mesh_emu.is_some() {
+            return self.store_mesh_emu_outputs(guard, primitive, &stores);
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
         let at = if mesh {
@@ -12170,9 +12211,11 @@ impl<'a> Lower<'a> {
                 .iter()
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
-        let free: std::collections::BTreeSet<u32> = self
-            .s
-            .outputs
+        let vertex_sigs = match &self.mesh_emu {
+            Some(m) => &m.vertex_sigs,
+            None => &self.s.outputs,
+        };
+        let free: std::collections::BTreeSet<u32> = vertex_sigs
             .iter()
             .filter(|o| o.kind == 0)
             .filter_map(|o| o.row)
@@ -12200,5 +12243,6 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 }
 
 include!("lower/methods.rs");
+include!("lower/mesh_emu.rs");
 #[cfg(test)]
 mod tests;

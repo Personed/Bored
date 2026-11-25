@@ -364,6 +364,7 @@ mod gpu {
             outputs: Vec::new(),
             prims: Vec::new(),
             crumbs: None,
+            emulate_mesh: false,
             mesh_stride: 0,
         })
         .expect("lower");
@@ -379,6 +380,7 @@ mod gpu {
             descriptor_words: lowered.descriptor_words,
             root_uavs: lowered.root_uavs,
             root_indexed_views: Vec::new(),
+            mesh_emu: None,
         };
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
