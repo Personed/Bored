@@ -8567,6 +8567,22 @@ impl<'a> Lower<'a> {
             let scale_bits = self.s.m.bin(c, Bin::Shl, biased, k23);
             let scale = self.as_float(scale_bits);
             let r = self.s.m.bin(c, Bin::Mul, a, scale);
+            // Overflow goes to +-inf as nearest-even rounds it (measured on
+            // RDNA2), even where the host's own f32-to-f16 conversion rounds
+            // toward zero (WARP's does): force f32 infinity past 65520, the
+            // midpoint between the largest finite half and the first magnitude
+            // that rounds away. NaN fails the compare and passes through.
+            let ri = self.as_int(r);
+            let abs = self.s.m.i32(0x7FFF_FFFF);
+            let mag = self.s.m.bin(c, Bin::And, ri, abs);
+            let thresh = self.s.m.i32(0x477F_F000); // 65520.0f32
+            let over = self.s.m.cmp(c, pred::IUGE, mag, thresh);
+            let signbit = self.s.m.i32(0x8000_0000);
+            let sign = self.s.m.bin(c, Bin::And, ri, signbit);
+            let finf = self.s.m.i32(0x7F80_0000);
+            let finf = self.s.m.bin(c, Bin::Or, sign, finf);
+            let rbits = self.s.m.select(c, over, finf, ri);
+            let r = self.as_float(rbits);
             return float_result(self, r);
         }
         if float2.contains(&name) {
