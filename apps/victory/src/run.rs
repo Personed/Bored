@@ -32,6 +32,9 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // The executable and its patched copy are on disk and loaded now; held
+    // here they would stay in memory (twice the executable) for the whole run.
+    drop((original, prepared));
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
