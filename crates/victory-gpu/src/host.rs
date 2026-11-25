@@ -2316,8 +2316,8 @@ struct CardPlan {
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
-    /// The lists of ours the plan recorded (whether the compare, the
-    /// list), given back by `Host::card_done`.
+    /// The lists of ours the plan recorded (whether each came from the
+    /// shared prelude pool), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
     /// With [`relay`], the number of this plan's send of changed ranges
     /// (`QUEUE_ORDER`); else 0.
