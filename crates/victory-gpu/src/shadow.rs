@@ -2762,16 +2762,23 @@ struct Entry {
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
+/// The longest title buffer registered so far (it stays after the buffer is
+/// released): a buffer starting further below an address than this cannot
+/// hold it. Changed under `BUFFERS`' lock.
+static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
+    map.insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end: start.saturating_add(len),
             shadow: None,
         },
     );
@@ -2786,12 +2793,10 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end > address)
-        .map(|(k, e)| (k.0, e.end - k.0))
+    let map = buffers();
+    let end = address.saturating_add(1);
+    enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end)
+        .and_then(|key| map.get(&key).map(|e| (key.0, e.end - key.0)))
 }
 
 /// Title memory `[at, at + len)` is about to show something else or be
@@ -2836,6 +2841,27 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// The innermost entry holding `[address, end)`: the one starting closest
+/// below `address` that reaches `end`, among those starting at most `span`
+/// (the longest entry's length) below `end`. Big buffers hold many smaller
+/// ones (a heap's placed buffers), so the one holding an address past
+/// those can be any number of entries back.
+fn enclosing(
+    map: &BTreeMap<(u64, usize), Entry>,
+    span: u64,
+    address: u64,
+    end: u64,
+) -> Option<(u64, usize)> {
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    map.range((lowest, 0)..=(address, usize::MAX))
+        .rev()
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
@@ -2871,12 +2897,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end, len <= 1, any);
@@ -3156,7 +3177,30 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{WINDOW, cover, enclosing, grid, holder, longest_tail, tail_of, window_of};
+    use super::{BTreeMap, Entry};
+
+    /// A big buffer is found below any number of smaller entries in it.
+    #[test]
+    fn a_buffer_is_found_past_many_smaller_ones() {
+        let mut map = BTreeMap::new();
+        let base = 0x1_0000_0000u64;
+        let entry = |start, len| Entry {
+            end: start + len,
+            shadow: None,
+        };
+        map.insert((base, 1), entry(base, 256 << 20));
+        for i in 0..128u64 {
+            let at = base + i * 0x1_0000;
+            map.insert((at, 100 + i as usize), entry(at, 0x1_0000));
+        }
+        let ask = base + 96 * 0x1_0000;
+        assert_eq!(
+            enclosing(&map, 256 << 20, ask, ask + 4),
+            Some((base, 1)),
+            "the small entries must not hide the heap-sized buffer"
+        );
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
