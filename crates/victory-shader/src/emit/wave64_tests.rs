@@ -119,6 +119,7 @@ fn lowered_on(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
@@ -132,6 +133,7 @@ fn lowered_on(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        mesh_emu: None,
     })
 }
 

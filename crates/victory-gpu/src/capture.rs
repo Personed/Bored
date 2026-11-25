@@ -456,7 +456,7 @@ fn dump_one(
             }
             let most = |m: std::collections::HashMap<u32, u32>| {
                 let mut v: Vec<(u32, u32)> = m.into_iter().collect();
-                v.sort_by_key(|e| std::cmp::Reverse(e.1));
+                v.sort_unstable_by_key(|e| std::cmp::Reverse(e.1));
                 (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
@@ -519,7 +519,7 @@ fn stencil_values(
             .enumerate()
             .filter(|v| v.1 != 0)
             .collect();
-        most.sort_by_key(|v| std::cmp::Reverse(v.1));
+        most.sort_unstable_by_key(|v| std::cmp::Reverse(v.1));
         most.truncate(16);
         tracing::info!(
             frame,

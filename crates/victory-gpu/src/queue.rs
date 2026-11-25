@@ -892,7 +892,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// compute queue waits for the depth the graphics queue draws). Our
 /// submissions run when they are made, so a wait for a value already
 /// reached is nothing; otherwise what the queue is given next is held
-/// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
+/// (`Held`) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {

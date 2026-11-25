@@ -657,7 +657,7 @@ fn log_memory_map() {
         group.1 += bytes;
     }
     let mut groups: Vec<((usize, usize), (u64, u64))> = groups.into_iter().collect();
-    groups.sort_by_key(|g| std::cmp::Reverse(g.1.1));
+    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.1.1));
     let biggest: Vec<String> = groups
         .iter()
         .take(20)
@@ -1197,7 +1197,7 @@ pub(crate) fn log(frames: f64) {
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();
-    whole.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
+    whole.sort_unstable_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
     tracing::info!(
         "  copied whole (memory not watched): {:.1} ms per frame in {} ranges; the largest follow",
         ms(c[C::WholeUs as usize]),
@@ -1235,7 +1235,7 @@ pub(crate) fn log(frames: f64) {
     );
     let by = WAITS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut by: Vec<_> = by.into_iter().flatten().collect();
-    by.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+    by.sort_unstable_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
     for (what, (n, us)) in by.into_iter().take(12) {
         tracing::info!(
             "  the card's time by what ran: {:.1} ms a frame in {:.1} submissions a frame: {}",
@@ -1246,7 +1246,7 @@ pub(crate) fn log(frames: f64) {
     }
     let by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut by: Vec<_> = by.into_iter().flatten().collect();
-    by.sort_by_key(|&(_, (_, us, _))| std::cmp::Reverse(us));
+    by.sort_unstable_by_key(|&(_, (_, us, _))| std::cmp::Reverse(us));
     // All of them together, and by their first word: the forty lines below
     // are the heaviest only (100 of 226 ms waited in run 102), and what the
     // commands do not account for is the layer's own lists (the card
@@ -1260,7 +1260,7 @@ pub(crate) fn log(frames: f64) {
                 None => kinds.push((word, *n, *us)),
             }
         }
-        kinds.sort_by_key(|k| std::cmp::Reverse(k.2));
+        kinds.sort_unstable_by_key(|k| std::cmp::Reverse(k.2));
         let all: u64 = kinds.iter().map(|k| k.2).sum();
         let text: Vec<String> =
             kinds.iter().map(|(word, n, us)| format!("{word} {:.1} ms in {:.0}", *us as f64 / 1e3 / frames, *n as f64 / frames)).collect();
@@ -1300,7 +1300,7 @@ pub(crate) fn log(frames: f64) {
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut compared: Vec<_> = compared.into_iter().flatten().collect();
-    compared.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
+    compared.sort_unstable_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
     tracing::info!("  compared after submissions: {} ranges; the largest follow", compared.len());
     for ((src, len), (n, written)) in compared.into_iter().take(8) {
         tracing::info!(
@@ -1311,7 +1311,7 @@ pub(crate) fn log(frames: f64) {
         );
     }
     let mut submitters = std::mem::take(&mut *SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner()));
-    submitters.sort_by_key(|s| std::cmp::Reverse(s.1.submissions));
+    submitters.sort_unstable_by_key(|s| std::cmp::Reverse(s.1.submissions));
     for (id, s) in submitters.into_iter().take(4) {
         let per = |v: u64| v as f64 / 1e3 / frames;
         tracing::info!(
@@ -1329,7 +1329,7 @@ pub(crate) fn log(frames: f64) {
         );
     }
     let mut recorders = std::mem::take(&mut *RECORDERS.lock().unwrap_or_else(|e| e.into_inner()));
-    recorders.sort_by_key(|r| std::cmp::Reverse(r.1));
+    recorders.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
     let busiest: Vec<String> = recorders
         .iter()
         .take(6)
@@ -1339,7 +1339,7 @@ pub(crate) fn log(frames: f64) {
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
+    ranges.sort_unstable_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
     for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
