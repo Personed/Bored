@@ -50,6 +50,8 @@ pub(crate) struct Staging {
     mips: u32,
     /// Per subresource, the byte ranges of the memory it is detiled from.
     extents: Vec<Vec<Range<usize>>>,
+    /// Top console mips omitted from the host copy.
+    mip_drop: u32,
     memory: *const u8,
     last: Mutex<Last>,
 }
@@ -312,7 +314,7 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
-    Some((staging.memory as u64, staging.size as u64))
+    Some((staging.memory as u64, staging.layout.size))
 }
 
 /// Frames after a whole upload of a texture at which its memory is looked
@@ -592,7 +594,8 @@ impl Staging {
             if changed.is_some_and(|c| !overlaps(&self.extents[i], c)) {
                 continue;
             }
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (host_mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let mip = host_mip + self.mip_drop;
             // SAFETY: the upload buffer is mapped for exactly this range.
             let linear = unsafe { std::slice::from_raw_parts_mut(self.data, self.size) };
             if let Err(e) = self.layout.detile(
@@ -747,9 +750,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let mips = u32::from(d.MipLevels).max(1);
+    let (mip_drop, _) = crate::resource::host_mip_info(resource);
     let whole: Vec<_> = std::iter::once(0..layout.size as usize).collect();
     let extents = (0..count)
-        .map(|i| match layout.extents(i % mips, i / mips) {
+        .map(|i| match layout.extents(i % mips + mip_drop, i / mips) {
             Ok(e) => e
                 .into_iter()
                 .map(|r| r.start as usize..r.end as usize)
@@ -766,6 +770,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         extents,
+        mip_drop,
         memory,
         last: Mutex::default(),
     });

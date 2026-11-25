@@ -37,6 +37,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    /// Dedicated video memory of the adapter the device is on, in bytes.
+    memory: u64,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -187,10 +189,23 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some((adapter, memory, name)) = hardware_adapter() {
+            match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
+                Ok(()) => tracing::info!(
+                    adapter = name,
+                    memory_gb = format_args!("{:.1}", memory as f64 / f64::powi(1024.0, 3)),
+                    "host device on the largest-memory hardware adapter"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, adapter = name, "hardware adapter refused D3D12; using the default adapter");
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            }
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let memory = adapter_memory(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -217,6 +232,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
+            memory,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -231,6 +247,75 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
         })
     }
+}
+
+/// The hardware adapter with the most dedicated video memory, if DXGI knows
+/// one: a Ryzen APU plus a discrete card must not default to the APU's small
+/// shared-memory device.
+fn hardware_adapter() -> Option<(IDXGIAdapter, u64, String)> {
+    // SAFETY: plain DXGI factory and adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut best = None;
+        for i in 0.. {
+            let Ok(adapter1) = factory.EnumAdapters1(i) else {
+                break;
+            };
+            let Ok(desc) = adapter1.GetDesc1() else {
+                continue;
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let memory = desc.DedicatedVideoMemory as u64;
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            let better = best
+                .as_ref()
+                .is_none_or(|(_, old, _): &(IDXGIAdapter, u64, String)| memory > *old);
+            if better {
+                best = adapter1
+                    .cast::<IDXGIAdapter>()
+                    .ok()
+                    .map(|a| (a, memory, name));
+            }
+        }
+        best
+    }
+}
+
+/// Dedicated video memory of `device`'s adapter in bytes, zero if DXGI does
+/// not say. Matching by LUID also covers a device made on the default adapter.
+fn adapter_memory(device: &ID3D12Device) -> u64 {
+    // SAFETY: plain device and DXGI queries.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return 0;
+        };
+        for i in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(i) else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            if desc.AdapterLuid == luid {
+                return desc.DedicatedVideoMemory as u64;
+            }
+        }
+        0
+    }
+}
+
+/// Dedicated video memory of the host adapter in bytes (`None` without a
+/// host device).
+pub(crate) fn device_memory() -> Option<u64> {
+    host().map(|h| h.memory)
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
