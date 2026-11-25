@@ -1140,6 +1140,9 @@ pub(crate) struct HostTexture {
     /// Top title mips omitted from the host copy.
     mip_drop: u32,
     is_3d: bool,
+    /// Its range in a heap of textures (`crate::placement`), given back
+    /// when it goes; `None` for a committed texture.
+    placement: Option<crate::placement::Placement>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1369,10 +1372,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Some((texture, 0)),
+            Some(texture) => Some((texture, 0, None)),
             None => host_texture(&r.desc, r.host.state, clear),
         };
-        let Some((texture, mip_drop)) = texture else {
+        let Some((texture, mip_drop, placement)) = texture else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1399,6 +1402,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 r.desc.dimension == TEXTURE_3D,
             ),
         };
+        host.placement = placement;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1464,8 +1468,12 @@ pub(crate) fn room() -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+            // Free space in the heaps of textures takes the card's memory
+            // but is not in use: new textures go there first.
+            let used = used.saturating_sub(crate::placement::free_bytes())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept();
+            used < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2080,6 +2088,7 @@ impl HostTexture {
             title_mips: title_mips.max(1),
             mip_drop,
             is_3d,
+            placement: None,
         }
     }
 
@@ -2103,6 +2112,7 @@ impl HostTexture {
             title_mips: u32::from(desc.MipLevels).max(1),
             mip_drop: 0,
             is_3d: desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            placement: None,
         }
     }
 
@@ -2275,6 +2285,9 @@ fn apply_mip_drop(desc: &mut ResourceDesc, title_mips: u32, drop: u32) {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        if let Some(p) = self.placement.take() {
+            crate::placement::free(self.texture.clone(), p);
+        }
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -2341,7 +2354,11 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    u32,
+    Option<crate::placement::Placement>,
+)> {
     host_texture_impl(desc, state, clear, false)
 }
 
@@ -2355,7 +2372,7 @@ fn host_texture_as(
     clear: *const c_void,
     reserved: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_impl(desc, state, clear, reserved).map(|(texture, _)| texture)
+    host_texture_impl(desc, state, clear, reserved).map(|(texture, _, _)| texture)
 }
 
 #[cfg(windows)]
@@ -2364,7 +2381,11 @@ fn host_texture_impl(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    u32,
+    Option<crate::placement::Placement>,
+)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2427,7 +2448,47 @@ fn host_texture_impl(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let made = if reserved {
+    // In a heap of textures if it fits there (`crate::placement`): nothing
+    // it is cleared with, no mip dropped (the range's size is fixed), not
+    // reserved. On failure the committed path below runs as before.
+    let mut placement = None;
+    if !reserved && clear_value.is_none() && drop == 0 {
+        // SAFETY: the description has the host layout (checked size, same
+        // fields).
+        let plain = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+        if crate::placement::fits(&host.device, &plain)
+            && let Some((heap, p)) = crate::placement::place(&host.device, &plain)
+        {
+            // SAFETY: a range of the heap for this description.
+            let made_placed = unsafe {
+                host.device.CreatePlacedResource(
+                    &heap,
+                    p.offset(),
+                    &plain,
+                    D3D12_RESOURCE_STATES(crate::host::legal_for(
+                        d.flags,
+                        crate::host::texture_state(state),
+                    ) as i32),
+                    None,
+                    &mut texture,
+                )
+            };
+            match made_placed {
+                Ok(()) => placement = Some(p),
+                Err(e) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(error = %e, "a texture not placed in a heap: committed")
+                    });
+                    crate::placement::unplace(p);
+                    texture = None;
+                }
+            }
+        }
+    }
+    let made = if texture.is_some() {
+        Ok(())
+    } else if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
@@ -2497,7 +2558,7 @@ fn host_texture_impl(
             )
         });
     }
-    texture.map(|texture| (texture, drop))
+    texture.map(|texture| (texture, drop, placement))
 }
 
 /// The host copy of title texture `this` if it is made and was made
