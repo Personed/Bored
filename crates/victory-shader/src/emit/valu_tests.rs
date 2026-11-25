@@ -419,6 +419,12 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
         (0x89ab_cdef, 0x0123_4567), // reversed
         (0x1111_1111, 0xf0f0_f0f0), // repeats
     ];
+    // Cross-lane code declares WaveSize(32), which WARP's pipeline creation
+    // refuses: the test is hardware-only, and skips where there is none.
+    if Host::new(false).is_err() {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    }
     for (op, cross) in [(0x377u16, false), (0x378, true)] {
         for read in [0u8, 5, 15, 16, 22, 31] {
             let mut body = Vec::new();
