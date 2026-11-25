@@ -6643,8 +6643,13 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.is_mesh() && quad;
-        if !mesh_quad {
+        // Quad-local reads go through quad operations in mesh programs
+        // (host quads are threads 4n..4n+3) and in pixel programs, where a
+        // triangle edge's helpers must be reached: wave reads give 0 from
+        // them on AMD — wrong derivatives along every edge (upstream
+        // 4015a18).
+        let quad_read = quad && (self.is_mesh() || self.s.pixel);
+        if !quad_read {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
@@ -6722,7 +6727,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if quad_read {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
