@@ -1226,6 +1226,15 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // A call whose pipeline is not made yet cannot run. That is common
+        // while the world builds its pipelines; drop it before refreshing and
+        // clamping records nothing will read.
+        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            why("no host pipeline");
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");

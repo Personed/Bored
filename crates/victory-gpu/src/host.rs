@@ -1599,7 +1599,12 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                // Wine does not write into write-watched pages not written
+                // since they were committed (ERROR_PARTIAL_COPY), but reads
+                // into them. The kernel checks this destination as well.
+                if !write(at, n) {
+                    read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
+                }
             });
         }
     });
