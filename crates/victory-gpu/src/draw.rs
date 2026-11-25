@@ -3375,12 +3375,19 @@ impl State {
         counter: Option<(&std::sync::Arc<crate::shadow::Shadow>, u64)>,
         why: &dyn Fn(&str),
     ) -> bool {
+        // The mesh preparation pass reuses this list's indirect scratch
+        // buffer, so discard any cached window that may alias it.
+        self.window = None;
         if mesh_test() == 1 || !mesh_kept(self.pipeline) {
             why("mesh draws are switched off (VICTORY_MESH_TEST)");
             return false;
         }
         if stride < 12 {
             why("indirect mesh stride smaller than 12 bytes");
+            return false;
+        }
+        if max > crate::mesh_emu::MAX_INDIRECT_RECORDS {
+            why("indirect mesh record count exceeds the emulation safety limit");
             return false;
         }
         let Some(emu_pipe) = &p.mesh_emu else {
@@ -3406,18 +3413,32 @@ impl State {
             return false;
         }
         args.refresh(list, arguments, len);
-        if let Some((s, at)) = counter {
-            s.refresh(list, at, 4);
-        }
+        let count_arg = counter.as_ref().map(|(s, at)| {
+            s.refresh(list, *at, 4);
+            (&s.buffer, s.offset(*at))
+        });
+        let Some(bounded) = crate::indirect::bound(
+            list,
+            (&args.buffer, args.offset(arguments)),
+            count_arg,
+            (10, stride, max),
+        ) else {
+            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            return false;
+        };
+        // SAFETY: `bounded` is the live scratch resource returned by `bound`.
+        let bounded_gpu = unsafe { bounded.GetGPUVirtualAddress() };
         if !buffers.prepare_indirect(
             list,
-            args.gpu(arguments),
+            &bounded,
+            bounded_gpu,
             count_gpu,
             stride,
             max,
             emu_pipe.emu.max_primitives,
             group_cap,
         ) {
+            crate::indirect::done(list, &bounded);
             why("no mesh indirect preparation pipeline");
             return false;
         }

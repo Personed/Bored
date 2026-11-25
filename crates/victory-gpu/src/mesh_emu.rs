@@ -19,6 +19,7 @@ use crate::indirect::uav_barrier;
 
 const SLOT_MAP_BYTES: u64 = 65_536 * 4;
 const INDIRECT_ARGS_BYTES: u64 = 256;
+pub(crate) const MAX_INDIRECT_RECORDS: u32 = 65_535;
 const OUTPUT_FALLBACK_SIZES: &[u64] = &[128 << 20, 64 << 20, 32 << 20, 16 << 20];
 
 const PREP_SOURCE: &str = r#"
@@ -241,14 +242,16 @@ impl Buffers {
         (self.output_bytes / u64::from(group_bytes.max(4))).min(65_535) as u32
     }
 
-    /// Sums indirect mesh group counts into host dispatch/draw arguments,
-    /// clamped to one output-buffer chunk. When several records can run,
-    /// `slot_map` maps each compacted group to its group inside its record.
+    /// Sums a bounded `INDIRECT_ARGUMENT` scratch buffer into host dispatch
+    /// and draw arguments, clamped to one output-buffer chunk. Returns the
+    /// source to `COMMON`; when several records can run, `slot_map` maps each
+    /// compacted group to its group inside its record.
     /// Leaves `indirect_args` in `INDIRECT_ARGUMENT` and `slot_map` readable.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_indirect(
         &self,
         list: &HostList,
+        args: &ID3D12Resource,
         args_gpu: u64,
         count_gpu: Option<u64>,
         stride: u32,
@@ -269,10 +272,15 @@ impl Buffers {
             u32::from(count_gpu.is_some()),
             u32::from(build_map),
         ];
+        let args_to_uav = transition(
+            args,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
         // SAFETY: an open list; all GPU addresses name live buffers kept for
         // the submission.
         unsafe {
-            l.ResourceBarrier(&[uav_barrier()]);
+            l.ResourceBarrier(&[uav_barrier(), args_to_uav]);
             l.SetComputeRootSignature(prep_root);
             l.SetPipelineState(prep_pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -286,15 +294,20 @@ impl Buffers {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             );
+            let source_barrier = transition(
+                args,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
             if build_map {
                 let map_barrier = transition(
                     &self.slot_map,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 );
-                l.ResourceBarrier(&[args_barrier, map_barrier]);
+                l.ResourceBarrier(&[args_barrier, map_barrier, source_barrier]);
             } else {
-                l.ResourceBarrier(&[args_barrier]);
+                l.ResourceBarrier(&[args_barrier, source_barrier]);
             }
         }
         true
