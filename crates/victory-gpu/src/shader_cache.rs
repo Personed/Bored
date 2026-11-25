@@ -175,14 +175,17 @@ fn cached(
                 };
             }
         };
+        if let Some(shader) = converter.translated.get() {
+            // A miss is already translated; reading its just-written entry
+            // back costs about as much as a small translation where a virus
+            // scanner looks at every new file.
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader translated and cached");
+            return Ok(shader.clone());
+        }
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.translated.get().is_some() {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader from the cache");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
