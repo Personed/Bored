@@ -200,6 +200,11 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
+            // Past the deadline the workers break out at once: opening and
+            // reading the rest of the assets would only scan for nothing.
+            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
+                break;
+            }
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
