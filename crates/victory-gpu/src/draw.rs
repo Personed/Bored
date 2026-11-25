@@ -3411,7 +3411,6 @@ impl State {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
-        list.flush_barriers();
         // SAFETY: `bounded` is the live scratch resource returned by `bound`.
         let bounded_gpu = unsafe { bounded.GetGPUVirtualAddress() };
         if !buffers.prepare_indirect(
@@ -3475,7 +3474,6 @@ impl State {
                 false,
             )
         });
-        list.flush_barriers();
         // SAFETY: open list with the emulated compute pipeline bound,
         // generated indirect arguments, and `output` in UAV state.
         unsafe {
@@ -3501,7 +3499,6 @@ impl State {
             why("prepare emulated mesh graphics failed");
             return false;
         }
-        list.flush_barriers();
         self.mesh_scissor(list, true);
         // SAFETY: open list with the unpack graphics pipeline bound and
         // generated draw arguments at offset 16.
