@@ -68,7 +68,6 @@ pub struct Bools {
 
 /// The tables below have small integer keys; SipHash dominated run time.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-type Set<T> = HashSet<T, BuildHasherDefault<Fx>>;
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
@@ -144,17 +143,14 @@ impl Bools {
     }
 
     fn vars(&self, b: Bool) -> Vec<u32> {
-        let mut seen = Set::default();
-        let mut has_var = vec![false; self.atoms.len()];
-        let mut vars = Vec::new();
-        let mut stack = vec![b];
+        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
             let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v == TERMINAL || !seen.insert(b) {
+            if v == TERMINAL || seen.contains(&b) {
                 continue;
             }
-            if !has_var[v as usize] {
-                has_var[v as usize] = true;
+            seen.push(b);
+            if !vars.contains(&v) {
                 vars.push(v);
             }
             stack.extend([lo, hi]);
@@ -197,13 +193,7 @@ impl Bools {
         }
     }
 
-    fn ite(&mut self, mut f: Bool, mut g: Bool, mut h: Bool) -> Bool {
-        if f == g {
-            g = Bool::TRUE;
-        }
-        if f == h {
-            h = Bool::FALSE;
-        }
+    fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -212,14 +202,6 @@ impl Bools {
         }
         if (g, h) == (Bool::TRUE, Bool::FALSE) {
             return f;
-        }
-        if self.overflow {
-            return Bool::FALSE;
-        }
-        if h == Bool::FALSE && f > g {
-            std::mem::swap(&mut f, &mut g);
-        } else if g == Bool::TRUE && f > h {
-            std::mem::swap(&mut f, &mut h);
         }
         if let Some(&r) = self.memo.get(&(f, g, h)) {
             return r;
@@ -350,139 +332,16 @@ impl Bools {
         found
     }
 
-    /// The `Bool` representing `atom` if it exists in this table.
-    pub(crate) fn var_bool(&self, atom: Atom) -> Option<Bool> {
-        let &v = self.ids.get(&atom)?;
-        self.unique.get(&(v, Bool::FALSE, Bool::TRUE)).copied()
-    }
-
-    /// Whether some lane can satisfy every `(b, holds)` of `all` at once,
-    /// enforcing equivalence groups over atoms (`(atom, group, inverted)`)
-    /// and checking `leaf_ok` on any surviving leaf assignment.
-    pub(crate) fn meet_with_facts(
-        &self,
-        all: &[(Bool, bool)],
-        equiv: &[(Atom, usize, bool)],
-        groups_len: usize,
-        leaf_ok: impl Fn(&[(Atom, bool)]) -> bool,
-    ) -> bool {
-        let mut var_equiv = Map::default();
-        for &(atom, group, inv) in equiv {
-            if let Some(&v) = self.ids.get(&atom) {
-                var_equiv.insert(v, (group, inv));
-            }
-        }
-        let mut budget = MAX_MEET;
-        let mut groups = vec![None; groups_len];
-        let mut assigned = Vec::new();
-        self.meet_facts_in(
-            all.to_vec(),
-            &mut budget,
-            &var_equiv,
-            &mut groups,
-            &mut assigned,
-            &leaf_ok,
-        )
-    }
-
-    fn meet_facts_in<F: Fn(&[(Atom, bool)]) -> bool>(
-        &self,
-        mut all: Vec<(Bool, bool)>,
-        budget: &mut usize,
-        var_equiv: &Map<u32, (usize, bool)>,
-        groups: &mut [Option<bool>],
-        assigned: &mut Vec<(Atom, bool)>,
-        leaf_ok: &F,
-    ) -> bool {
-        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
-        if all.iter().any(fails) {
-            return false;
-        }
-        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        if *budget == 0 {
-            return true;
-        }
-        if all.is_empty() {
-            return leaf_ok(assigned);
-        }
-        *budget -= 1;
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        let atom = self.atoms[v as usize];
-        let track_atom = matches!(atom, Atom::Lane(_));
-
-        let values = match var_equiv.get(&v).copied() {
-            Some((g, inv)) => match groups[g] {
-                Some(gval) => [Some(gval ^ inv), None],
-                None => [Some(false), Some(true)],
-            },
-            None => [Some(false), Some(true)],
-        };
-
-        for value in values.into_iter().flatten() {
-            let set_group = match var_equiv.get(&v).copied() {
-                Some((g, inv)) if groups[g].is_none() => {
-                    groups[g] = Some(value ^ inv);
-                    Some(g)
-                }
-                _ => None,
-            };
-            let next = all
-                .iter()
-                .map(|&(b, holds)| {
-                    let (lo, hi) = self.split(b, v);
-                    (if value { hi } else { lo }, holds)
-                })
-                .collect();
-            if track_atom {
-                assigned.push((atom, value));
-            }
-            let ok = self.meet_facts_in(next, budget, var_equiv, groups, assigned, leaf_ok);
-            if track_atom {
-                assigned.pop();
-            }
-            if let Some(g) = set_group {
-                groups[g] = None;
-            }
-            if ok {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn implies(&self, a: Bool, b: Bool) -> bool {
-        fn check(bools: &Bools, a: Bool, b: Bool, memo: &mut Map<(Bool, Bool), bool>) -> bool {
-            if a == Bool::FALSE || b == Bool::TRUE || a == b {
-                return true;
-            }
-            if a == Bool::TRUE || b == Bool::FALSE {
-                return false;
-            }
-            if let Some(&r) = memo.get(&(a, b)) {
-                return r;
-            }
-            let v = bools.nodes[a.0 as usize].0.min(bools.nodes[b.0 as usize].0);
-            let ((a0, a1), (b0, b1)) = (bools.split(a, v), bools.split(b, v));
-            let r = check(bools, a0, b0, memo) && check(bools, a1, b1, memo);
-            memo.insert((a, b), r);
-            r
-        }
-
-        if a == Bool::FALSE || b == Bool::TRUE || a == b {
-            return true;
-        }
-        if a == Bool::TRUE || b == Bool::FALSE {
-            return false;
-        }
-        check(self, a, b, &mut Map::default())
+    fn implies(&mut self, a: Bool, b: Bool) -> bool {
+        let nb = self.not(b);
+        self.and(a, nb) == Bool::FALSE
     }
 
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
         let (v, lo, hi) = self.nodes[b.0 as usize];
-        if v == TERMINAL || self.overflow {
+        if v == TERMINAL {
             return b;
         }
         if let Some(&r) = memo.get(&b) {
@@ -494,112 +353,6 @@ impl Bools {
             self.or(lo, hi)
         } else {
             self.mk(v, lo, hi)
-        };
-        memo.insert(b, r);
-        r
-    }
-
-    /// For each atom index, the value `known` decides it to, if any.
-    /// Empty when `known` forces no atom.
-    fn forced(&self, known: Bool) -> Vec<Option<bool>> {
-        let n = self.atoms.len();
-        if known == Bool::TRUE || n == 0 {
-            return Vec::new();
-        }
-        if known == Bool::FALSE {
-            return vec![Some(true); n];
-        }
-        let mut seen = Set::default();
-        let mut stack = vec![known];
-        let mut skip_diff = vec![0i32; n + 1];
-        let mut can_false = vec![false; n];
-        let mut can_true = vec![false; n];
-
-        let root_var = self.nodes[known.0 as usize].0 as usize;
-        if root_var > 0 {
-            skip_diff[0] += 1;
-            skip_diff[root_var] -= 1;
-        }
-
-        while let Some(u) = stack.pop() {
-            let (v, lo, hi) = self.nodes[u.0 as usize];
-            if v == TERMINAL || !seen.insert(u) {
-                continue;
-            }
-            let v = v as usize;
-            if lo != Bool::FALSE {
-                can_false[v] = true;
-                let lo_var = self.nodes[lo.0 as usize].0;
-                let end = if lo_var == TERMINAL {
-                    n
-                } else {
-                    lo_var as usize
-                };
-                if v + 1 < end {
-                    skip_diff[v + 1] += 1;
-                    skip_diff[end] -= 1;
-                }
-                stack.push(lo);
-            }
-            if hi != Bool::FALSE {
-                can_true[v] = true;
-                let hi_var = self.nodes[hi.0 as usize].0;
-                let end = if hi_var == TERMINAL {
-                    n
-                } else {
-                    hi_var as usize
-                };
-                if v + 1 < end {
-                    skip_diff[v + 1] += 1;
-                    skip_diff[end] -= 1;
-                }
-                stack.push(hi);
-            }
-        }
-
-        let mut out = Vec::with_capacity(n);
-        let mut skipped = 0i32;
-        let mut any = false;
-        for ((&diff, &f), &t) in skip_diff[..n].iter().zip(&can_false).zip(&can_true) {
-            skipped += diff;
-            let val = if skipped == 0 && f != t {
-                any = true;
-                Some(t)
-            } else {
-                None
-            };
-            out.push(val);
-        }
-        if !any {
-            out.clear();
-        }
-        out
-    }
-
-    fn restrict_many(
-        &mut self,
-        b: Bool,
-        forced: &[Option<bool>],
-        memo: &mut Map<Bool, Bool>,
-    ) -> Bool {
-        if forced.is_empty() || self.overflow {
-            return b;
-        }
-        let (bv, lo, hi) = self.nodes[b.0 as usize];
-        if bv == TERMINAL {
-            return b;
-        }
-        if let Some(&r) = memo.get(&b) {
-            return r;
-        }
-        let r = match forced[bv as usize] {
-            Some(true) => self.restrict_many(hi, forced, memo),
-            Some(false) => self.restrict_many(lo, forced, memo),
-            None => {
-                let l = self.restrict_many(lo, forced, memo);
-                let h = self.restrict_many(hi, forced, memo);
-                self.mk(bv, l, h)
-            }
         };
         memo.insert(b, r);
         r
@@ -638,162 +391,6 @@ impl Bools {
     }
 }
 
-/// Non-mutating overlay over [`Bools`] for building path conditions in
-/// lowering without mutating [`Structured`]. Caps extra nodes and falls back
-/// to `Bool::TRUE` (conservatively reachable) on overflow.
-pub(crate) struct BoolSet<'a> {
-    base: &'a Bools,
-    extra: Vec<(u32, Bool, Bool)>,
-    unique: Map<(u32, Bool, Bool), Bool>,
-    memo: Map<(Bool, Bool, Bool), Bool>,
-    forget_memo: Map<(Bool, usize), Bool>,
-    overflow: bool,
-}
-
-const MAX_OVERLAY_NODES: usize = 1 << 16;
-
-impl<'a> BoolSet<'a> {
-    pub(crate) fn new(base: &'a Bools) -> Self {
-        BoolSet {
-            base,
-            extra: Vec::new(),
-            unique: Map::default(),
-            memo: Map::default(),
-            forget_memo: Map::default(),
-            overflow: false,
-        }
-    }
-
-    fn node(&self, b: Bool) -> (u32, Bool, Bool) {
-        let base_len = self.base.nodes.len();
-        let idx = b.0 as usize;
-        if idx < base_len {
-            self.base.nodes[idx]
-        } else {
-            self.extra[idx - base_len]
-        }
-    }
-
-    fn mk(&mut self, v: u32, lo: Bool, hi: Bool) -> Bool {
-        if self.overflow {
-            return Bool::TRUE;
-        }
-        if lo == hi {
-            return lo;
-        }
-        let base_len = self.base.nodes.len();
-        if (lo.0 as usize) < base_len
-            && (hi.0 as usize) < base_len
-            && let Some(&b) = self.base.unique.get(&(v, lo, hi))
-        {
-            return b;
-        }
-        if let Some(&b) = self.unique.get(&(v, lo, hi)) {
-            return b;
-        }
-        if self.extra.len() >= MAX_OVERLAY_NODES {
-            self.overflow = true;
-            return Bool::TRUE;
-        }
-        let b = Bool((base_len + self.extra.len()) as u32);
-        self.extra.push((v, lo, hi));
-        self.unique.insert((v, lo, hi), b);
-        b
-    }
-
-    fn split(&self, b: Bool, v: u32) -> (Bool, Bool) {
-        match self.node(b) {
-            (bv, lo, hi) if bv == v => (lo, hi),
-            _ => (b, b),
-        }
-    }
-
-    fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
-        if self.overflow {
-            return Bool::TRUE;
-        }
-        if f == Bool::TRUE || g == h {
-            return g;
-        }
-        if f == Bool::FALSE {
-            return h;
-        }
-        if (g, h) == (Bool::TRUE, Bool::FALSE) {
-            return f;
-        }
-        if let Some(&r) = self.memo.get(&(f, g, h)) {
-            return r;
-        }
-        let top = |b: Bool| self.node(b).0;
-        let v = top(f).min(top(g)).min(top(h));
-        let ((f0, f1), (g0, g1), (h0, h1)) = (self.split(f, v), self.split(g, v), self.split(h, v));
-        let lo = self.ite(f0, g0, h0);
-        let hi = self.ite(f1, g1, h1);
-        let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
-        r
-    }
-
-    pub(crate) fn and(&mut self, a: Bool, b: Bool) -> Bool {
-        self.ite(a, b, Bool::FALSE)
-    }
-
-    pub(crate) fn or(&mut self, a: Bool, b: Bool) -> Bool {
-        self.ite(a, Bool::TRUE, b)
-    }
-
-    pub(crate) fn not(&mut self, a: Bool) -> Bool {
-        match a {
-            Bool::FALSE if !self.overflow => Bool::TRUE,
-            Bool::TRUE if !self.overflow => Bool::FALSE,
-            _ => self.ite(a, Bool::FALSE, Bool::TRUE),
-        }
-    }
-
-    /// Existentially quantifies atoms born at `from` or later (loop back edges).
-    pub(crate) fn forget(&mut self, b: Bool, from: usize) -> Bool {
-        if self.overflow {
-            return Bool::TRUE;
-        }
-        let (v, lo, hi) = self.node(b);
-        if v == TERMINAL {
-            return b;
-        }
-        if let Some(&r) = self.forget_memo.get(&(b, from)) {
-            return r;
-        }
-        let lo = self.forget(lo, from);
-        let hi = self.forget(hi, from);
-        let r = if self.base.born[v as usize] >= from {
-            self.or(lo, hi)
-        } else {
-            self.mk(v, lo, hi)
-        };
-        self.forget_memo.insert((b, from), r);
-        r
-    }
-
-    /// Condition under which a lane takes edge `q -> b`.
-    pub(crate) fn edge(&mut self, st: &Structured, q: usize, b: usize) -> Bool {
-        let mut c = st.reach[q];
-        if let LaneExit::Branch {
-            when,
-            taken,
-            not_taken,
-        } = st.exits[q]
-            && taken != not_taken
-        {
-            let branch = if b == taken { when } else { self.not(when) };
-            c = self.and(c, branch);
-        }
-        c
-    }
-
-    pub(crate) fn sat(&mut self, a: Bool, b: Bool) -> bool {
-        self.overflow || self.and(a, b) != Bool::FALSE
-    }
-}
-
 /// How a lane leaves a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneExit {
@@ -825,9 +422,6 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
-    /// Lane masks not derived from EXEC or VALU results (constants, opaque
-    /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
-    pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -1194,56 +788,39 @@ impl<'a> Lanes<'a> {
         }
         let blocks = &self.p.blocks;
         let b = &mut self.b;
-        let mut guards = Vec::with_capacity(blocks.len());
-        let mut exits = Vec::with_capacity(blocks.len());
-        let mut restrict_memo = Map::default();
-
-        for (n, block) in blocks.iter().enumerate() {
-            let reach = cond[n];
-            let forced = b.forced(reach);
-            restrict_memo.clear();
-            let mut last_exec: Option<(Bool, Option<Bool>)> = None;
-            let block_guards = block
-                .insts
-                .iter()
-                .zip(&execs[n])
-                .map(|(inst, exec)| match (exec, &inst.fields) {
-                    (None, _)
-                    | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => None,
-                    (&Some(e), _) => {
-                        if let Some((prev, guard)) = last_exec
-                            && prev == e
-                        {
-                            return guard;
-                        }
-                        let guard = if b.implies(reach, e) {
+        let guards = blocks
+            .iter()
+            .enumerate()
+            .map(|(n, block)| {
+                block
+                    .insts
+                    .iter()
+                    .zip(&execs[n])
+                    .map(|(inst, exec)| match (exec, &inst.fields) {
+                        (None, _)
+                        | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
-                        } else {
-                            Some(b.restrict_many(e, &forced, &mut restrict_memo))
-                        };
-                        last_exec = Some((e, guard));
-                        guard
-                    }
-                })
-                .collect();
-            guards.push(block_guards);
-            let exit = match block.exit {
+                        }
+                        (&Some(e), _) if b.implies(cond[n], e) => None,
+                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                    })
+                    .collect()
+            })
+            .collect();
+        let exits = blocks
+            .iter()
+            .enumerate()
+            .map(|(n, block)| match block.exit {
                 Exit::Jump(t) => LaneExit::Jump(t),
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
                 Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.restrict_many(
-                        self.when[n].unwrap_or(Bool::FALSE),
-                        &forced,
-                        &mut restrict_memo,
-                    ),
+                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
                     taken,
                     not_taken,
                 },
-            };
-            exits.push(exit);
-        }
-
+            })
+            .collect();
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
@@ -1263,18 +840,13 @@ impl<'a> Lanes<'a> {
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
-            other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
                 .keys()
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 {
-                self.masks
-            } else {
-                Map::default()
-            },
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
@@ -1675,23 +1247,10 @@ impl<'a> Lanes<'a> {
                     let e = exec.unwrap_or(Bool::TRUE);
                     let own = self.b.given(m, e);
                     if self.b.implies(m, e)
-                        && self
-                            .b
-                            .support(own)
-                            .iter()
-                            .all(|a| matches!(a, Atom::Uniform(_)))
+                        && self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
                     {
                         self.scc_lane.insert(scc, own);
                     }
-                }
-                // `s_bcnt1` of a mask: SCC is "some lane is set", as for a
-                // mask operation.
-                if takes_mask
-                    && name.strip_prefix("s_bcnt1_i32_b") == Some(width)
-                    && let (Some(scc), [a]) = (inst.write(Reg::Scc), &src[..])
-                    && let Some((m, _)) = self.operand(inst, a)
-                {
-                    self.scc_lane.insert(scc, m);
                 }
             }
             Fields::Valu(v) => {
@@ -1806,38 +1365,25 @@ impl<'a> Lanes<'a> {
     fn paths(&mut self) -> Result<Vec<Bool>, ShaderError> {
         let n = self.p.blocks.len();
         let mut cond = vec![Bool::FALSE; n];
-        let mut dirty = vec![false; n];
         if let Some(&entry) = self.order.first() {
             cond[entry] = Bool::TRUE;
-            for s in self.p.blocks[entry].exit.successors() {
-                dirty[s] = true;
-            }
         }
-        let mut forget_memo = Map::default();
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;
             for i in 1..self.order.len() {
                 let s = self.order[i];
-                if !dirty[s] {
-                    continue;
-                }
-                dirty[s] = false;
                 let mut c = Bool::FALSE;
                 for k in 0..self.incoming[s].len() {
                     let (q, taken) = self.incoming[s][k];
                     let mut e = self.edge(cond[q], q, taken);
-                    if i <= self.index[q] && e != Bool::FALSE && e != Bool::TRUE {
-                        forget_memo.clear();
-                        e = self.b.forget(e, i, &mut forget_memo);
+                    if i <= self.index[q] {
+                        e = self.b.forget(e, i, &mut Map::default());
                     }
                     c = self.b.or(c, e);
                 }
                 if c != cond[s] {
                     cond[s] = c;
                     changed = true;
-                    for next in self.p.blocks[s].exit.successors() {
-                        dirty[next] = true;
-                    }
                 }
             }
             if self.b.overflow {
@@ -1885,89 +1431,6 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
-    }
-
-    fn eval(bools: &Bools, b: Bool, bits: u32) -> bool {
-        match bools.node(b) {
-            None => b == Bool::TRUE,
-            Some((Atom::Constant(idx), lo, hi)) => {
-                eval(bools, if (bits >> idx) & 1 != 0 { hi } else { lo }, bits)
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn forced_implies_and_restrict_many_match_truth_table() {
-        let mut b = Bools::new();
-        let a = [0, 1, 2, 3].map(|i| b.atom(Atom::Constant(i), i as usize));
-        let na0 = b.not(a[0]);
-        let na3 = b.not(a[3]);
-
-        let target = {
-            let p = b.or(a[0], a[1]);
-            let q = b.xor(a[2], a[3]);
-            b.and(p, q)
-        };
-        let cases = [
-            Bool::FALSE,
-            Bool::TRUE,
-            b.and(a[0], a[2]),
-            {
-                let l = b.and(a[0], a[1]);
-                let r = b.and(na0, a[2]);
-                b.or(l, r)
-            },
-            {
-                let t = b.and(a[0], a[1]);
-                let l = b.and(t, a[2]);
-                let r = b.and(na0, a[2]);
-                b.or(l, r)
-            },
-            {
-                let x = b.xor(a[0], a[1]);
-                b.and(x, na3)
-            },
-        ];
-
-        for known in cases {
-            let forced = b.forced(known);
-            let reduced = b.restrict_many(target, &forced, &mut Map::default());
-            for (i, &var) in a.iter().enumerate() {
-                let nvar = b.not(var);
-                let imp_t = (0..16u32).all(|bits| !eval(&b, known, bits) || eval(&b, var, bits));
-                let imp_f = (0..16u32).all(|bits| !eval(&b, known, bits) || eval(&b, nvar, bits));
-                assert_eq!(b.implies(known, var), imp_t);
-                assert_eq!(b.implies(known, nvar), imp_f);
-                let expected = if imp_t {
-                    Some(true)
-                } else if imp_f {
-                    Some(false)
-                } else {
-                    None
-                };
-                assert_eq!(forced.get(i).copied().flatten(), expected);
-            }
-            for bits in 0..16u32 {
-                if eval(&b, known, bits) {
-                    assert_eq!(eval(&b, reduced, bits), eval(&b, target, bits));
-                }
-            }
-            assert_eq!(
-                b.implies(known, target),
-                (0..16u32).all(|bits| !eval(&b, known, bits) || eval(&b, target, bits))
-            );
-        }
-    }
-
-    #[test]
-    fn meet_detects_direct_contradictions() {
-        let mut b = Bools::new();
-        let a = b.atom(Atom::Constant(0), 0);
-        let c = b.atom(Atom::Constant(1), 1);
-        let f = b.xor(a, c);
-        assert!(!b.meet(&[(f, true), (f, false)]));
-        assert!(b.meet(&[(f, true), (f, true)]));
     }
 
     /// The search of [`Bools::meet`] with every case split made anew, as it

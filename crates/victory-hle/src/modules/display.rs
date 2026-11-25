@@ -5,7 +5,7 @@
 use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
 };
 
 /// HDR mode; asked for with this interface id since 2020.
@@ -36,7 +36,7 @@ pub const CAPTURE_PROVIDER: Guid = Guid::new(
     0x4485,
     [0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27],
 );
-/// As Grand Theft Auto VI (2026) asks for it; it calls 0x28 (take a
+/// As the title (2026) asks for it; it calls 0x28 (take a
 /// screenshot) with the public API's arguments.
 pub const CAPTURE_IID_2026: Guid = Guid::new(
     0x22e6_72d7,
@@ -104,7 +104,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
         return hr;
     }
-    super::xgameruntime::put(out, request)
+    put(out, request)
 }
 
 #[cfg(windows)]

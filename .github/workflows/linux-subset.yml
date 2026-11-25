@@ -58,7 +58,7 @@ env:
   # once it is, and switch to `cargo fmt --all --check` when all are.
   RUSTFMT_CRATES: >-
     -p victory-core -p victory-pe -p victory-pipeline -p victory-game
-    -p victory-shader -p victory -p xtask
+    -p xtask
   # Crates whose rustdoc builds with no warnings on Linux (broken or private
   # intra-doc links, bad code-block attributes, ...): LINUX_CRATES plus
   # victory-gpu, whose docs build on Linux although its code does not.

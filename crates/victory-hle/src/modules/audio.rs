@@ -12,7 +12,7 @@
 //! Mixed audio leaves through the host's WASAPI, which titles and
 //! middleware reach through COM like on PC. fmod's console build sets up
 //! the coprocessor inside `System_Create` and waits there for its first
-//! command to be acknowledged; Grand Theft Auto VI uses only XMA contexts.
+//! command to be acknowledged; the title uses only XMA contexts.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -114,6 +114,11 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
+    // The big ones are named in the log: they are the title's audio memory
+    // given out of our allocator, which the memory line counts as ours.
+    if size >= 32 << 20 {
+        tracing::info!(mb = size >> 20, at = ?ptr, "audio memory for the title from our allocator");
+    }
     Some((ptr, apu))
 }
 
@@ -492,10 +497,9 @@ impl Xma {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) = (
-                self.context(index),
-                &mut *lock(&self.voices[index as usize]),
-            ) {
+            if let (Some(context), Some(voice)) =
+                (self.context(index), &mut *lock(&self.voices[index as usize]))
+            {
                 pump(context, voice);
                 active += 1;
             }
@@ -644,10 +648,7 @@ fn dump_input(index: u32, context: Context) {
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(
-        dir.join(format!("{n:02}-{index}.xma")),
-        input.unwrap_or_default(),
-    );
+    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill

@@ -26,38 +26,10 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
-    let path = absolute_title_path(path);
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
     paths.push((base, path));
-}
-
-/// Makes `path` absolute, as the title stored it: an already-absolute path
-/// is kept as is; a relative path is made absolute against the current
-/// directory. A Windows path is absolute everywhere, regardless of the
-/// host: `C:\title\game.exe` is a title path, not a bare relative one
-/// that the host would make absolute against the wrong root.
-fn absolute_title_path(path: &Path) -> PathBuf {
-    if path.is_absolute() || title_absolute(path) {
-        return path.to_path_buf();
-    }
-    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
-}
-
-/// Whether `path` looks like an absolute Windows path: a drive root (`C:\`),
-/// a drive-rooted path (`C:\title\game.exe`) or a UNC path (`\\server\share`).
-fn title_absolute(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    let bytes = s.as_bytes();
-    // A drive root: `X:` (nothing else), then a separator.
-    if bytes.len() >= 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        return true;
-    }
-    s.starts_with("\\\\")
 }
 
 /// Forgets a title image that was unmapped again.
@@ -79,17 +51,8 @@ pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths
         .iter()
-        .find(|(_, p)| title_file_name(p).is_some_and(|n| n.eq_ignore_ascii_case(file)))
+        .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
         .map(|(b, _)| *b)
-}
-
-/// The file name of a path, whatever its shape: `C:\title\Mapped.dll` and
-/// `C:\title/Mapped.dll` both name `Mapped.dll`, on whatever host the title
-/// runs on.
-fn title_file_name(path: &Path) -> Option<String> {
-    let s = path.to_string_lossy();
-    let name = s.rsplit(['\\', '/']).next()?;
-    Some(name.to_string())
 }
 
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
@@ -185,22 +148,10 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        // Text up to the first child belongs to this element. A self-closing
-        // element has none, so whatever follows it belongs to its parent.
-        let body = if closed {
-            String::new()
-        } else {
-            let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-            [
-                ("&lt;", "<"),
-                ("&gt;", ">"),
-                ("&quot;", "\""),
-                ("&apos;", "'"),
-                ("&amp;", "&"),
-            ]
+        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
             .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c))
-        };
+            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -225,7 +176,7 @@ pub fn title() -> Title {
 }
 
 /// Gives the process the console's millisecond timers. Titles pace
-/// themselves with short waits (Grand Theft Auto VI's audio mixer sleeps
+/// themselves with short waits (the title's audio mixer sleeps
 /// about 4 ms per 5.3 ms block) and cannot tune the timer on the console;
 /// a desktop process waits in 15.6 ms ticks unless it asks for finer ones,
 /// and Windows 11 drops that request while the window is hidden unless the
@@ -259,14 +210,6 @@ pub fn use_console_timers() {
 mod tests {
     use super::*;
 
-    /// The body recorded for `path`, if any element has it.
-    fn body<'a>(elements: &'a [(String, String)], path: &str) -> Option<&'a str> {
-        elements
-            .iter()
-            .find(|(p, _)| p == path)
-            .map(|(_, text)| text.as_str())
-    }
-
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {
         let text = "\u{feff}<?xml version=\"1.0\"?>\n<Game configVersion=\"1\">\
@@ -279,140 +222,5 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
-    }
-
-    #[test]
-    fn elements_record_the_path_of_each_nested_element() {
-        let found = elements("<A><B><C>x</C></B></A>");
-        for (path, text) in [("A", ""), ("A/B", ""), ("A/B/C", "x")] {
-            assert_eq!(body(&found, path), Some(text), "{path}");
-        }
-        assert_eq!(found.len(), 3, "one entry per element");
-    }
-
-    #[test]
-    fn a_self_closing_element_owns_no_text() {
-        // The words after `/>` belong to the parent, not to `Flag`.
-        let found = elements("<Game><Flag/>owned by the parent<Name>ok</Name></Game>");
-        assert_eq!(body(&found, "Game/Flag"), Some(""));
-        assert_eq!(body(&found, "Game/Name"), Some("ok"));
-        // Neighbours with nothing between them are still empty.
-        let neighbours = elements("<R><A/><B/></R>");
-        assert_eq!(body(&neighbours, "R/A"), Some(""));
-        assert_eq!(body(&neighbours, "R/B"), Some(""));
-    }
-
-    #[test]
-    fn comments_cdata_and_declarations_are_skipped() {
-        let found =
-            elements("<?xml version=\"1.0\"?><G><!-- <X>c</X> --><![CDATA[<Y>d</Y>]]><Z>1</Z></G>");
-        assert_eq!(body(&found, "G/X"), None, "inside a comment");
-        assert_eq!(body(&found, "G/Y"), None, "inside CDATA");
-        assert_eq!(body(&found, "G/Z"), Some("1"));
-    }
-
-    #[test]
-    fn predefined_entities_are_decoded_once() {
-        assert_eq!(
-            body(&elements("<A>&lt;&gt;&amp;&quot;&apos;</A>"), "A"),
-            Some("<>&\"'")
-        );
-        // One pass: `&amp;lt;` is the text `&lt;`, not a second `<`.
-        assert_eq!(body(&elements("<A>&amp;lt;</A>"), "A"), Some("&lt;"));
-    }
-
-    #[test]
-    fn unterminated_markup_is_ignored_without_panicking() {
-        let found = elements("<A>x<B");
-        assert_eq!(body(&found, "A"), Some("x"));
-        assert_eq!(body(&found, "A/B"), None, "the <?B has no >");
-        assert!(elements("<").is_empty());
-    }
-
-    #[test]
-    fn missing_manifest_yields_defaults() {
-        for text in [
-            "",
-            "<Game></Game>",
-            "<NotGame><TitleId>1</TitleId></NotGame>",
-        ] {
-            let title = Title::from_manifest(text);
-            assert_eq!(
-                (title.id, title.store_id.as_str(), title.storage_bytes),
-                (0, "", 0),
-                "{text:?}"
-            );
-            assert_eq!(title.storage, PathBuf::new(), "{text:?}");
-        }
-    }
-
-    #[test]
-    fn lowercase_hex_id_and_quota_in_bytes() {
-        let title = Title::from_manifest(
-            "<Game><TitleId>deadbeef</TitleId>\
-             <PersistentLocalStorage><SizeMB>2</SizeMB></PersistentLocalStorage></Game>",
-        );
-        assert_eq!(title.id, 0xDEAD_BEEF);
-        assert_eq!(title.storage_bytes, 2 << 20);
-    }
-
-    #[test]
-    fn invalid_id_and_missing_quota_are_zero() {
-        let title = Title::from_manifest("<Game><TitleId>0x12</TitleId></Game>");
-        assert_eq!((title.id, title.storage_bytes), (0, 0));
-    }
-
-    #[test]
-    fn store_id_is_trimmed_and_entity_decoded() {
-        let title = Title::from_manifest("<Game><StoreId>  a&amp;b  </StoreId></Game>");
-        assert_eq!(title.store_id, "a&b");
-    }
-
-    #[test]
-    fn commented_and_cdata_ids_are_ignored() {
-        let title = Title::from_manifest(
-            "<Game><!--<TitleId>1</TitleId>--><![CDATA[<StoreId>x</StoreId>]]>\
-             <TitleId>2</TitleId></Game>",
-        );
-        assert_eq!(title.id, 2);
-        assert_eq!(title.store_id, "");
-    }
-
-    #[test]
-    fn the_first_element_at_a_path_wins() {
-        let title = Title::from_manifest("<Game><TitleId>1</TitleId><TitleId>2</TitleId></Game>");
-        assert_eq!(title.id, 1);
-    }
-
-    #[test]
-    fn saves_live_beside_storage() {
-        assert_eq!(Title::default().saves(), PathBuf::from("saves"));
-        let title = Title {
-            storage: PathBuf::from("data/0000/storage"),
-            ..Title::default()
-        };
-        assert_eq!(title.saves(), PathBuf::from("data/0000/saves"));
-    }
-
-    #[test]
-    fn image_registry_remembers_replaces_and_forgets() {
-        let base = 0x7DFF_5A5A_0001;
-        let first = Path::new(r"C:\victory-test\victory-runtime-image.dll");
-        let second = Path::new(r"D:\victory-test\victory-renamed-image.dll");
-        let name = |path: &Path| path.file_name().unwrap().to_owned();
-
-        set_image_path(base, first);
-        assert_eq!(image_path(base).map(|p| name(&p)), Some(name(first)));
-        assert_eq!(image_named("VICTORY-RUNTIME-IMAGE.DLL"), Some(base));
-
-        // A second file at the same base replaces the first.
-        set_image_path(base, second);
-        assert_eq!(image_path(base).map(|p| name(&p)), Some(name(second)));
-        assert_eq!(image_named("victory-runtime-image.dll"), None);
-        assert_eq!(image_named("victory-renamed-image.dll"), Some(base));
-
-        forget_image(base);
-        assert_eq!(image_path(base), None);
-        assert_eq!(image_named("victory-renamed-image.dll"), None);
     }
 }

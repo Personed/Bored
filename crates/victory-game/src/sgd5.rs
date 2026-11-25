@@ -8,7 +8,7 @@
 //! ```
 
 pub const MAGIC: &[u8; 4] = b"SGD5";
-pub const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
+const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
 /// Containers are at most a few MiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: usize = 64 << 20;
 
@@ -29,20 +29,54 @@ pub struct Record<'a> {
 impl Record<'_> {
     /// The container, or `None` if the stream is corrupt.
     pub fn unpack(&self) -> Option<Vec<u8>> {
-        miniz_oxide::inflate::decompress_to_vec_with_limit(self.packed, self.unpacked_size)
-            .ok()
-            .filter(|out| out.len() == self.unpacked_size)
+        let mut state = zlib_rs::Inflate::new(false, 15);
+        let mut out = Vec::new();
+        let (mut in_pos, mut out_pos) = (0usize, 0usize);
+        loop {
+            if out_pos == self.unpacked_size {
+                let mut extra = [0u8; 1];
+                let status = state
+                    .decompress(
+                        &self.packed[in_pos..],
+                        &mut extra,
+                        zlib_rs::InflateFlush::NoFlush,
+                    )
+                    .ok()?;
+                return (status == zlib_rs::Status::StreamEnd
+                    && state.total_out() as usize == self.unpacked_size)
+                    .then_some(out);
+            }
+            if out_pos == out.len() {
+                let next_len = if out.is_empty() {
+                    self.unpacked_size
+                        .min(self.packed.len().saturating_mul(4).max(4096))
+                } else {
+                    out.len().saturating_mul(2).min(self.unpacked_size)
+                };
+                out.resize(next_len, 0);
+            }
+            let status = state
+                .decompress(
+                    &self.packed[in_pos..],
+                    &mut out[out_pos..],
+                    zlib_rs::InflateFlush::NoFlush,
+                )
+                .ok()?;
+            let next_in = state.total_in() as usize;
+            let next_out = state.total_out() as usize;
+            match status {
+                zlib_rs::Status::StreamEnd => {
+                    out.truncate(next_out);
+                    return (next_out == self.unpacked_size).then_some(out);
+                }
+                zlib_rs::Status::Ok if next_in != in_pos || next_out != out_pos => {
+                    in_pos = next_in;
+                    out_pos = next_out;
+                }
+                zlib_rs::Status::Ok | zlib_rs::Status::BufError => return None,
+            }
+        }
     }
-}
-
-/// Record size from the marker onwards. The header starts four bytes
-/// before the marker and includes the unpacked size.
-pub fn encoded_len(header: &[u8; 16]) -> Option<usize> {
-    let n = u32::from_le_bytes(header[..4].try_into().expect("four bytes"));
-    let again = u32::from_le_bytes(header[8..12].try_into().expect("four bytes"));
-    let unpacked = u32::from_le_bytes(header[12..].try_into().expect("four bytes")) as usize;
-    (header[4..8] == MARKER && n == again && n >= 12 && unpacked <= MAX_UNPACKED)
-        .then_some(n as usize)
 }
 
 /// An SGD5 file, or a file holding one (an archive: records are found by
@@ -56,20 +90,22 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     memchr::memmem::find_iter(file, &MARKER).filter_map(|at| record(file, at))
 }
 
-/// Reads a record at a known marker offset in the supplied slice.
-pub fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
-    let header: &[u8; 16] = file
-        .get(at.checked_sub(4)?..at.checked_add(12)?)?
-        .try_into()
-        .ok()?;
-    let n = encoded_len(header)?;
-    let unpacked_size = u32::from_le_bytes(header[12..].try_into().expect("four bytes")) as usize;
+fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
+    let u32_at = |o: usize| {
+        file.get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
+    };
+    let n = u32_at(at.checked_sub(4)?)?;
+    let unpacked_size = u32_at(at + 8)?;
+    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
+        return None;
+    }
     let nul = at.checked_sub(6)?;
     Some(Record {
         offset: at,
         name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
         kind: file[at - 5],
-        packed: file.get(at + 12..at.checked_add(n)?)?,
+        packed: file.get(at + 12..at + n)?,
         unpacked_size,
     })
 }
@@ -91,7 +127,13 @@ mod tests {
     use super::*;
 
     fn record_bytes(name: &str, kind: u8, payload: &[u8]) -> Vec<u8> {
-        let packed = miniz_oxide::deflate::compress_to_vec(payload, 6);
+        let mut buf = vec![0u8; zlib_rs::compress_bound(payload.len())];
+        let config = zlib_rs::DeflateConfig {
+            window_bits: -15,
+            ..zlib_rs::DeflateConfig::new(6)
+        };
+        let (packed, rc) = zlib_rs::compress_slice(&mut buf, payload, config);
+        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
         let n = (packed.len() + 12) as u32;
         let mut out = vec![0xF4, 0x01, 0, 0, name.len() as u8 + 1];
         out.extend_from_slice(name.as_bytes());
@@ -99,7 +141,7 @@ mod tests {
         for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        out.extend_from_slice(&packed);
+        out.extend_from_slice(packed);
         out
     }
 
@@ -140,5 +182,37 @@ mod tests {
         file[27] = 0xFF; // first packed byte: reserved block type
         let r = records(&file).next().unwrap();
         assert_eq!(r.unpack(), None);
+    }
+
+    #[test]
+    fn handles_empty_and_rejects_mismatched_or_truncated_streams() {
+        let empty = record_bytes("CS_empty", 0x3c, &[]);
+        assert_eq!(records(&empty).next().unwrap().unpack(), Some(Vec::new()));
+
+        let payload: Vec<u8> = (0..16_384u32)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 5)) as u8)
+            .collect();
+        let good = record_bytes("PS_big", 0x32, &payload);
+        let r = records(&good).next().unwrap();
+        assert_eq!(r.unpack(), Some(payload.clone()));
+
+        // Oversized stream (declared unpacked_size smaller than actual output).
+        let mut smaller = good.clone();
+        smaller[r.offset + 8..r.offset + 12]
+            .copy_from_slice(&((payload.len() - 1) as u32).to_le_bytes());
+        assert_eq!(records(&smaller).next().unwrap().unpack(), None);
+
+        // Under-filled stream (declared unpacked_size larger than actual output).
+        let mut larger = good.clone();
+        larger[r.offset + 8..r.offset + 12]
+            .copy_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
+        assert_eq!(records(&larger).next().unwrap().unpack(), None);
+
+        // Truncated raw deflate stream.
+        let mut truncated = good[..good.len() - 1].to_vec();
+        let new_n = (truncated.len() - r.offset) as u32;
+        truncated[r.offset - 4..r.offset].copy_from_slice(&new_n.to_le_bytes());
+        truncated[r.offset + 4..r.offset + 8].copy_from_slice(&new_n.to_le_bytes());
+        assert_eq!(records(&truncated).next().unwrap().unpack(), None);
     }
 }

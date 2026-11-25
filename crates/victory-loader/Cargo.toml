@@ -14,7 +14,6 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 blake3.workspace = true
-hex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -25,6 +24,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Performance",
     "Win32_System_Threading",
 ] }
 

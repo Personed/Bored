@@ -15,15 +15,9 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(windows)]
-mod address_map;
-#[cfg(windows)]
-mod breadcrumb;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
-#[cfg(windows)]
-mod copy_pool;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
@@ -37,15 +31,13 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
-pub mod list;
 #[cfg(windows)]
-mod mesh_emu;
+mod inplace;
+pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod profile;
 pub mod query;
 pub mod queue;
 pub mod resource;
@@ -54,6 +46,8 @@ pub mod root;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+#[cfg(windows)]
+mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
@@ -65,4 +59,8 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{set_alias_lookup, title_memory_remapped, writing as kernel_will_write};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use watch::{
+    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+};

@@ -35,7 +35,6 @@
 //!             mask, u8 attribute (v_interp `attr`), u8 default, u8 second
 //!             row (of a packed pair), u8 parameter slot, u8 flags (bit 0
 //!             flat, 1 linear, 3 fp16, 4 fp16 packed); E+0x124 u32 count
-//!     E+0x128 u32 SPI_SHADER_PGM_RSRC2_PS
 //!     E+0x134 u32 SPI_PS_INPUT_ADDR, E+0x138 u32 DB_SHADER_CONTROL
 //!     E+0x148 u32 export patch size (dwords), E+0x14c 8 patches, one per
 //!             MRT: u32 code offset (dwords, -1 none), then the export code
@@ -103,7 +102,6 @@ const ENTRY_SIZE: u64 = 20;
 const MAX_SEMANTICS: u32 = 32;
 const PS_INPUTS: usize = 0x24;
 const PS_INPUT_COUNT: usize = 0x124;
-const PS_RSRC2: usize = 0x128;
 const PS_INPUT_ADDR: usize = 0x134;
 const PS_DB_SHADER_CONTROL: usize = 0x138;
 const PS_PATCH_SIZE: usize = 0x148;
@@ -262,8 +260,6 @@ pub enum StageIo {
     },
     Ps {
         inputs: Vec<PsInput>,
-        /// `SPI_SHADER_PGM_RSRC2_PS`: user SGPRs and enabled hardware SGPRs.
-        rsrc2: u32,
         /// `SPI_PS_INPUT_ADDR`: which system values arrive in VGPRs.
         input_addr: u32,
         /// `DB_SHADER_CONTROL`: depth export, kill.
@@ -272,33 +268,6 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
-}
-
-impl StageIo {
-    /// How many general SGPRs (`s0..`) the hardware initializes on entry, when
-    /// the stage's `PGM_RSRC2` register is read. Registers at or above this
-    /// count hold whatever the previous wave left.
-    pub fn initialized_sgprs(&self) -> Option<u8> {
-        match self {
-            Self::Cs(cs) => Some(cs.initialized_sgprs()),
-            Self::Ps { rsrc2, .. } => Some(ps_initialized_sgprs(*rsrc2)),
-            _ => None,
-        }
-    }
-}
-
-/// SGPRs the hardware initializes for a pixel shader from
-/// `SPI_SHADER_PGM_RSRC2_PS`: user SGPRs (bits 1-5, plus bit 28 as MSB),
-/// `prim_mask` (always present), `wave_cnt` (bit 7), POPS collision wave id
-/// (bit 25), intrawave collisions (bit 26), and the scratch wave offset
-/// (bit 0).
-pub fn ps_initialized_sgprs(rsrc2: u32) -> u8 {
-    let user = ((rsrc2 >> 1) & 0x1F) | (((rsrc2 >> 28) & 1) << 5);
-    let scratch = rsrc2 & 1;
-    let wave_cnt = (rsrc2 >> 7) & 1;
-    let pops_collision = (rsrc2 >> 25) & 1;
-    let pops_intrawave = (rsrc2 >> 26) & 1;
-    (user + 1 + wave_cnt + pops_collision + pops_intrawave + scratch) as u8
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -477,12 +446,61 @@ fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     }
     let stream =
         bytes(blob, XBCH_HEADER as u64, packed).ok_or(Malformed("XBCH stream out of bounds"))?;
-    let out = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(stream, unpacked as usize)
-        .map_err(|_| Malformed("XBCH stream does not inflate to its stated size"))?;
-    if out.len() as u64 != unpacked {
-        return Err(Malformed("XBCH stream does not inflate to its stated size"));
-    }
+    let out = inflate_zlib_exact(stream, unpacked as usize)
+        .ok_or(Malformed("XBCH stream does not inflate to its stated size"))?;
     Ok(out)
+}
+
+/// Inflates a zlib stream incrementally up to `expected` bytes, rejecting
+/// truncated, corrupt, under-filled, or oversized streams without eagerly
+/// allocating the full declared size up front.
+fn inflate_zlib_exact(source: &[u8], expected: usize) -> Option<Vec<u8>> {
+    let mut state = zlib_rs::Inflate::new(true, 15);
+    let mut out = Vec::new();
+    let (mut in_pos, mut out_pos) = (0usize, 0usize);
+    loop {
+        if out_pos == expected {
+            let mut extra = [0u8; 1];
+            let status = state
+                .decompress(
+                    &source[in_pos..],
+                    &mut extra,
+                    zlib_rs::InflateFlush::NoFlush,
+                )
+                .ok()?;
+            return (status == zlib_rs::Status::StreamEnd
+                && state.total_out() as usize == expected)
+                .then_some(out);
+        }
+        if out_pos == out.len() {
+            let next_len = if out.is_empty() {
+                expected.min(source.len().saturating_mul(4).max(4096))
+            } else {
+                out.len().saturating_mul(2).min(expected)
+            };
+            out.resize(next_len, 0);
+        }
+        let status = state
+            .decompress(
+                &source[in_pos..],
+                &mut out[out_pos..],
+                zlib_rs::InflateFlush::NoFlush,
+            )
+            .ok()?;
+        let next_in = state.total_in() as usize;
+        let next_out = state.total_out() as usize;
+        match status {
+            zlib_rs::Status::StreamEnd => {
+                out.truncate(next_out);
+                return (next_out == expected).then_some(out);
+            }
+            zlib_rs::Status::Ok if next_in != in_pos || next_out != out_pos => {
+                in_pos = next_in;
+                out_pos = next_out;
+            }
+            zlib_rs::Status::Ok | zlib_rs::Status::BufError => return None,
+        }
+    }
 }
 
 fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
@@ -636,7 +654,6 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     }
     Ok(StageIo::Ps {
         inputs,
-        rsrc2: u32_at(data, PS_RSRC2)?,
         input_addr: u32_at(data, PS_INPUT_ADDR)?,
         db_shader_control: u32_at(data, PS_DB_SHADER_CONTROL)?,
         patches,
@@ -761,12 +778,15 @@ mod tests {
     }
 
     fn xbch(unpacked: &[u8]) -> Vec<u8> {
-        let stream = miniz_oxide::deflate::compress_to_vec_zlib(unpacked, 6);
+        let mut buf = vec![0u8; zlib_rs::compress_bound(unpacked.len())];
+        let (stream, rc) =
+            zlib_rs::compress_slice(&mut buf, unpacked, zlib_rs::DeflateConfig::new(6));
+        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
         let mut out = b"XBCH".to_vec();
         out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
         out.extend_from_slice(&(stream.len() as u64).to_le_bytes());
         out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
-        out.extend_from_slice(&stream);
+        out.extend_from_slice(stream);
         out
     }
 
@@ -817,7 +837,6 @@ mod tests {
                     used: vec![],
                     io: StageIo::Ps {
                         inputs: vec![],
-                        rsrc2: 0,
                         input_addr: 0,
                         db_shader_control: 0,
                         patches: vec![],
@@ -887,7 +906,6 @@ mod tests {
         // TEXCOORD in row 1 (xy), read as attr0, flat.
         blob[e + PS_INPUTS..][..8].copy_from_slice(&[6, 1, 3, 0, 0, 0, 1, 1]);
         blob[e + PS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
-        blob[e + PS_RSRC2..][..4].copy_from_slice(&0x14u32.to_le_bytes());
         blob[e + PS_INPUT_ADDR..][..4].copy_from_slice(&2u32.to_le_bytes());
         blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&2u32.to_le_bytes());
         // MRT1 at dword 1: the 32_ABGR variant is `exp mrt1 v0-v3 done`.
@@ -899,7 +917,6 @@ mod tests {
         let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
         let StageIo::Ps {
             inputs,
-            rsrc2,
             input_addr,
             patches,
             ..
@@ -917,7 +934,7 @@ mod tests {
             pack2: false,
             row2: 0,
         };
-        assert_eq!((&inputs[..], *rsrc2, *input_addr), (&[input][..], 0x14, 2));
+        assert_eq!((&inputs[..], *input_addr), (&[input][..], 2));
         assert_eq!(patches.len(), 1);
         assert_eq!((patches[0].mrt, patches[0].offset), (1, 1));
         let patched = p.patched_code();
@@ -1015,39 +1032,6 @@ mod tests {
     }
 
     #[test]
-    fn ps_initialized_sgprs_covers_user_system_and_scratch() {
-        // 10 user SGPRs (s0..=s9) + prim_mask (s10): 11.
-        assert_eq!(ps_initialized_sgprs(10 << 1), 11);
-        // 17 user SGPRs (s0..=s16) + prim_mask (s17): 18.
-        assert_eq!(ps_initialized_sgprs(17 << 1), 18);
-        // USER_SGPR_MSB (bit 28) extends user SGPRs to 32 + prim_mask: 33.
-        assert_eq!(ps_initialized_sgprs(1 << 28), 33);
-        // Scratch (bit 0), wave_cnt (bit 7), POPS collision wave id (bit 25),
-        // and intrawave collisions (bit 26) each add one SGPR.
-        assert_eq!(ps_initialized_sgprs((10 << 1) | 1), 12);
-        assert_eq!(ps_initialized_sgprs((10 << 1) | (1 << 7)), 12);
-        assert_eq!(
-            ps_initialized_sgprs((10 << 1) | 1 | (1 << 7) | (1 << 25) | (1 << 26)),
-            15
-        );
-        // TRAP_PRESENT (bit 6), EXTRA_LDS_SIZE (8..=15), and EXCP_EN (16..=24)
-        // do not allocate general SGPRs.
-        assert_eq!(
-            ps_initialized_sgprs((10 << 1) | (1 << 6) | (0xFF << 8) | (0x1FF << 16)),
-            11
-        );
-        let ps = StageIo::Ps {
-            inputs: vec![],
-            rsrc2: 17 << 1,
-            input_addr: 0,
-            db_shader_control: 0,
-            patches: vec![],
-        };
-        assert_eq!(ps.initialized_sgprs(), Some(18));
-        assert_eq!(StageIo::None.initialized_sgprs(), None);
-    }
-
-    #[test]
     fn reads_every_native_blob() {
         let es = xbch(&fssm(&[(HwStage::Es, &VS_CODE)]));
         let vs = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
@@ -1087,5 +1071,33 @@ mod tests {
         let at = FSSM_HEADER + slot(HwStage::Ls);
         bad_record[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_record))])).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_oversized_and_bad_checksum_xbch_streams() {
+        let plain = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let good = xbch(&plain);
+        assert_eq!(unpack(&good).unwrap(), plain);
+
+        // Truncated zlib stream (drop last byte, update packed length).
+        let mut truncated = good[..good.len() - 1].to_vec();
+        let new_packed = (truncated.len() - XBCH_HEADER) as u64;
+        truncated[8..16].copy_from_slice(&new_packed.to_le_bytes());
+        assert!(unpack(&truncated).is_err());
+
+        // Stated unpacked size smaller than the inflated output.
+        let mut oversized = good.clone();
+        oversized[16..24].copy_from_slice(&((plain.len() - 1) as u64).to_le_bytes());
+        assert!(unpack(&oversized).is_err());
+
+        // Stated unpacked size larger than the inflated output.
+        let mut underfilled = good.clone();
+        underfilled[16..24].copy_from_slice(&((plain.len() + 1) as u64).to_le_bytes());
+        assert!(unpack(&underfilled).is_err());
+
+        // Corrupt Adler-32 trailer.
+        let mut bad_adler = good.clone();
+        *bad_adler.last_mut().unwrap() ^= 1;
+        assert!(unpack(&bad_adler).is_err());
     }
 }

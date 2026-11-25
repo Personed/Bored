@@ -63,8 +63,8 @@ extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
 }
 
 /// As documented: the title ends (suspended first, as on any end) and the
-/// game starts again in a new process; this never returns. Grand Theft
-/// Auto VI relaunches itself (its own path from `GetModuleFileNameA`) with
+/// game starts again in a new process; this never returns.
+/// The title relaunches itself (its own path from `GetModuleFileNameA`) with
 /// arguments from its configuration. The new `victory run` gets the same
 /// options, the new executable, and the title's arguments after `--`
 /// (the title reads the whole command line).
@@ -74,28 +74,17 @@ extern "system" fn launch_new_game(
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let (exe, args) = (
-        text(exe).unwrap_or_default(),
-        text(args).unwrap_or_default(),
-    );
+    let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
     tracing::info!(exe, args, "XLaunchNewGame");
     let current = runtime::main_image()
         .and_then(runtime::image_path)
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-    #[cfg(not(windows))]
-    let _ = command;
-    #[cfg(windows)]
     super::lifecycle::end_title(
         "XLaunchNewGame",
         Box::new(move || super::lifecycle::relaunch(command)),
     );
-    #[cfg(not(windows))]
-    {
-        let _ = &command;
-        tracing::info!("XLaunchNewGame: not implemented on this host; the title ends");
-    }
     loop {
         std::thread::park();
     }
@@ -206,32 +195,15 @@ mod tests {
 
     #[test]
     fn a_relaunch_keeps_our_options() {
-        let ours: Vec<std::ffi::OsString> = [
-            "run",
-            "G:/game.exe",
-            "--execute",
-            "--console",
-            "series-s",
-            "--",
-            "-old",
-        ]
-        .map(Into::into)
-        .into();
+        let ours: Vec<std::ffi::OsString> =
+            ["run", "G:/game.exe", "--execute", "--console", "series-s", "--", "-old"]
+                .map(Into::into)
+                .into();
         let current = std::ffi::OsStr::new("G:/game.exe");
         let again = relaunch_args(ours.clone(), current, "G:/game.exe", " -config=x  -y ");
-        let expected = [
-            "run",
-            "G:/game.exe",
-            "--execute",
-            "--console",
-            "series-s",
-            "--",
-        ];
+        let expected = ["run", "G:/game.exe", "--execute", "--console", "series-s", "--"];
         assert_eq!(again[..6], expected.map(std::ffi::OsString::from));
-        assert_eq!(
-            again[6..],
-            ["-config=x", "-y"].map(std::ffi::OsString::from)
-        );
+        assert_eq!(again[6..], ["-config=x", "-y"].map(std::ffi::OsString::from));
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");

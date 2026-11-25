@@ -37,7 +37,7 @@ Converting them ahead of time from files is only a warm-up.
 | `victory-shader` | Xbox shader containers → host shaders |
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
 | `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
+| `victory-game` | the title-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
@@ -94,26 +94,6 @@ waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
 to the per-lane load or choice that gives each lane its own (a mask's
 `v_cndmask_b32`, or an if/else whose arms each set it: traced on the paths
 the lanes take, from structurisation), and accessed with a non-uniform heap
-index in one pass. On GPUs with SM 6.6 that lack hardware mesh shaders (or with
-`VICTORY_MESH_EMULATION=1`), console mesh programs (`HwStage::Ms`) lower to a
-compute pass (`cs_6_6`) writing packed primitive indices and attributes into a
-VRAM buffer read back by a generated unpack vertex shader (`vs_6_6`). Indirect
-mesh work first runs a preparation pass over the clamped records: it compacts
-the requested groups into host dispatch/draw arguments and, for multi-record
-calls, a slot map that preserves each record-local mesh group id.
-`victory translate`
+index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
-
-An address the program computes itself (a pointer it loads, picks by
-control flow or builds) traces to no root parameter. Such accesses go
-through the address map (`victory_shader::emit::address_map`): the host
-copies of title memory sorted by address, which the shader searches, then
-reads or writes through a raw view in the descriptor heap. The ray-tracing
-passes walk the BVH this way and test each node with
-`image_bvh_intersect_ray`, which no host shader model has: the translation
-reads the node through the map and tests it as Microsoft's software model
-of the instruction does (`SoftwareBvhIntersectRay` in the XDXR traversal
-headers). Descriptor words a program reads as numbers (a buffer's address,
-say) come from a copy of the view heap in the console's layout, 32 bytes a
-slot, that the host keeps beside it.

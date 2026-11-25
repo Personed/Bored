@@ -7,20 +7,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-#[cfg(not(windows))]
-use unsupported::{Host, Validator, host};
-use victory_shader::emit;
-#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-#[cfg(windows)]
-use victory_shader::emit::validator::Validator;
+use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{Source, sources};
+use crate::shader::{MAX_FILE, Source, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -155,20 +150,6 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
-    mesh: emit::MeshMode,
-}
-
-fn mesh_mode(host: Option<&Host>) -> emit::MeshMode {
-    match std::env::var("VICTORY_MESH_EMULATION")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => emit::MeshMode::Emulate,
-        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => emit::MeshMode::Native,
-        _ if host.is_some_and(|h| !h.mesh_shaders()) => emit::MeshMode::Emulate,
-        _ => emit::MeshMode::Native,
-    }
 }
 
 pub fn run(
@@ -179,12 +160,11 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
-    // The validator and the host checks are Windows-only; on other hosts
-    // they are skipped with a note instead of failing.
-    let validate_requested = validate;
-    let pipelines_requested = pipelines;
-    let validate = validate && cfg!(windows);
-    let pipelines = pipelines && cfg!(windows);
+    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
+    // at most 32 lanes (as the runtime does on such a card).
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -193,11 +173,9 @@ pub fn run(
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
-    } else if validate_requested {
-        println!("validator    skipped (Windows only)");
     }
-    if pipelines_requested && !pipelines {
-        println!("host pipelines skipped (Windows only)");
+    if pipelines {
+        Host::new(false).map_err(anyhow::Error::msg)?;
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -205,13 +183,6 @@ pub fn run(
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
-    let probe_host = if pipelines || !pairs.is_empty() {
-        Some(Host::new(false).map_err(anyhow::Error::msg)?)
-    } else {
-        None
-    };
-    let mesh = mesh_mode(probe_host.as_ref());
-    drop(probe_host);
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -222,45 +193,37 @@ pub fn run(
             .into_iter()
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_file() {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
-            // A large archive takes multiple batches. Keep each worker's
-            // validator and D3D device across batches of the same file.
-            let mut workers = Vec::new();
-            if let Err(error) = sources(entry.path(), |jobs| {
-                let next = AtomicUsize::new(0);
-                let count = threads.min(jobs.len());
-                if workers.len() < count {
-                    workers.resize_with(count, || None);
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        let mut t = Tally {
+                            list,
+                            ..Tally::default()
+                        };
+                        let mut checks = Checks {
+                            keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            validator: validate
+                                .then(|| Validator::load(dll.as_deref()).ok())
+                                .flatten(),
+                            host: pipelines
+                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                .flatten(),
+                        };
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                        }
+                        lock(&total).merge(t);
+                    });
                 }
-                std::thread::scope(|s| {
-                    for worker in &mut workers[..count] {
-                        s.spawn(|| {
-                            let mut t = Tally {
-                                list,
-                                ..Tally::default()
-                            };
-                            let checks = worker.get_or_insert_with(|| Checks {
-                                keep: (!pairs.is_empty()).then(|| kept.clone()),
-                                validator: validate
-                                    .then(|| Validator::load(dll.as_deref()).ok())
-                                    .flatten(),
-                                host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
-                                mesh,
-                            });
-                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                translate(job, entry.path(), &seen, &mut t, checks);
-                            }
-                            lock(&total).merge(t);
-                        });
-                    }
-                });
-            }) {
-                eprintln!("could not scan {}: {error}", entry.path().display());
-            }
+            });
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -313,33 +276,22 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        // The host check is Windows-only: without a host device the
-        // pairs are not checked at all.
-        #[cfg(windows)]
-        {
-            let host = Host::new(false).map_err(anyhow::Error::msg)?;
-            let kept = lock(&kept);
-            let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-            for (v, p) in &pairs {
-                let made = match (find(v), find(p)) {
-                    (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                        if vs.mesh_emu.is_some() {
-                            host.emulated_mesh_pipelines(vs, ps).map(drop)
-                        } else {
-                            host.mesh_pipeline(vs, ps).map(drop)
-                        }
-                    } else {
-                        host.pipeline(vs, ps).map(drop)
-                    }
-                    .map(|()| "pipeline created".to_owned())
-                    .unwrap_or_else(|e| e),
-                    _ => "not emitted".to_owned(),
-                };
-                println!("pair {v} + {p}: {made}");
-            }
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let kept = lock(&kept);
+        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+        for (v, p) in &pairs {
+            let made = match (find(v), find(p)) {
+                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+                    host.mesh_pipeline(vs, ps)
+                } else {
+                    host.pipeline(vs, ps)
+                }
+                .map(|_| "pipeline created".to_owned())
+                .unwrap_or_else(|e| e),
+                _ => "not emitted".to_owned(),
+            };
+            println!("pair {v} + {p}: {made}");
         }
-        #[cfg(not(windows))]
-        println!("host pipelines skipped (Windows only)");
     }
     let mut lines = t.lines;
     lines.sort();
@@ -365,6 +317,24 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    // The hash a run's log names the shader by (`hash=` in "first bind",
+    // "shader does not translate", "host pipeline refused").
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
+    // those containers alone.
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
+        return;
+    }
+    let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -372,17 +342,61 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    // `~`: the hash of the code alone; containers that differ only around
+    // it are translated once, the others listed as duplicates of it.
+    let code = blake3::hash(dxil);
+    let code8 = code.to_hex()[..8].to_owned();
+    let example = || format!("{} ~{code8}", example());
+    // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
+    // line holds one of the texts (a name, `#hash`), as the title has them.
+    if let Ok(spec) = std::env::var("VICTORY_DUMP_MATCH")
+        && let Some((dir, texts)) = spec.split_once(';')
+    {
+        let line = example();
+        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+            let name: String = source
+                .label()
+                .chars()
+                .skip_while(|c| *c != ' ')
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(70)
+                .collect();
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+        }
+    }
+    if !lock(seen).insert(code) {
         t.duplicates += 1;
+        if t.list {
+            t.lines.push(format!("{}  duplicate", example()));
+        }
         return;
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
+    // has them (`.cdxil`), to work on a translator gap offline
+    let dump = std::env::var_os("VICTORY_FAIL_DUMP");
+    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    translate_programs(&container, programs, &example, t, checks);
+    if let (Some(dir), Some(before)) = (dump, before) {
+        for (reason, (n, _)) in &t.failed {
+            let was = before.get(reason).copied().unwrap_or(0);
+            if *n > was && was < 3 {
+                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+            }
+        }
+    }
+}
+
+fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+        match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
@@ -443,8 +457,9 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, checks.mesh) {
+                    match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
@@ -465,6 +480,51 @@ fn translate(
             }
         }
     }
+}
+
+/// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:
+/// its label, the console program's instructions by encoding class (a
+/// static count of the whole program, not of one thread's path), and the
+/// host module's instructions by kind (`emit::census::KINDS`).
+fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
+    use std::io::Write;
+    use victory_shader::gfx10::Fields;
+    static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(out) = OUT.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(Mutex::new(file))
+    }) else {
+        return;
+    };
+    let Some(census) = emit::census::take(&shader.dxil) else {
+        return;
+    };
+    // total, vector, scalar, descriptor loads, buffer and memory, image, LDS, control, other
+    let mut console = [0u32; 9];
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        console[0] += 1;
+        let k = match &inst.fields {
+            Fields::Valu(_) => 1,
+            Fields::Sop { .. } => 2,
+            Fields::Smem { .. } => 3,
+            Fields::Buffer { .. } | Fields::Flat { .. } => 4,
+            Fields::Image { .. } => 5,
+            Fields::Ds { .. } => 6,
+            Fields::Sopp { .. } => 7,
+            _ => 8,
+        };
+        console[k] += 1;
+    }
+    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    line.push('\n');
+    let _ = lock(out).write_all(line.as_bytes());
 }
 
 /// Validates an emitted shader if asked to.
@@ -494,9 +554,6 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
-            HwStage::Ms if shader.mesh_emu.is_some() => {
-                h.emulated_mesh_pipelines(&shader, stub_ps).map(drop)
-            }
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
@@ -513,14 +570,7 @@ fn check(
     let Some(v) = checks.validator.as_mut() else {
         return;
     };
-    let result = v.validate(&mut shader.dxil).and_then(|()| {
-        if let Some(emu) = &shader.mesh_emu {
-            let mut unpack = emit::unpack_vertex_shader(emu, None).map_err(|e| e.to_string())?;
-            v.validate(&mut unpack)?;
-        }
-        Ok(())
-    });
-    match result {
+    match v.validate(&mut shader.dxil) {
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
             if t.list {
@@ -586,8 +636,9 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
     t.io_raised += 1;
     for (_, i) in &r.interps {
         match i {
-            io::Interp::Interpolated { .. } | io::Interp::Weighted { .. } => t.interpolated += 1,
+            io::Interp::Interpolated { .. } => t.interpolated += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Weighted { .. } => t.interpolated += 1,
         }
     }
     for e in &r.exports {
@@ -731,75 +782,4 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// `--validate` and `--pipelines` need the host's DXIL validator and D3D12
-/// device, which only Windows has; elsewhere they refuse to start.
-#[cfg(not(windows))]
-mod unsupported {
-    use std::path::{Path, PathBuf};
-
-    use victory_shader::emit::HostShader;
-
-    const WHY: &str = "needs Windows (the host DXIL validator and D3D12)";
-
-    pub struct Validator;
-
-    impl Validator {
-        pub fn default_path() -> Option<PathBuf> {
-            None
-        }
-
-        pub fn load(_: Option<&Path>) -> Result<Self, String> {
-            Err(WHY.into())
-        }
-
-        pub fn validate(&mut self, _: &mut [u8]) -> Result<(), String> {
-            Err(WHY.into())
-        }
-    }
-
-    pub struct Host;
-
-    impl Host {
-        pub fn new(_warp: bool) -> Result<Self, String> {
-            Err(WHY.into())
-        }
-
-        pub fn mesh_shaders(&self) -> bool {
-            false
-        }
-
-        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
-            Err(WHY.into())
-        }
-
-        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
-            Err(WHY.into())
-        }
-
-        pub fn emulated_mesh_pipelines(
-            &self,
-            _: &HostShader,
-            _: &HostShader,
-        ) -> Result<(), String> {
-            Err(WHY.into())
-        }
-
-        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
-            Err(WHY.into())
-        }
-    }
-
-    pub mod host {
-        use victory_shader::emit::HostShader;
-
-        pub fn stub_ps() -> HostShader {
-            unreachable!("Host::new fails first")
-        }
-
-        pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
-            Err(super::WHY.into())
-        }
-    }
 }
