@@ -3058,7 +3058,7 @@ fn adjust_srv_for_mip_drop(srv: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, drop: u32,
 
 /// A host CBV has a 256-byte-aligned address and size.
 fn constant_desc(gpu: u64, size: u32) -> Option<D3D12_CONSTANT_BUFFER_VIEW_DESC> {
-    if gpu % 256 != 0 {
+    if !gpu.is_multiple_of(256) {
         return None;
     }
     Some(D3D12_CONSTANT_BUFFER_VIEW_DESC {
