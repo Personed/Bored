@@ -144,11 +144,8 @@ fn dxc_library() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
     use windows::core::{HSTRING, w};
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     if let Some(p) = std::env::var_os("VICTORY_DXC").map(std::path::PathBuf::from) {
-        paths.push(if p.is_dir() {
-            p.join("dxcompiler.dll")
-        } else {
-            p
-        });
+        let p = if p.is_dir() { p.join("dxcompiler.dll") } else { p };
+        paths.push(std::fs::canonicalize(&p).unwrap_or(p));
     }
     if let Some(dir) = victory_shader::emit::validator::Validator::default_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))

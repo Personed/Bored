@@ -71,8 +71,8 @@ pub(crate) struct Buffers {
     pub(crate) indirect_args_gpu: u64,
     pub(crate) dummy_srv: ID3D12Resource,
     pub(crate) dummy_srv_gpu: u64,
-    prep_root: ID3D12RootSignature,
-    prep_pso: ID3D12PipelineState,
+    prep_root: Option<ID3D12RootSignature>,
+    prep_pso: Option<ID3D12PipelineState>,
 }
 
 // SAFETY: D3D12 resources, root signatures, and pipeline states are free-threaded.
@@ -197,9 +197,10 @@ fn make() -> Option<Buffers> {
     let (dummy_srv, dummy_ptr) = host.upload_buffer(256)?;
     // SAFETY: `dummy_ptr` points to 256 writable bytes of the live upload buffer.
     unsafe { std::ptr::write_bytes(dummy_ptr, 0, 256) };
-    let (prep_root, prep_pso) = compile_prep(&host.device)
+    let prep = compile_prep(&host.device)
         .inspect_err(|e| tracing::warn!(error = %e, "mesh_indirect_prep pipeline failed"))
-        .ok()?;
+        .ok();
+    let (prep_root, prep_pso) = (prep.as_ref().map(|p| p.0.clone()), prep.as_ref().map(|p| p.1.clone()));
     name(&output, || format!("mesh emu output {output_bytes:#x}"));
     name(&slot_map, || "mesh emu slot_map".into());
     name(&indirect_args, || "mesh emu indirect_args".into());
@@ -252,7 +253,10 @@ impl Buffers {
         max_records: u32,
         max_primitives: u32,
         group_cap: u32,
-    ) {
+    ) -> bool {
+        let (Some(prep_root), Some(prep_pso)) = (&self.prep_root, &self.prep_pso) else {
+            return false;
+        };
         let l = &list.list;
         let build_map = max_records > 1;
         let constants = [
@@ -267,8 +271,8 @@ impl Buffers {
         // the submission.
         unsafe {
             l.ResourceBarrier(&[uav_barrier()]);
-            l.SetComputeRootSignature(&self.prep_root);
-            l.SetPipelineState(&self.prep_pso);
+            l.SetComputeRootSignature(prep_root);
+            l.SetPipelineState(prep_pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, args_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu.unwrap_or(args_gpu));
@@ -291,5 +295,6 @@ impl Buffers {
                 l.ResourceBarrier(&[args_barrier]);
             }
         }
+        true
     }
 }

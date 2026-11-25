@@ -3163,7 +3163,7 @@ impl State {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || made_rects || p.rects) && !p.compute && !p.mesh
             }
-            MESH => !p.compute && p.mesh && p.mesh_emu.is_none(),
+            MESH => !p.compute && p.mesh,
             DISPATCH => p.compute,
             _ => false,
         };
@@ -3368,6 +3368,10 @@ impl State {
         counter: Option<(&std::sync::Arc<crate::shadow::Shadow>, u64)>,
         why: &dyn Fn(&str),
     ) -> bool {
+        if mesh_test() == 1 || !mesh_kept(self.pipeline) {
+            why("mesh draws are switched off (VICTORY_MESH_TEST)");
+            return false;
+        }
         if stride < 12 {
             why("indirect mesh stride smaller than 12 bytes");
             return false;
@@ -3398,7 +3402,7 @@ impl State {
         if let Some((s, at)) = counter {
             s.refresh(list, at, 4);
         }
-        buffers.prepare_indirect(
+        if !buffers.prepare_indirect(
             list,
             args.gpu(arguments),
             count_gpu,
@@ -3406,7 +3410,10 @@ impl State {
             max,
             emu_pipe.emu.max_primitives,
             group_cap,
-        );
+        ) {
+            why("no mesh indirect preparation pipeline");
+            return false;
+        }
         list.keep(&buffers.indirect_args);
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -3481,6 +3488,7 @@ impl State {
         }
         // SAFETY: open list with the unpack graphics pipeline bound and
         // generated draw arguments at offset 16.
+        self.mesh_scissor(list, true);
         unsafe {
             list.list
                 .ExecuteIndirect(&draw_sig, 1, &buffers.indirect_args, 16, None, 0);
@@ -3490,6 +3498,7 @@ impl State {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             )]);
         }
+        self.mesh_scissor(list, false);
         finish_indirect(list);
         self.restore_mesh_emu_state(list);
         DRAWN.fetch_add(1, Ordering::Relaxed);
