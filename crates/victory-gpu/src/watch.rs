@@ -553,6 +553,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } else {
         ask(j, kfirst, klast)
     };
+    // The wide asking answered: the whole allocation is covered. The narrow
+    // retry's answer covers only the range asked.
+    let wide = answer.is_some() && (kfirst, klast) != (first, last);
     if answer.is_none() && !known_view && (kfirst, klast) != (first, last) {
         // The allocation was not one watched range after all (or is gone):
         // just ours, and look it up again next time.
@@ -599,10 +602,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    if answer.is_some() && (kfirst, klast) != (first, last) {
-        // A whole allocation asked: its other buffers answer from the
-        // journal for the rest of the submission instead of scanning it
-        // whole once a flush each (under Wine, about 1 ms a scan).
+    if wide && j.kept {
+        // A whole allocation asked while a submission's batch asking
+        // stands: its other buffers answer from the journal for the rest of
+        // the submission instead of scanning it whole once a flush each
+        // (under Wine, about 1 ms a scan). Only then: the coverage dies with
+        // the batch at `ask_once_end` — outside a submission it would go
+        // stale with nothing to end it.
         j.ahead.push((kfirst, klast));
         j.ahead_asked = now;
     }
