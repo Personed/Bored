@@ -420,7 +420,7 @@ mod gpu {
             0x0004_0E02,
             0x3402_0084, // v_lshlrev_b32 v1, 4, v0
             0xE078_1000,
-            0x8003_0201, // DIAGNOSTIC buffer_store_dwordx4 v[2:5], v1, s[12:15], 0 offen
+            0x8003_0E01, // buffer_store_dwordx4 v[14:17], v1, s[12:15], 0 offen
             0xBF81_0000, // s_endpgm
         ];
         let names: Vec<_> =
@@ -579,12 +579,14 @@ mod gpu {
                 continue;
             };
             for (sort, ij) in [(true, true), (false, true)] {
+                // Heap slot 1 holds the nodes from title address BVH on.
+                // Set before `build`: the hook fires while the DXIL is
+                // lowered, not at dispatch time.
+                TEST_MEMORY.set(Some((1, BVH)));
                 let shader = build(sort, ij);
                 let (root, pso) = host
                     .compute_pipeline(&shader)
                     .unwrap_or_else(|e| panic!("{label}: {e}"));
-                // Heap slot 1 holds the nodes from title address BVH on.
-                TEST_MEMORY.set(Some((1, BVH)));
                 let out = host
                     .dispatch(
                         &root,
