@@ -94,6 +94,7 @@ mod image_atomic_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 mod lower;
+pub mod mesh_compute;
 #[cfg(test)]
 mod mtbuf_tests;
 mod own_bits;
