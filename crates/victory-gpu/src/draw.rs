@@ -3375,8 +3375,7 @@ impl State {
         counter: Option<(&std::sync::Arc<crate::shadow::Shadow>, u64)>,
         why: &dyn Fn(&str),
     ) -> bool {
-        // The mesh preparation pass reuses this list's indirect scratch
-        // buffer, so discard any cached window that may alias it.
+        // A non-windowed indirect call ends any cached run of clamped draws.
         self.window = None;
         if mesh_test() == 1 || !mesh_kept(self.pipeline) {
             why("mesh draws are switched off (VICTORY_MESH_TEST)");
@@ -3386,10 +3385,9 @@ impl State {
             why("indirect mesh stride smaller than 12 bytes");
             return false;
         }
-        if max > crate::mesh_emu::MAX_INDIRECT_RECORDS {
-            why("indirect mesh record count exceeds the emulation safety limit");
-            return false;
-        }
+        // Bound CPU/GPU preparation work without rejecting a sparse call
+        // whose API maximum exceeds the slot-map capacity.
+        let record_count = max.min(crate::mesh_emu::MAX_INDIRECT_RECORDS);
         let Some(emu_pipe) = &p.mesh_emu else {
             return false;
         };
@@ -3412,33 +3410,33 @@ impl State {
             why("count not 4-byte aligned");
             return false;
         }
-        args.refresh(list, arguments, len);
-        let count_arg = counter.as_ref().map(|(s, at)| {
-            s.refresh(list, *at, 4);
-            (&s.buffer, s.offset(*at))
-        });
-        let Some(bounded) = crate::indirect::bound(
-            list,
-            (&args.buffer, args.offset(arguments)),
-            count_arg,
-            (10, stride, max),
-        ) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        let Some(budget_gpu) = list.budget() else {
+            why("indirect mesh work budget unavailable");
             return false;
         };
-        // SAFETY: `bounded` is the live scratch resource returned by `bound`.
-        let bounded_gpu = unsafe { bounded.GetGPUVirtualAddress() };
+        if !stride.is_multiple_of(4)
+            || u64::from(stride) * u64::from(record_count) > u64::from(u32::MAX)
+            || !args.gpu(arguments).is_multiple_of(4)
+        {
+            why("indirect mesh arguments are unaligned or exceed the shader address range");
+            return false;
+        }
+        let refresh_len =
+            len.min(u64::from(stride) * u64::from(record_count.max(1)));
+        args.refresh(list, arguments, refresh_len);
+        if let Some((s, at)) = counter {
+            s.refresh(list, at, 4);
+        }
         if !buffers.prepare_indirect(
             list,
-            &bounded,
-            bounded_gpu,
+            args.gpu(arguments),
             count_gpu,
+            budget_gpu,
             stride,
-            max,
+            record_count,
             emu_pipe.emu.max_primitives,
             group_cap,
         ) {
-            crate::indirect::done(list, &bounded);
             why("no mesh indirect preparation pipeline");
             return false;
         }

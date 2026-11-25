@@ -4,7 +4,7 @@
 //! compute, writing packed primitive indices and attributes into `output`.
 //! Its generated vertex shader then reads that memory by `SV_VertexID` and
 //! feeds the title's pixel shader. Indirect mesh dispatches first run a
-//! tiny preparation pass that sums the clamped group counts, builds a slot
+//! tiny preparation pass that sums the bounded group counts, builds a slot
 //! map across indirect records, and writes host dispatch/draw arguments.
 
 use std::sync::OnceLock;
@@ -22,8 +22,8 @@ const INDIRECT_ARGS_BYTES: u64 = 256;
 pub(crate) const MAX_INDIRECT_RECORDS: u32 = 65_535;
 const OUTPUT_FALLBACK_SIZES: &[u64] = &[128 << 20, 64 << 20, 32 << 20, 16 << 20];
 
-const PREP_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
+pub(crate) const PREP_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3), UAV(u4)"
 cbuffer Info : register(b0) {
     uint stride;
     uint max_records;
@@ -32,12 +32,13 @@ cbuffer Info : register(b0) {
     uint has_count;
     uint build_map;
 };
-// The inputs are unordered views only so same-submission GPU writes need no
-// SRV transition; this pass reads them and never stores to either.
+// The source arguments and count use the UAV state also used by title
+// compute producers; this pass does not store to them.
 RWByteAddressBuffer args : register(u0);
 RWByteAddressBuffer count_buf : register(u1);
 RWByteAddressBuffer out_args : register(u2);
 RWByteAddressBuffer slot_map : register(u3);
+RWByteAddressBuffer budget : register(u4);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
@@ -59,6 +60,22 @@ void main() {
         }
         total += take;
     }
+    bool over = false;
+    uint cost = total * 128u;
+    if (cost > 0) {
+        uint before;
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < (1u << 27)) {
+            uint next = ((1u << 27) - before <= cost) ? (1u << 27) : (before + cost);
+            uint prev;
+            budget.InterlockedCompareExchange(0, before, next, prev);
+            if (prev == before) break;
+            before = prev;
+        }
+        over = before >= (1u << 27) || (1u << 27) - before < cost;
+    }
+    if (over) total = 0;
     out_args.Store4(0, uint4(total, 1, 1, 0));
     out_args.Store4(16, uint4(total * max_primitives * 3, 1, 0, 0));
 }
@@ -242,18 +259,17 @@ impl Buffers {
         (self.output_bytes / u64::from(group_bytes.max(4))).min(65_535) as u32
     }
 
-    /// Sums a bounded `INDIRECT_ARGUMENT` scratch buffer into host dispatch
-    /// and draw arguments, clamped to one output-buffer chunk. Returns the
-    /// source to `COMMON`; when several records can run, `slot_map` maps each
-    /// compacted group to its group inside its record.
+    /// Compacts indirect mesh groups into host dispatch and draw arguments,
+    /// charges only the groups that fit in the output-buffer chunk, and writes
+    /// each compacted group's record-local id to `slot_map`.
     /// Leaves `indirect_args` in `INDIRECT_ARGUMENT` and `slot_map` readable.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_indirect(
         &self,
         list: &HostList,
-        args: &ID3D12Resource,
         args_gpu: u64,
         count_gpu: Option<u64>,
+        budget_gpu: u64,
         stride: u32,
         max_records: u32,
         max_primitives: u32,
@@ -262,6 +278,17 @@ impl Buffers {
         let (Some(prep_root), Some(prep_pso)) = (&self.prep_root, &self.prep_pso) else {
             return false;
         };
+        if max_records > MAX_INDIRECT_RECORDS
+            || group_cap == 0
+            || stride < 12
+            || !stride.is_multiple_of(4)
+            || u64::from(stride) * u64::from(max_records) > u64::from(u32::MAX)
+            || !args_gpu.is_multiple_of(4)
+            || count_gpu.is_some_and(|gpu| !gpu.is_multiple_of(4))
+            || !budget_gpu.is_multiple_of(4)
+        {
+            return false;
+        }
         let l = &list.list;
         let build_map = max_records > 1;
         let constants = [
@@ -272,15 +299,10 @@ impl Buffers {
             u32::from(count_gpu.is_some()),
             u32::from(build_map),
         ];
-        let args_to_uav = transition(
-            args,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        );
         // SAFETY: an open list; all GPU addresses name live buffers kept for
         // the submission.
         unsafe {
-            l.ResourceBarrier(&[uav_barrier(), args_to_uav]);
+            l.ResourceBarrier(&[uav_barrier()]);
             l.SetComputeRootSignature(prep_root);
             l.SetPipelineState(prep_pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -288,16 +310,12 @@ impl Buffers {
             l.SetComputeRootUnorderedAccessView(2, count_gpu.unwrap_or(args_gpu));
             l.SetComputeRootUnorderedAccessView(3, self.indirect_args_gpu);
             l.SetComputeRootUnorderedAccessView(4, self.slot_map_gpu);
+            l.SetComputeRootUnorderedAccessView(5, budget_gpu);
             l.Dispatch(1, 1, 1);
             let args_barrier = transition(
                 &self.indirect_args,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            );
-            let source_barrier = transition(
-                args,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COMMON,
             );
             if build_map {
                 let map_barrier = transition(
@@ -305,9 +323,9 @@ impl Buffers {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 );
-                l.ResourceBarrier(&[args_barrier, map_barrier, source_barrier]);
+                l.ResourceBarrier(&[uav_barrier(), args_barrier, map_barrier]);
             } else {
-                l.ResourceBarrier(&[args_barrier, source_barrier]);
+                l.ResourceBarrier(&[uav_barrier(), args_barrier]);
             }
         }
         true
