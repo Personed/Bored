@@ -5,7 +5,7 @@
 //! (`cs_6_6`) with the console's `[numthreads(threads, 1, 1)]` and LDS, writing
 //! packed primitive indices, per-vertex attributes (`OSG1`), and per-primitive
 //! attributes (`PSG1`) into a fixed-stride per-group slice of a raw UAV buffer
-//! at `u0, space 2` ([`MESH_EMU_SPACE`]):
+//! at `u0, space 2` ([`super::shader::MESH_EMU_SPACE`]):
 //!
 //! ```text
 //! group g (byte offset = g * group_bytes):
