@@ -2455,25 +2455,43 @@ void main() {
         host.execute(&[&list]);
         list.reset();
 
-        // After reset, requests up to the grown high-water mark reuse `b3` with
-        // zero new allocations; the buffer decayed to common when the
-        // submission ran.
+        // After reset, the grown buffer is no longer the first list's
+        // private allocation: a second list asking for the same size receives
+        // that very buffer from the shared pool. Holding `b3` here makes a
+        // coincidental raw-pointer reuse impossible.
         assert_eq!(
             list.indirect_state(&b3),
             D3D12_RESOURCE_STATE_COMMON,
             "a reset list starts with a common scratch buffer"
         );
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        assert_eq!(
-            b4.as_raw(),
-            b3.as_raw(),
-            "grown scratch buffer must persist across reset"
-        );
-        assert_eq!(list.indirect_state(&b4), args);
-        list.close();
+        let Ok(other) = host.new_list() else {
+            return;
+        };
+        let b4 = bound(&other, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        if crate::host::indirect_pool() {
+            assert_eq!(
+                b4.as_raw(),
+                b3.as_raw(),
+                "grown scratch buffer must be handed to another list"
+            );
+        } else {
+            assert_ne!(
+                b4.as_raw(),
+                b3.as_raw(),
+                "without the pool the first list keeps its grown scratch"
+            );
+            let retained = list.indirect_scratch(5000 * 20).unwrap();
+            assert_eq!(
+                retained.as_raw(),
+                b3.as_raw(),
+                "without the pool reset must keep the first list's grown scratch"
+            );
+        }
+        assert_eq!(other.indirect_state(&b4), args);
+        other.close();
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
-        host.execute(&[&list]);
-        list.reset();
+        host.execute(&[&other]);
+        other.reset();
     }
 
     /// A group charges its records in lane order: with 300 left of the
