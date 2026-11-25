@@ -502,7 +502,7 @@ impl State {
         &mut self,
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
-        keys: Vec<KeyState>,
+        mut keys: Vec<KeyState>,
         mouse: MouseState,
     ) -> Vec<Event> {
         let now = now();
@@ -528,6 +528,18 @@ impl State {
         }
         let fallback = (!using_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
+        if let Some(last) = self.slots[KEYBOARD].history.back()
+            && let Value::Keys(previous) = &last.value
+        {
+            // GameInput appends new presses and removes released keys in place.
+            // Stable sorting keeps simultaneous new presses in host poll order.
+            keys.sort_by_key(|k| {
+                previous
+                    .iter()
+                    .position(|p| p.scan_code == k.scan_code && p.virtual_key == k.virtual_key)
+                    .unwrap_or(usize::MAX)
+            });
+        }
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -1072,26 +1084,33 @@ extern "system" fn key_count(this: *const Reading) -> u32 {
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
-    let Value::Keys(keys) = &reading(this).value else {
-        return 0;
-    };
-    if out.is_null() {
+    if out.is_null() || count == 0 {
         return 0;
     }
+    let keys: &[KeyState] = match &reading(this).value {
+        Value::Keys(keys) => keys,
+        Value::Pad(_) => &[],
+    };
     let n = keys.len().min(count as usize);
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
+    if n < count as usize {
+        // SAFETY: the slot after the last key is inside the caller's array.
+        unsafe { out.add(n).write(KeyState::default()) };
+    }
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
-        Value::Pad(state) if !out.is_null() => {
-            // SAFETY: checked non-null.
-            unsafe { out.write(*state) };
-            true
-        }
-        _ => false,
+    if out.is_null() {
+        return false;
     }
+    let (state, valid) = match &reading(this).value {
+        Value::Pad(state) => (*state, true),
+        Value::Keys(_) => (PadState::default(), false),
+    };
+    // SAFETY: checked non-null; the caller supplies a gamepad state.
+    unsafe { out.write(state) };
+    valid
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
@@ -1416,11 +1435,32 @@ mod host {
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        active_scripted_keys(keys, start.elapsed())
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn active_scripted_keys(keys: &[(Duration, u8)], now: Duration) -> Vec<u8> {
+        let mut down = Vec::new();
+        for &(at, vk) in keys {
+            if now
+                .checked_sub(at)
+                .is_some_and(|age| age < Duration::from_millis(200))
+                && !down.contains(&vk)
+            {
+                down.push(vk);
+            }
+        }
+        down
+    }
+
+    #[test]
+    fn overlapping_scripted_presses_hold_one_key_until_both_end() {
+        let ms = Duration::from_millis;
+        let keys = [(ms(0), b'W'), (ms(50), b'A'), (ms(100), b'W')];
+        assert_eq!(active_scripted_keys(&keys, ms(100)), b"WA");
+        assert_eq!(active_scripted_keys(&keys, ms(249)).len(), 2);
+        assert_eq!(active_scripted_keys(&keys, ms(250)), b"W");
+        assert!(active_scripted_keys(&keys, ms(300)).is_empty());
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1678,6 +1718,38 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_reading_clears_previous_gamepad_state() {
+        let (hub, _) = fake();
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let mut state = PadState {
+            buttons: A,
+            left_trigger: 1.0,
+            ..Default::default()
+        };
+        assert!(!gamepad_state(r, &mut state));
+        assert_eq!(state, PadState::default());
+        release(r);
+    }
+
+    #[test]
+    fn key_state_terminates_a_reused_buffer() {
+        let (hub, host) = fake();
+        host.lock().unwrap().keys = vec![key(b'W')];
+        hub.poll();
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let mut got = [key(b'A'); 2];
+        assert_eq!(key_state(r, 1, got.as_mut_ptr()), 1);
+        assert_eq!(got, [key(b'W'), key(b'A')]);
+        assert_eq!(key_state(r, 2, got.as_mut_ptr()), 1);
+        assert_eq!(got, [key(b'W'), KeyState::default()]);
+        release(r);
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(key_state(r, 2, got.as_mut_ptr()), 0);
+        assert_eq!(got[0], KeyState::default());
+        release(r);
+    }
+
+    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1711,6 +1783,52 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn keyboard_readings_keep_held_keys_in_press_order() {
+        let (hub, host) = fake();
+        let poll = |down: &[u8]| {
+            host.lock().unwrap().keys = down.iter().copied().map(key).collect();
+            hub.poll();
+            current(hub, KEYBOARD_KIND, KEYBOARD).unwrap()
+        };
+        let read_keys = |reading, capacity| {
+            let state = slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(
+                reading, 0x78,
+            );
+            let mut keys = [KeyState::default(); 3];
+            let count = state(reading, capacity, keys.as_mut_ptr()) as usize;
+            keys[..count]
+                .iter()
+                .map(|key| key.virtual_key)
+                .collect::<Vec<_>>()
+        };
+        let sequence = |reading| {
+            let get = slot::<extern "system" fn(*const Reading, u32) -> u64, _>(reading, 0x20);
+            get(reading, KEYBOARD_KIND)
+        };
+
+        let w = poll(b"W");
+        let wa = poll(b"AW");
+        let reordered = poll(b"WA");
+        let wad = poll(b"ADW");
+        let ad = poll(b"AD");
+        let adw = poll(b"ADW");
+
+        assert_ne!(sequence(w), sequence(wa));
+        assert_eq!(sequence(reordered), sequence(wa));
+        // Retained readings keep their original key state even after later polls.
+        assert_eq!(read_keys(w, 3), b"W");
+        assert_eq!(read_keys(wa, 3), b"WA");
+        assert_eq!(read_keys(wad, 3), b"WAD");
+        assert_eq!(read_keys(wad, 2), b"WA");
+        assert_eq!(read_keys(ad, 3), b"AD");
+        assert_eq!(read_keys(adw, 3), b"ADW");
+
+        for reading in [w, wa, reordered, wad, ad, adw] {
+            release(reading);
+        }
     }
 
     #[test]
