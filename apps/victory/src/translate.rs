@@ -197,6 +197,11 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let counts = [const { AtomicUsize::new(0) }; 5];
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            // Past the deadline the workers break out at once: walking and
+            // opening the rest of the assets would only scan for nothing.
+            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
+                break;
+            }
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }

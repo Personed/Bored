@@ -87,12 +87,41 @@ fn build() -> [u8; 32] {
 /// the run will have (`victory_shader::emit::translation_fingerprint`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
+    // The translation depends on the view-index cap as at runtime.
+    crate::descriptor::host::probe_view_limit();
     let ran = AtomicBool::new(false);
+    // The mode the runtime translates with on this machine: an emulated
+    // mesh shader's cache entry is another key than the native one's, so a
+    // warm-up in only the native mode left emulation hardware (no mesh
+    // shader support) to translate every mesh program on first use. Only a
+    // mesh program's container keys by it: everything else translates in
+    // the native mode whatever the host (`pipeline::translate`).
+    let mesh = if container_is_mesh(container)
+        && crate::host::host().is_some_and(crate::host::Host::emulate_mesh_shaders)
+    {
+        MeshMode::Emulate
+    } else {
+        MeshMode::Native
+    };
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        victory_shader::emit::translate_with(c, mesh).map_err(|e| e.to_string())
     };
-    cached(cache, &build(), MeshMode::Native, container, translate).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, &build(), mesh, container, translate).map(|_| ran.load(Ordering::Relaxed))
+}
+
+/// Whether the container's program is a mesh program: the only stage the
+/// mesh mode keys and translates differently.
+fn container_is_mesh(container: &[u8]) -> bool {
+    let Ok(c) = victory_shader::Container::parse(container) else {
+        return false;
+    };
+    let Some(dxil) = c.part(victory_shader::FourCC::DXIL) else {
+        return false;
+    };
+    victory_shader::native_programs(dxil.data)
+        .map(|ps| ps.iter().any(|p| p.stage == victory_shader::HwStage::Ms))
+        .unwrap_or(false)
 }
 
 /// The translation of a console shader container, from the cache when
@@ -147,9 +176,18 @@ fn cached(
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => {
+                // A cache that cannot write (a full or read-only disk) must
+                // not cost the shader: the translation is the same work the
+                // converter just did, returned uncached instead of dropping
+                // every draw of the program for the rest of the run.
+                tracing::debug!("shader cache write failed ({e:#}); the shader is not cached");
+                MISSES.fetch_add(1, Ordering::Relaxed);
+                return (converter.translate)(container);
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
