@@ -98,16 +98,11 @@ fn build() -> &'static [u8; BUILD_LEN] {
 }
 
 /// The translation of a console shader container, from the cache when
-/// there is one, with native mesh output.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    host_shader_with(container, MeshMode::Native)
-}
-
+/// there is one.
 /// The translation of a console shader container in `mesh` mode. Native and
 /// emulated mesh translations use separate converter ids: the same console
 /// container has two independent cache entries.
-#[allow(dead_code)]
-pub(crate) fn host_shader_with(container: &[u8], mesh: MeshMode) -> Result<HostShader, String> {
+pub(crate) fn host_shader(container: &[u8], mesh: MeshMode) -> Result<HostShader, String> {
     let id = match mesh {
         MeshMode::Native => "shader.dxil",
         MeshMode::Emulate => "shader.dxil.mesh-emu",

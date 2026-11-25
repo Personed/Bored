@@ -339,14 +339,18 @@ pub(crate) fn log_removal_context() {
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
-static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
-static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// The card's clock, for the frame line of every run, in microseconds since
 /// the last one: how long the card had nothing of ours queued; how much of
@@ -480,12 +484,15 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// host sides of title lists the title made and has not used (a host list
 /// cost 0.68 MB of private memory in run 69: 431 MB for the 632 the title
 /// makes at its start).
-pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The process's private bytes (diagnostics: around the making of lists).
 #[cfg(feature = "diagnostics")]
 fn private_bytes() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
         cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
@@ -519,9 +526,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
-            ),
+            None if host.messages.is_none() => {
+                text.push_str("; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command")
+            }
             None => {}
         }
     }
@@ -619,16 +626,27 @@ fn create() -> windows::core::Result<Host> {
                 None,
                 None,
             );
-            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
+            tracing::info!(
+                ok = set.is_ok(),
+                "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)"
+            );
         }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         if device
-            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o1).cast(),
+                size_of_val(&o1) as u32,
+            )
             .is_ok()
         {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
+            tracing::info!(
+                min = o1.WaveLaneCountMin,
+                max = o1.WaveLaneCountMax,
+                "host wave lanes"
+            );
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
         let messages = debug
@@ -831,10 +849,8 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type States =
+    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -1384,7 +1400,10 @@ struct Spare<T> {
 
 impl<T> Spare<T> {
     const fn new() -> Self {
-        Spare { kept: Vec::new(), bytes: 0 }
+        Spare {
+            kept: Vec::new(),
+            bytes: 0,
+        }
     }
 
     /// A kept thing of `size` bytes, the one given last.
@@ -1914,7 +1933,13 @@ mod relay_tests {
         let (a, b) = (0x1000usize, 0x2000usize);
         // Copy a: piece 3 under two ranges, flagged under the first only;
         // piece 4 not flagged; copy b: piece 3 not flagged, piece 9 flagged.
-        let flags = [(a, 3, true), (a, 4, false), (a, 3, false), (b, 3, false), (b, 9, true)];
+        let flags = [
+            (a, 3, true),
+            (a, 4, false),
+            (a, 3, false),
+            (b, 3, false),
+            (b, 9, true),
+        ];
         let fetch = flagged_pieces(&flags);
         assert!(fetch.contains(&(a, 3)));
         assert!(!fetch.contains(&(a, 4)));
@@ -2175,9 +2200,13 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
         let mut runs_left = 512;
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans.iter().any(|(shadow, from, to)| {
+            shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
+        });
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    spans
+        .iter()
+        .any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -2479,7 +2508,11 @@ fn relay_hand_back(back: &[Declared]) {
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
-        work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+        work.extend(
+            spans
+                .into_iter()
+                .map(|(from, to)| (shadow.clone(), from, to)),
+        );
     }
     if work.is_empty() {
         return;
@@ -2491,7 +2524,10 @@ fn relay_hand_back(back: &[Declared]) {
     // that flight's landing, and the merge looks again under the lock.
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+    crate::copystat::add(
+        crate::copystat::C::BackScanUs,
+        scanning.elapsed().as_micros() as u64,
+    );
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
@@ -2608,7 +2644,10 @@ mod late_tests {
     #[test]
     fn ranges_touch_where_they_overlap() {
         let mut ranges = Vec::new();
-        join_ranges(&mut ranges, [(40, 50), (10, 20), (20, 25), (45, 60), (7, 7)]);
+        join_ranges(
+            &mut ranges,
+            [(40, 50), (10, 20), (20, 25), (45, 60), (7, 7)],
+        );
         assert_eq!(ranges, [(10, 25), (40, 60)]);
         join_ranges(&mut ranges, [(25, 40)]);
         assert_eq!(ranges, [(10, 60)]);
@@ -2705,7 +2744,9 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// runtime, the read requests that fail (with 2: every request).
 pub(crate) fn walls_trace() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2"))
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2")
+    })
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -2725,13 +2766,21 @@ fn read_backs(list: &HostList) {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    std::ptr::copy_nonoverlapping(
+                        from.add(line * row.next_multiple_of(256)),
+                        (*at as *mut u8).add(line * pitch),
+                        *row,
+                    );
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
                 if walls_trace() && *rows == 1 && *row <= 96 {
                     let mut values = [0f32; 24];
-                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
+                    std::ptr::copy_nonoverlapping(
+                        from,
+                        values.as_mut_ptr().cast::<u8>(),
+                        *row & !3,
+                    );
                     tracing::info!(
                         frame = crate::frame::current(),
                         to = format_args!("{:#x}", *at),
@@ -2766,13 +2815,20 @@ fn hand_back(back: &[Declared]) {
                     _ => spans.push((from, to)),
                 }
             }
-            work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+            work.extend(
+                spans
+                    .into_iter()
+                    .map(|(from, to)| (shadow.clone(), from, to)),
+            );
         }
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
         let found = crate::shadow::find_all(&work);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+        crate::copystat::add(
+            crate::copystat::C::BackScanUs,
+            scanning.elapsed().as_micros() as u64,
+        );
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -2815,40 +2871,75 @@ fn hand_back(back: &[Declared]) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshSupport {
+    Native,
+    Emulate,
+    Unsupported,
+}
+
 impl Host {
-    /// Whether the host runs mesh shaders at shader model 6.6 (translated
-    /// mesh shaders need both); logged once.
-    pub(crate) fn mesh_shaders(&self) -> bool {
-        static MESH: OnceLock<bool> = OnceLock::new();
+    fn mesh_support(&self) -> MeshSupport {
+        static MESH: OnceLock<MeshSupport> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
             let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
             // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
+            let (opt_ok, sm_ok) = unsafe {
+                (
+                    self.device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_D3D12_OPTIONS7,
+                            (&raw mut options).cast(),
+                            size_of_val(&options) as u32,
+                        )
+                        .is_ok(),
+                    self.device
                         .CheckFeatureSupport(
                             D3D12_FEATURE_SHADER_MODEL,
                             (&raw mut model).cast(),
                             size_of_val(&model) as u32,
                         )
-                        .is_ok()
+                        .is_ok(),
+                )
             };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
-            mesh
+            let sm66 = sm_ok && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            let hardware = opt_ok && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            let override_env = std::env::var("VICTORY_MESH_EMULATION").ok();
+            let mode = match override_env.as_deref().map(str::trim) {
+                Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => {
+                    if sm66 {
+                        MeshSupport::Emulate
+                    } else {
+                        MeshSupport::Unsupported
+                    }
+                }
+                Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => {
+                    if sm66 && hardware {
+                        MeshSupport::Native
+                    } else {
+                        MeshSupport::Unsupported
+                    }
+                }
+                _ if !sm66 => MeshSupport::Unsupported,
+                _ if hardware => MeshSupport::Native,
+                _ => MeshSupport::Emulate,
+            };
+            tracing::info!(?mode, sm66, hardware, "host mesh shader support");
+            mode
         })
+    }
+
+    /// Whether the host runs native mesh shaders at shader model 6.6.
+    pub(crate) fn mesh_shaders(&self) -> bool {
+        self.mesh_support() == MeshSupport::Native
+    }
+
+    /// Whether mesh shaders run as compute plus generated vertex shaders.
+    pub(crate) fn emulate_mesh_shaders(&self) -> bool {
+        self.mesh_support() == MeshSupport::Emulate
     }
 
     /// Whether the host GPU supports the depth bounds test; logged once.
@@ -2898,11 +2989,15 @@ impl Host {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
-                let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList =
-                    self.device
-                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                let allocator: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None,
+                )?;
                 list.Close()?;
                 Ok((allocator, list))
             })()
@@ -3039,21 +3134,28 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self
+            .shared_buffer(RESULTS)
+            .ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
+            let pso: ID3D12PipelineState =
+                self.device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })?;
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -3124,7 +3226,9 @@ impl Host {
         for (shadow, _) in &declared {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
-                name(&before, || "title buffer on the card, hashes of its pieces".into());
+                name(&before, || {
+                    "title buffer on the card, hashes of its pieces".into()
+                });
                 Some(before)
             }) {
                 whole.push(shadow.clone());
@@ -3151,10 +3255,18 @@ impl Host {
                             continue;
                         };
                         for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                            list.CopyBufferRegion(
+                                &shadow.buffer,
+                                a as u64,
+                                staging,
+                                a as u64,
+                                (b - a) as u64,
+                            );
+                            crate::shadow::CARD_STATS[0]
+                                .fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
-                        crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        crate::shadow::CARD_STATS[1]
+                            .fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         let Some(before) = before else {
                             continue;
                         };
@@ -3173,18 +3285,32 @@ impl Host {
                         }
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(
+                            1,
+                            shadow.buffer.GetGPUVirtualAddress(),
+                        );
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
+                        list.SetComputeRootUnorderedAccessView(
+                            3,
+                            work.differs.0.GetGPUVirtualAddress(),
+                        );
+                        let runs: Vec<crate::shadow::CardSpan> =
+                            if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                                vec![shadow.card_run(0, usize::MAX)]
+                            } else {
+                                ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            };
                         // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        let runs = if rehash_runs() {
+                            crate::shadow::joined_piece_runs(runs)
+                        } else {
+                            runs
+                        };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                        CARD_PASSES[1].fetch_add(
+                            runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(),
+                            Ordering::Relaxed,
+                        );
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -3264,14 +3390,27 @@ impl Host {
                     }]);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(
+                        3,
+                        work.differs.0.GetGPUVirtualAddress(),
+                    );
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
+                        let constants = [
+                            r.span.first,
+                            r.span.skew,
+                            size as u32,
+                            r.span.pieces,
+                            r.at * 4,
+                            if flown { 2 } else { 1 },
+                        ];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(
+                            1,
+                            r.shadow.buffer.GetGPUVirtualAddress(),
+                        );
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
@@ -3367,8 +3506,13 @@ impl Host {
                     .iter()
                     .flat_map(|r| {
                         (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
+                            let flagged = !r.compared
+                                || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
+                            (
+                                std::sync::Arc::as_ptr(&r.shadow) as usize,
+                                r.span.first + p,
+                                flagged,
+                            )
                         })
                     })
                     .collect();
@@ -3418,7 +3562,13 @@ impl Host {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
                 for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    list.CopyBufferRegion(
+                        &buffer,
+                        *at,
+                        &shadow.buffer,
+                        *lo as u64,
+                        (*hi - *lo) as u64,
+                    );
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -3539,7 +3689,9 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => {
+                    crate::fence::set(fence as crate::object::This, value)
+                }
             }
         }
         if last > 0 {
@@ -3640,7 +3792,13 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
+                        list.CopyBufferRegion(
+                            fetched,
+                            at,
+                            &plan.ranges[i].shadow.buffer,
+                            lo as u64,
+                            (hi - lo) as u64,
+                        );
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -3670,13 +3828,25 @@ impl Host {
                 // of its copy and of title memory): several at a time.
                 let fetched = *data;
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
-                    std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
+                    std::sync::Arc::new(
+                        (0..plan.ranges.len())
+                            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                            .collect(),
+                    );
                 let each = pieces.len().div_ceil(8);
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
                     .chunks(each)
                     .map(|chunk| {
-                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
-                            chunk.iter().map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at)).collect();
+                        let chunk: Vec<(
+                            std::sync::Arc<crate::shadow::Shadow>,
+                            usize,
+                            usize,
+                            usize,
+                            u64,
+                        )> = chunk
+                            .iter()
+                            .map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at))
+                            .collect();
                         let counts = counts.clone();
                         Box::new(move || {
                             let mut title = Vec::new();
@@ -3684,7 +3854,12 @@ impl Host {
                                 // SAFETY: the mapping of the fetched bytes;
                                 // the copy into it has run, and the caller
                                 // waits for this job.
-                                let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
+                                let gpu = unsafe {
+                                    std::slice::from_raw_parts(
+                                        (fetched + at as usize) as *const u8,
+                                        hi - lo,
+                                    )
+                                };
                                 let merged = shadow.card_merge(lo, gpu, &mut title);
                                 shadow.walls_merged(gpu.len(), merged);
                                 counts[i].fetch_add(merged, Ordering::Relaxed);
@@ -3747,8 +3922,19 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            let Line {
+                line: items,
+                written,
+                lists: flying,
+                target,
+                ..
+            } = &mut *line;
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3759,7 +3945,11 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
             }));
-            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            items.extend(
+                sent.writes
+                    .into_iter()
+                    .map(|(at, what, bytes)| Late::Write(at, what, bytes)),
+            );
             *flying >= late_most()
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -3791,8 +3981,19 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            let Line {
+                line: items,
+                written,
+                lists: flying,
+                target,
+                ..
+            } = &mut *line;
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3803,7 +4004,11 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
             }));
-            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            items.extend(
+                sent.writes
+                    .into_iter()
+                    .map(|(at, what, bytes)| Late::Write(at, what, bytes)),
+            );
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         LINE_MOVED.notify_one();
@@ -3872,7 +4077,9 @@ impl Host {
                             stood(waiting);
                             working(true);
                         }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "submissions sent ahead not waited for")
+                        }
                     }
                 }
                 let gpu = waiting.elapsed();
@@ -3943,7 +4150,9 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => {
+                        crate::fence::set(fence as crate::object::This, value)
+                    }
                 }
             }
             if last > 0 {
@@ -3969,7 +4178,11 @@ impl Host {
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
     /// still held.
-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        late: bool,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4080,7 +4293,10 @@ impl Host {
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+            crate::copystat::add(
+                crate::copystat::C::SnapshotUs,
+                snapshots.elapsed().as_micros() as u64,
+            );
         }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
@@ -4105,11 +4321,19 @@ impl Host {
             };
             self.card_sent();
             if let Err(e) = signalled {
-                fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+                fail(format_args!(
+                    "a submission sent ahead could not be followed by a signal ({e})"
+                ));
             }
             let back = declared_writes(runs);
-            let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
-            SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+            let writes = runs
+                .iter()
+                .flat_map(|l| l.deferred().writes.clone())
+                .collect();
+            SUBMISSION_US[0].fetch_add(
+                (prepared - started).saturating_sub(settled).as_micros() as u64,
+                Ordering::Relaxed,
+            );
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
@@ -4193,7 +4417,12 @@ impl Host {
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
                 .collect();
             let text = format!("{} lists, pipelines {pipelines:?}", runs.len());
             text.chars().take(1200).collect()
@@ -4202,9 +4431,19 @@ impl Host {
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            tracing::warn!(
+                ms = gpu.as_millis(),
+                lists = runs.len(),
+                ?pipelines,
+                "slow host submission"
+            );
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -4456,14 +4695,20 @@ impl HostList {
                 let device = &host()?.device;
                 let mut heap: Option<ID3D12QueryHeap> = None;
                 let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let readback = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                };
                 let desc = D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
                     Width: u64::from(STAMPS) * 8,
                     Height: 1,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
                     Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                     ..Default::default()
                 };
@@ -4471,7 +4716,11 @@ impl HostList {
                 unsafe {
                     device
                         .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
+                            &D3D12_QUERY_HEAP_DESC {
+                                Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                                Count: STAMPS,
+                                NodeMask: 0,
+                            },
                             &mut heap,
                         )
                         .ok()?;
@@ -4500,7 +4749,10 @@ impl HostList {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        let range = D3D12_RANGE {
+            Begin: 0,
+            End: (count + 1) * 8,
+        };
         // SAFETY: a read-back buffer the finished list resolved into.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
@@ -4513,7 +4765,10 @@ impl HostList {
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (
+                    ticks as f64 * 1e3 / frequency.max(1) as f64,
+                    notes[i].0.chars().take(300).collect(),
+                )
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -4579,7 +4834,10 @@ impl HostList {
             fail(format_args!("a host command list did not reset ({e})"));
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+        crate::copystat::add(
+            crate::copystat::C::ResetNs,
+            started.elapsed().as_nanos() as u64,
+        );
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -4934,13 +5192,17 @@ impl HostList {
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
             unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                self.list
+                    .SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
-            crate::copystat::add(crate::copystat::C::NoteNs, started.elapsed().as_nanos() as u64);
+            crate::copystat::add(
+                crate::copystat::C::NoteNs,
+                started.elapsed().as_nanos() as u64,
+            );
         }
     }
 
@@ -5042,8 +5304,15 @@ impl HostList {
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    pub(crate) fn defer_read_back(
+        &self,
+        buffer: ID3D12Resource,
+        dst: *mut u8,
+        [row, rows, pitch]: [usize; 3],
+    ) {
+        self.deferred()
+            .backs
+            .push((buffer, dst as usize, [row, rows, pitch]));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -5396,11 +5665,16 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, from, to)| {
+                    Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            PREPARING[0].fetch_sub(
+                summed.saturating_sub(started.elapsed().as_micros() as u64),
+                Ordering::Relaxed,
+            );
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
@@ -5456,7 +5730,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    crate::copystat::add(
+        crate::copystat::C::MoveUs,
+        moved.elapsed().as_micros() as u64,
+    );
     if whole {
         return;
     }
@@ -5476,7 +5753,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         read_pieces(src, dst, len);
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+    crate::copystat::add(
+        crate::copystat::C::SparseUs,
+        sparse.elapsed().as_micros() as u64,
+    );
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
@@ -5615,6 +5895,59 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
         let next = ((at / step + 1) * step).min(end);
         f(at, next - at);
         at = next;
+    }
+}
+
+impl Host {
+    /// A default-heap GPU buffer, starting in `UNORDERED_ACCESS` when its
+    /// flags allow unordered access.
+    pub(crate) fn default_buffer(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let state = if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain default-heap buffer allocation with valid descriptions.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                state,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default buffer");
+                None
+            }
+        }
     }
 }
 
@@ -5822,16 +6155,14 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
+        let [cpu, gpu] =
+            [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
+        let [back_ms, back_mb] =
+            [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -5853,8 +6184,9 @@ impl Meter {
             }
         }
         {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let [own, asking, still, all] = [0, 1, 2, 3].map(|i| {
+                crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+            });
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
@@ -6331,7 +6663,12 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        Some([
+            own.Budget,
+            own.CurrentUsage,
+            shared.Budget,
+            shared.CurrentUsage,
+        ])
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
@@ -6352,7 +6689,12 @@ impl Host {
                 .ok()?;
         }
         let all = |m: &DXGI_QUERY_VIDEO_MEMORY_INFO| {
-            [m.Budget, m.CurrentUsage, m.AvailableForReservation, m.CurrentReservation]
+            [
+                m.Budget,
+                m.CurrentUsage,
+                m.AvailableForReservation,
+                m.CurrentReservation,
+            ]
         };
         Some([all(&own), all(&shared)])
     }
@@ -6516,9 +6858,16 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// barriers overlaps on the GPU), by kind, and what the markers just
 /// before them say (`HostList::note_op`: diagnostics builds with
 /// device-removed data on).
-fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
+fn in_flight(
+    history: &[D3D12_AUTO_BREADCRUMB_OP],
+    markers: &[(u32, String)],
+    done: usize,
+) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
-    let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
+    let from = history[..done]
+        .iter()
+        .rposition(barrier)
+        .map_or(0, |b| b + 1);
     let to = history[done..]
         .iter()
         .position(barrier)
