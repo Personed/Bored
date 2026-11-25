@@ -607,11 +607,16 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!("host device on the software adapter (WARP)");
         } else if let Some((adapter, memory, name)) = hardware_adapter() {
             match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
-                Ok(()) => tracing::info!(
+                Ok(()) if device.as_ref().is_some_and(shader_model66) => tracing::info!(
                     adapter = name,
                     memory_gb = format_args!("{:.1}", memory as f64 / f64::powi(1024.0, 3)),
                     "host device on the largest-memory hardware adapter"
                 ),
+                Ok(()) => {
+                    tracing::warn!(adapter = name, "hardware adapter lacks shader model 6.6; using the default adapter");
+                    device = None;
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, adapter = name, "hardware adapter refused D3D12; using the default adapter");
                     D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
@@ -705,6 +710,24 @@ fn create() -> windows::core::Result<Host> {
             adapter,
         })
     }
+}
+
+/// Whether `device` accepts shader model 6.6, which mesh emulation and the
+/// generated unpack vertex shaders need.
+fn shader_model66(device: &ID3D12Device) -> bool {
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: `model` is a live output structure of the given size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut model).cast(),
+            size_of_val(&model) as u32,
+        )
+    }
+    .is_ok()
+    && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0
 }
 
 /// The hardware adapter with the most dedicated video memory, if DXGI knows
