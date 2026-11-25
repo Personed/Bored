@@ -205,6 +205,7 @@ fn sweep() {
         return;
     }
     sweep_scratch_chunks();
+    sweep_indirect_scratch();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1803,6 +1804,76 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// Device-local indirect-argument scratch no list holds. Lists may grow
+/// these to the largest indirect execution they ever record; sharing them
+/// after reset keeps one list's peak from staying duplicated in every list.
+static INDIRECT_SPARE: Mutex<Spare<ID3D12Resource>> = Mutex::new(Spare::new());
+
+/// At most this much device-local memory is kept for indirect-argument
+/// scratch reuse. Larger peaks are freed instead of retained per list.
+const INDIRECT_SPARE_MOST: u64 = 128 << 20;
+
+/// Whether device-local indirect-argument scratch is shared between lists.
+fn indirect_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_POOL").is_none_or(|v| v != "0"))
+}
+
+/// A device-local indirect scratch buffer of `size` bytes: one kept by
+/// another list, or a new one. Sizes are exact so a small execution cannot
+/// consume a buffer kept for a much larger one.
+fn take_indirect_scratch(host: &Host, size: u64) -> Option<(ID3D12Resource, u64)> {
+    if indirect_pool()
+        && let Some(buffer) = INDIRECT_SPARE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(size)
+    {
+        return Some((buffer, size));
+    }
+    let buffer = host.uav_buffer(size)?;
+    name(&buffer, || format!("indirect arguments {size:#x}"));
+    Some((buffer, size))
+}
+
+/// A list is done with `buffer` after its submissions ran: kept for the
+/// next list, or freed past [`INDIRECT_SPARE_MOST`] and without the pool.
+fn give_indirect_scratch(buffer: ID3D12Resource, size: u64) {
+    let back = if indirect_pool() {
+        INDIRECT_SPARE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give(buffer, size, INDIRECT_SPARE_MOST)
+    } else {
+        Some(buffer)
+    };
+    // Freed outside the pool lock.
+    drop(back);
+}
+
+/// Lets go of spare indirect-argument scratch no list has reused lately.
+/// Unlike upload scratch, this is device-local memory, so its idle timeout
+/// follows VRAM pressure rather than system-RAM pressure.
+fn sweep_indirect_scratch() {
+    const IDLE_FRAMES: u64 = 4;
+    let video = host().and_then(|h| h.video_memory());
+    let idle_ms = vram_idle_ms(video);
+    let (count, bytes, expired) = {
+        let mut spare = INDIRECT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.sweep(idle_ms, IDLE_FRAMES)
+    };
+    if count == 0 {
+        return;
+    }
+    drop(expired);
+    trail(|| {
+        format!(
+            "sweep: {count} spare indirect scratch buffers let go ({} KiB)",
+            bytes >> 10
+        )
+    });
 }
 
 /// Lets go of spare scratch chunks no list has reused lately. They are
@@ -6889,6 +6960,20 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        if indirect_pool() {
+            let indirect = self
+                .indirect_args
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some((buffer, size)) = indirect {
+                // Every submission that read these arguments has finished, and
+                // the buffer is back in the common state. Its peak size should
+                // be shared with other lists, not kept as this list's private
+                // device memory until the title destroys the list object.
+                give_indirect_scratch(buffer, size);
+            }
+        }
         if self.list.initialized() || crate::cardmeter::on() {
             // With card metering on the pair is made even before the first
             // command: its begin timestamp belongs at the reset, not at
@@ -7754,12 +7839,11 @@ impl HostList {
             return Some(buffer.clone());
         }
         let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
-        let alloc = prev
+        let wanted = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
-        name(&buffer, || format!("indirect arguments {alloc:#x}"));
+        let (buffer, alloc) = take_indirect_scratch(host()?, wanted)?;
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
         if let Some((old_buf, _)) = old {
