@@ -70,6 +70,7 @@ impl SigElement {
             18 => 68,
             19 => 67,
             20 => 69,
+            28 => 23, // barycentrics
             30 => 25, // cull primitive
             _ => 0,
         }
@@ -143,10 +144,27 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
+/// The most a mesh shader's outputs may take, in bytes (D3D12).
+pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+/// A mesh shader's output size as the DXIL validator measures it against
+/// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
+/// and primitive element, times the maxima rounded up to multiples of 32.
+pub(crate) fn mesh_output_bytes(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u64 {
+    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let align = |n: u32| u64::from(n).next_multiple_of(32);
+    4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
-    /// PSV resource type: 1 sampler, 2 CBV.
+    /// PSV resource type: 1 sampler, 2 CBV, 4 raw SRV, 7 raw UAV.
     pub kind: u32,
     pub space: u32,
     pub register: u32,
@@ -155,7 +173,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -165,6 +183,9 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry (triangles in, triangle strips out on stream 0): its
+    /// maximum vertex count. `flag`: writes `SV_Position`.
+    pub geometry: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -224,6 +245,15 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     if p.validator18 {
         // Runtime info 3 names the entry point at offset 1 in the strings.
         info[48..52].copy_from_slice(&1u32.to_le_bytes());
+    }
+    if let Some(max_vertices) = p.geometry {
+        // Input primitive (3: triangles), output topology (5: triangle
+        // strips), stream mask, position written; the vertex maximum.
+        info[0..4].copy_from_slice(&3u32.to_le_bytes());
+        info[4..8].copy_from_slice(&5u32.to_le_bytes());
+        info[8..12].copy_from_slice(&1u32.to_le_bytes());
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
     out.extend(&info[..info_size as usize]);
     u32s(&mut out, &[p.bindings.len() as u32]);
@@ -437,6 +467,7 @@ mod tests {
             bindings: &[],
             threads: [0; 3],
             wave_size: None,
+            geometry: None,
         }
     }
 
@@ -759,6 +790,7 @@ mod tests {
             threads: [0; 3],
             wave_size: None,
             validator18: false,
+            geometry: None,
         });
         let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         let info_sz = u32_at(0) as usize;

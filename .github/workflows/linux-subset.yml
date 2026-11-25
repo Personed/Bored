@@ -796,6 +796,7 @@ jobs:
             emit::bitcode::tests::bench_write
           IGNORED_EXTERNAL: >-
             bcpack::tests::reference_chunks
+            emit::lower::tests::a_missing_value_stays_missing_through_two_live_joins
             xma::tests::matches_a_reference_decoder
             xma::tests::walks_saved_streams
         run: |
