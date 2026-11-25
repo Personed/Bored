@@ -205,16 +205,6 @@ pub(crate) fn free_bytes() -> u64 {
     h.heaps.iter().flat_map(|h| h.free.values()).sum()
 }
 
-/// Heaps of textures held, and their used and free bytes (after freeing
-/// what nothing holds now), for the statistics line.
-pub(crate) fn stats() -> (usize, u64, u64) {
-    let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(h) = heaps.as_mut() else { return (0, 0, 0) };
-    h.reap();
-    let free: u64 = h.heaps.iter().flat_map(|h| h.free.values()).sum();
-    (h.heaps.len(), h.heaps.len() as u64 * HEAP - free, free)
-}
-
 impl Placement {
     /// Its offset in its heap.
     pub(crate) fn offset(&self) -> u64 {
