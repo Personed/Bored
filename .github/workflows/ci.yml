@@ -50,3 +50,13 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      # Publish the same diagnostics binary used for on-device GPU captures.
+      # This is a linked Windows build; windows-target-check only type-checks.
+      - name: Build diagnostics runner
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: victory-diag-${{ github.sha }}
+          path: target/diag/victory.exe
+          if-no-files-found: error
+          retention-days: 7
