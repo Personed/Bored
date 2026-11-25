@@ -1472,8 +1472,8 @@ mod tests {
     #[test]
     fn null_cbv_clears_a_stale_view() {
         let null = std::ptr::null();
-        let slots = [0u64; 2 * 4];
-        let a = slots.as_ptr() as u64;
+        let mut slots = [0u64; 2 * 4];
+        let a = slots.as_mut_ptr() as u64;
         create_cbv(null, &[0x1000, 1, 256, 0], a);
         assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
         create_cbv(null, std::ptr::null(), a);
