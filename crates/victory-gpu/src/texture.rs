@@ -1039,7 +1039,7 @@ impl Staging {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(1)
         });
-        every <= 1 || (crate::frame::current() + ((self.memory as usize >> 16) as u64)) % every == 0
+        every <= 1 || (crate::frame::current() + ((self.memory as usize >> 16) as u64)).is_multiple_of(every)
     }
 
     pub(crate) fn refresh(&self) {
