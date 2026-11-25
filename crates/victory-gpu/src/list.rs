@@ -913,6 +913,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 && a.DepthOrArraySize == b.DepthOrArraySize
                 && a.MipLevels == b.MipLevels
             {
+                list.flush_barriers();
                 // SAFETY: an open list and matching live textures.
                 unsafe { list.list.CopyResource(to, from) };
             } else {
