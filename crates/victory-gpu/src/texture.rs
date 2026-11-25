@@ -549,7 +549,13 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     const KEPT: usize = 32 << 20;
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        if read.len() < size {
+        let len = read.len();
+        if len < size {
+            if read.capacity() < size {
+                // Exact: doubling a nearly full scratch would pass the
+                // kept-memory cap for a read still under it.
+                read.reserve_exact(size - len);
+            }
             read.resize(size, 0);
         }
         let out = f(&mut read[..size]);
@@ -2051,6 +2057,10 @@ mod mip_drop_read_tests {
     #[test]
     fn large_read_scratch_is_not_kept() {
         std::thread::spawn(|| {
+            with_read(24 << 20, |read| assert_eq!(read.len(), 24 << 20));
+            with_read(28 << 20, |read| assert_eq!(read.len(), 28 << 20));
+            READ.with(|read| assert!(read.borrow().capacity() <= (32 << 20)));
+
             let large = (32 << 20) + 1;
             with_read(large, |read| assert_eq!(read.len(), large));
             READ.with(|read| assert_eq!(read.borrow().capacity(), 0));
