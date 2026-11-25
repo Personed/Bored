@@ -87,6 +87,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
+mod image_atomic_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 mod lower;
 mod mesh_emu;
