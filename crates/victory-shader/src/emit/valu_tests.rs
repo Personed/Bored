@@ -69,6 +69,11 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_threads(body, 1)
+}
+
+/// The same compute harness with `threads` lanes per thread group.
+fn build_valu_cs_threads(body: &[u32], threads: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -117,7 +122,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -378,11 +383,17 @@ fn v_cvt_f32_f64_rounds_to_nearest_even() {
     run_cases(&shader, &inputs, |backend, i, _, got| {
         let x = values[i];
         if x.is_nan() {
-            assert!(f32::from_bits(got).is_nan(), "{backend}: cvt({x}) = {got:#010x}, want NaN");
+            assert!(
+                f32::from_bits(got).is_nan(),
+                "{backend}: cvt({x}) = {got:#010x}, want NaN"
+            );
             return;
         }
         let want = cvt_f32_f64_reference(x);
-        assert_eq!(got, want, "{backend}: cvt({x:e}) = {got:#010x}, want {want:#010x}");
+        assert_eq!(
+            got, want,
+            "{backend}: cvt({x:e}) = {got:#010x}, want {want:#010x}"
+        );
     });
 }
 
@@ -415,18 +426,23 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
             // v_readlane_b32 s12, v1, read (inline constant 128 + read)
             body.extend_from_slice(&vop3(0x360, 12, vgpr(1), 128 + u16::from(read), 0));
             body.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
-            let shader = build_cs(&body, 32, 0);
+            let shader = build_valu_cs_threads(&body, 32);
             let inputs: Vec<[u32; 4]> = selectors.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
             // Cross-lane code declares WaveSize(32), which WARP's pipeline
             // creation refuses: hardware only.
-            run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, i, inp, got| {
-                let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
-                assert_eq!(
-                    got, want,
-                    "{backend}: op {op:#x} selectors {:08x?}, lane {read}",
-                    selectors[i]
-                );
-            });
+            run_cases_on(
+                &shader,
+                &inputs,
+                &[("hardware", false)],
+                |backend, i, inp, got| {
+                    let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
+                    assert_eq!(
+                        got, want,
+                        "{backend}: op {op:#x} selectors {:08x?}, lane {read}",
+                        selectors[i]
+                    );
+                },
+            );
         }
     }
 }

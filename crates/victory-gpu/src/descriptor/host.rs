@@ -265,7 +265,10 @@ impl HostHeap {
                 // shortcut: descriptors past the host's limit are left out; a
                 // title that reaches them needs remapping. They read the null
                 // slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                tracing::warn!(
+                    count,
+                    "host view heap capped at {size}; views past it read a null slot"
+                );
                 null - want
             };
             match make(size) {
@@ -473,6 +476,12 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The dynamic slots past the title's a heap hands tables out of.
+    #[cfg(test)]
+    pub(crate) fn dynamic_slots(&self) -> u32 {
+        self.dynamic
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]

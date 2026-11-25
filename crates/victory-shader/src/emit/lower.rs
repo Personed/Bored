@@ -8203,7 +8203,9 @@ impl<'a> Lower<'a> {
                 let x = s(self, 0)?;
                 let (s1, s2) = (s(self, 1)?, s(self, 2)?);
                 let i32t = self.s.t.i32;
-                let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+                let lane = self
+                    .s
+                    .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
                 let [k15, k8, k7, k2, k16, not31, not15] =
                     [15, 8, 7, 2, 16, !31, !15].map(|x| self.s.m.i32(x));
                 let low = self.s.m.bin(c, Bin::And, lane, k15);
@@ -8470,37 +8472,6 @@ impl<'a> Lower<'a> {
                 let me = self.console_lane();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
-            }
-            "v_permlane16_b32" | "v_permlanex16_b32" => {
-                self.cross_lane(false)?;
-                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let me = self.lane_index();
-                let k8 = self.s.m.i32(8);
-                let k7 = self.s.m.i32(7);
-                let k4 = self.s.m.i32(4);
-                let k15 = self.s.m.i32(15);
-                let zero = self.s.m.i32(0);
-                let hi_half = self.s.m.bin(c, Bin::And, me, k8);
-                let use_s2 = self.s.m.cmp(c, pred::NE, hi_half, zero);
-                let sel_word = self.s.m.select(c, use_s2, s2, s1);
-                let lane_in_8 = self.s.m.bin(c, Bin::And, me, k7);
-                let sh = self.s.m.bin(c, Bin::Mul, lane_in_8, k4);
-                let shifted = self.s.m.bin(c, Bin::LShr, sel_word, sh);
-                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
-                let base = if name == "v_permlanex16_b32" {
-                    let mask = self.s.m.i32(!31u32);
-                    let row = self.s.m.bin(c, Bin::And, me, mask);
-                    let k16 = self.s.m.i32(16);
-                    let half = self.s.m.bin(c, Bin::And, me, k16);
-                    let other_half = self.s.m.bin(c, Bin::Xor, half, k16);
-                    self.s.m.bin(c, Bin::Or, row, other_half)
-                } else {
-                    let mask = self.s.m.i32(!15u32);
-                    self.s.m.bin(c, Bin::And, me, mask)
-                };
-                let lane = self.s.m.bin(c, Bin::Or, base, pick);
-                let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_readfirstlane_b32"
