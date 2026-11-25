@@ -1842,22 +1842,26 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
+                    .collect();
+                let lowest = addresses
+                    .iter()
                     .map(|a| a.offset & !3)
                     .min()
                     .ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -12242,6 +12246,7 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
     })
 }
 
+include!("lower/code.rs");
 include!("lower/methods.rs");
 include!("lower/mesh_emu.rs");
 #[cfg(test)]
