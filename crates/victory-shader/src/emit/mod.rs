@@ -123,7 +123,7 @@ pub use sampler::StaticSampler;
 pub use shader::{
     ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE,
     SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE,
-    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^14.
