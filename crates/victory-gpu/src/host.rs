@@ -605,6 +605,18 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some((adapter, memory, name)) = hardware_adapter() {
+            match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
+                Ok(()) => tracing::info!(
+                    adapter = name,
+                    memory_gb = format_args!("{:.1}", memory as f64 / f64::powi(1024.0, 3)),
+                    "host device on the largest-memory hardware adapter"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, adapter = name, "hardware adapter refused D3D12; using the default adapter");
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            }
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -692,6 +704,45 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// The hardware adapter with the most dedicated video memory, if DXGI knows
+/// one: a Ryzen APU plus a discrete card must not default to the APU's small
+/// shared-memory device.
+fn hardware_adapter() -> Option<(IDXGIAdapter, u64, String)> {
+    // SAFETY: plain DXGI factory and adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut best = None;
+        for i in 0.. {
+            let Ok(adapter1) = factory.EnumAdapters1(i) else {
+                break;
+            };
+            let Ok(desc) = adapter1.GetDesc1() else {
+                continue;
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let memory = desc.DedicatedVideoMemory as u64;
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            let better = best
+                .as_ref()
+                .is_none_or(|(_, old, _): &(IDXGIAdapter, u64, String)| memory > *old);
+            if better {
+                best = adapter1
+                    .cast::<IDXGIAdapter>()
+                    .ok()
+                    .map(|adapter| (adapter, memory, name));
+            }
+        }
+        best
     }
 }
 
