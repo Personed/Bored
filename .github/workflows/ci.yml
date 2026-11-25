@@ -54,9 +54,11 @@ jobs:
       # This is a linked Windows build; windows-target-check only type-checks.
       - name: Build diagnostics runner
         run: cargo build --locked --profile diag -p victory --features diagnostics
+      # Keep publication in the required check: without this executable the
+      # RX 580 runtime validation cannot be performed.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: victory-diag-${{ github.sha }}
+          name: victory-diag-${{ github.sha }}-${{ github.run_attempt }}
           path: target/diag/victory.exe
           if-no-files-found: error
           retention-days: 7
