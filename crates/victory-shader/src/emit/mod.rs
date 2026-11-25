@@ -69,10 +69,10 @@
 //!   layout) with the title's pixel shader. The thread group is the
 //!   console's in lanes (`[numthreads]` in the DXIL), the vertex and
 //!   primitive maxima its own, triangles only, no wave size required. The
-//!   console numbers groups in x only: the draw path passes the title's
-//!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
-//!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
-//!   console never exports them).
+//!   console numbers groups as one scalar sequence: the draw path flattens
+//!   the title's grid and passes `DispatchMesh(x*y*z, 1, 1)`. Per-primitive
+//!   outputs (`PSG1`) are the console's, without `SV_PrimitiveID` and
+//!   `SV_CullPrimitive` (the console never exports them).
 //! * **Rectangle lists** ([`rect_list_gs`], `gs_6_6`): the console draws a
 //!   rectangle from three vertices; the host has no such topology. A
 //!   pipeline the title makes for rectangles (topology type 19) gets a
