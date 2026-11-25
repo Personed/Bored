@@ -84,6 +84,57 @@ pub(crate) struct Staging {
     pooled: u64,
 }
 
+/// Bytes of one console slice or depth slab that a mip-dropped upload can
+/// still use. Mips are laid out smallest first, so the surviving smaller
+/// mips are a prefix of the slice when the dropped ones are all before the
+/// tail. A drop into the shared mip tail is rare (at most three levels) and
+/// keeps the whole slice: dropped and surviving levels share its block.
+fn live_slice_bytes(layout: &victory_formats::texture::Layout, mip_drop: u32) -> usize {
+    let slice = layout.slice_size as usize;
+    if mip_drop == 0 || mip_drop > layout.first_tail_mip {
+        return slice;
+    }
+    layout
+        .mips
+        .get((mip_drop - 1) as usize)
+        .map_or(slice, |m| (m.offset as usize).min(slice))
+}
+
+/// `(offset, len)` ranges of console texture memory the host copy can use,
+/// one per slice or depth slab.
+fn live_ranges(
+    layout: &victory_formats::texture::Layout,
+    mip_drop: u32,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let slice = layout.slice_size as usize;
+    let live = live_slice_bytes(layout, mip_drop);
+    (0..layout.slices as usize).map(move |s| (s * slice, live))
+}
+
+/// Bytes of console texture memory the host copy can use.
+fn live_bytes(layout: &victory_formats::texture::Layout, mip_drop: u32) -> usize {
+    live_slice_bytes(layout, mip_drop) * layout.slices as usize
+}
+
+/// Hash only the ranges the host copy can use. Writes to dropped top mips
+/// must not make an upload of the surviving mips look stale.
+fn hash_live(
+    layout: &victory_formats::texture::Layout,
+    mip_drop: u32,
+    tiled: &[u8],
+) -> blake3::Hash {
+    if live_bytes(layout, mip_drop) == tiled.len() {
+        return blake3::hash(tiled);
+    }
+    let mut hash = blake3::Hasher::new();
+    for (at, len) in live_ranges(layout, mip_drop) {
+        if let Some(bytes) = tiled.get(at..at.saturating_add(len)) {
+            hash.update(bytes);
+        }
+    }
+    hash.finalize()
+}
+
 /// A staging buffer nothing holds: the buffer and where it is mapped.
 struct Spare(ID3D12Resource, usize);
 
@@ -1030,6 +1081,72 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// Bytes of title memory the host copy can use (dropped top mips are
+    /// neither read nor hashed).
+    fn live_bytes(&self) -> usize {
+        live_bytes(&self.layout, self.mip_drop)
+    }
+
+    /// Hash the ranges of `tiled` the host copy can use.
+    fn hash_live(&self, tiled: &[u8]) -> blake3::Hash {
+        hash_live(&self.layout, self.mip_drop, tiled)
+    }
+
+    /// Copy the ranges the host copy can use into their places in `read`.
+    /// Returns the bytes asked for; unmapped pages read as zeros, as
+    /// `copy_mapped` has it.
+    fn copy_live_into(&self, read: &mut [u8]) -> usize {
+        if self.live_bytes() == read.len() {
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, read.len(), false);
+            return read.len();
+        }
+        let mut copied = 0;
+        for (at, len) in live_ranges(&self.layout, self.mip_drop) {
+            let Some(dst) = read.get_mut(at..at.saturating_add(len)) else {
+                continue;
+            };
+            crate::host::copy_mapped(dst.as_mut_ptr(), self.memory.wrapping_add(at), len, false);
+            copied += len;
+        }
+        copied
+    }
+
+    /// Whether a write-watch page newer than `since` touches a range the
+    /// host copy can use. Writes wholly in dropped top mips need no upload.
+    fn writes_touch_live(&self, written: &[(usize, u64)], since: u64) -> bool {
+        if self.live_bytes() == self.layout.size as usize {
+            return written.iter().any(|&(_, w)| w > since);
+        }
+        let base = self.memory as usize;
+        written.iter().any(|&(page, w)| {
+            if w <= since {
+                return false;
+            }
+            let start = page * crate::watch::PAGE;
+            let end = start + crate::watch::PAGE;
+            live_ranges(&self.layout, self.mip_drop).any(|(at, len)| {
+                start < base + at + len && base + at < end
+            })
+        })
+    }
+
+    /// Read the ranges the host copy can use through the kernel. `None` if
+    /// a page is not there at this moment, as `read_into` has it.
+    fn read_live_into(&self, read: &mut [u8]) -> Option<usize> {
+        if self.live_bytes() == read.len() {
+            return crate::host::read_into(self.memory, read).then_some(read.len());
+        }
+        let mut copied = 0;
+        for (at, len) in live_ranges(&self.layout, self.mip_drop) {
+            let dst = read.get_mut(at..at.saturating_add(len))?;
+            if !crate::host::read_into(self.memory.wrapping_add(at), dst) {
+                return None;
+            }
+            copied += len;
+        }
+        Some(copied)
+    }
+
     /// `VICTORY_TEXTURE_REFRESH_EVERY`, 1 or unset: refresh every frame.
     fn refresh_every() -> u64 {
         static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1091,19 +1208,24 @@ impl Staging {
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            let asked = last.asked;
+            if asked != 0 && written.iter().all(|&(_, w)| w <= asked) {
                 return 0;
             }
             last.asked = now;
+            if asked != 0 && !self.writes_touch_live(&written, asked) {
+                return 0;
+            }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let copied = with_read(size, |read| {
+                let copied = self.copy_live_into(read);
                 self.detile(read);
+                copied
             });
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            crate::copystat::add(crate::copystat::C::TexWatched, copied as u64);
+            return copied;
         }
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
@@ -1160,57 +1282,64 @@ impl Staging {
                 return 0;
             }
             last.partial = Some(frame);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            let mut copied = 0;
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                copied = self.copy_live_into(read);
+                let hash = self.hash_live(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if live_ranges(&self.layout, self.mip_drop).all(|(at, len)| {
+                    read.get(at..at.saturating_add(len))
+                        .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
+                }) {
                     return false;
                 }
                 self.detile(read);
                 true
             });
             #[cfg(feature = "diagnostics")]
-            if changed {
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            {
+                crate::copystat::add(crate::copystat::C::TexHashed, copied as u64);
+                if changed {
+                    crate::copystat::add(crate::copystat::C::TexChanged, copied as u64);
+                }
             }
             let _ = changed;
-            return size;
+            return copied;
         }
         if through_copy() {
+            let live = self.live_bytes();
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = self.hash_live(tiled);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                crate::copystat::add(crate::copystat::C::TexHashed, live as u64);
                 if last.hash == Some(hash) {
-                    return size;
+                    return live;
                 }
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-                size
+                crate::copystat::add(crate::copystat::C::TexChanged, live as u64);
+                live
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = self.hash_live(tiled);
+        let live = self.live_bytes();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        crate::copystat::add(crate::copystat::C::TexHashed, live as u64);
         if last.hash == Some(hash) {
-            return size;
+            return live;
         }
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        size
+        crate::copystat::add(crate::copystat::C::TexChanged, live as u64);
+        live
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
@@ -1221,20 +1350,20 @@ impl Staging {
     /// Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = blake3::hash(read);
+        let (read, copied) = with_read(size, |read| {
+            let Some(copied) = self.read_live_into(read) else {
+                return (false, 0);
+            };
+            let hash = self.hash_live(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
             }
-            true
+            (true, copied)
         });
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
-            size
+            copied
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
@@ -1727,5 +1856,59 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mip_drop_read_tests {
+    use super::{hash_live, live_bytes, live_ranges, live_slice_bytes};
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    fn layout(width: u32, array: u32) -> victory_formats::texture::Layout {
+        Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            width,
+            height: width,
+            depth_or_array: array,
+            mips: 0,
+            format: 28,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .expect("layout")
+        .planes[0]
+        .layout
+        .clone()
+    }
+
+    /// Dropped top mips are the tail of each console slice: only the
+    /// smaller surviving prefix is read, per array slice.
+    #[test]
+    fn mip_dropped_reads_cover_only_surviving_prefixes() {
+        let layout = layout(256, 2);
+        let slice = layout.slice_size as usize;
+        assert_eq!(live_slice_bytes(&layout, 0), slice);
+        let live = live_slice_bytes(&layout, 1);
+        assert_eq!(live, layout.mips[0].offset as usize);
+        assert!(live < slice);
+        assert_eq!(live_bytes(&layout, 1), live * 2);
+        assert_eq!(
+            live_ranges(&layout, 1).collect::<Vec<_>>(),
+            vec![(0, live), (slice, live)]
+        );
+    }
+
+    /// A write in a dropped mip does not change the upload hash; one in a
+    /// surviving mip does.
+    #[test]
+    fn mip_dropped_hashes_ignore_dropped_mips() {
+        let layout = layout(256, 1);
+        let mut tiled = vec![0u8; layout.size as usize];
+        let before = hash_live(&layout, 1, &tiled);
+        let slice = layout.slice_size as usize;
+        tiled[slice - 1] = 0x5a;
+        assert_eq!(before, hash_live(&layout, 1, &tiled));
+        tiled[0] = 1;
+        assert_ne!(before, hash_live(&layout, 1, &tiled));
     }
 }
