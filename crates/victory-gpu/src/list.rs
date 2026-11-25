@@ -2143,6 +2143,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
             comparison,
             reference,
             wide,
+            mask = format_args!("{mask:#x}"),
             met = wait.met(),
             "a list waits for a memory value"
         );
@@ -2151,7 +2152,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
     if let Some(host) = host_list(this) {
         crate::capture::op(std::ptr::from_ref(host) as usize, || {
             format!(
-                "WAIT VALUE at {address:#x} comparison {comparison} reference {reference:#x} wide {wide} met {}",
+                "WAIT VALUE at {address:#x} comparison {comparison} reference {reference:#x} mask {mask:#x} wide {wide} met {}",
                 wait.met()
             )
         });
