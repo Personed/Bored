@@ -5,7 +5,7 @@
 //! (`cs_6_6`) with the console's `[numthreads(threads, 1, 1)]` and LDS, writing
 //! packed primitive indices, per-vertex attributes (`OSG1`), and per-primitive
 //! attributes (`PSG1`) into a fixed-stride per-group slice of a raw UAV buffer
-//! at `u0` in [`MESH_EMU_SPACE`]:
+//! at `u0` in [`MESH_EMU_SPACE`](super::shader::MESH_EMU_SPACE):
 //!
 //! ```text
 //! group g (byte offset = g * group_bytes):
@@ -15,7 +15,7 @@
 //! ```
 //!
 //! [`unpack_vertex_shader`] builds the matching `vs_6_6` that reads that raw
-//! buffer at `t0` in [`MESH_EMU_SPACE`] by `SV_VertexID`, culls bit-31 primitives via quiet
+//! buffer at `t0` in [`MESH_EMU_SPACE`](super::shader::MESH_EMU_SPACE) by `SV_VertexID`, culls bit-31 primitives via quiet
 //! `NaN` on `SV_Position`, and emits every vertex and per-primitive attribute in
 //! the exact signature layout the title's pixel shader (`ps_6_6`) expects.
 
@@ -27,7 +27,7 @@ use super::shader::Shader;
 use crate::ShaderError;
 use crate::dxbc::{Container, FourCC, u32_at};
 
-/// Sentinel `base_group` value in `b0` in [`MESH_EMU_SPACE`] telling an emulated mesh
+/// Sentinel `base_group` value in `b0` in [`MESH_EMU_SPACE`](super::shader::MESH_EMU_SPACE) telling an emulated mesh
 /// compute shader that reads `SV_GroupID` to look up its per-record group ID
 /// in the `slot_map` raw SRV (`t0` in the same space).
 pub const INDIRECT_SLOT_MAP_FLAG: u32 = u32::MAX;
