@@ -134,12 +134,18 @@ pub fn mesh_compute_layout(
 
 /// Computes the output-buffer allocation and non-indexed draw count for
 /// `groups` workgroups. Returns `None` if the allocation overflows `u64` or
-/// the draw count cannot be represented by D3D12's `DrawInstanced` arguments.
+/// exceeds the 32-bit byte-offset address space of a D3D12 raw buffer, or the
+/// draw count cannot be represented by D3D12's `DrawInstanced` arguments.
 pub fn mesh_compute_dispatch(
     layout: &MeshComputeLayout,
     groups: u32,
 ) -> Option<MeshComputeDispatch> {
     let output_bytes = layout.slot_bytes.checked_mul(u64::from(groups))?;
+    // ByteAddressBuffer/RWByteAddressBuffer offsets are 32-bit. A buffer may
+    // occupy 2^32 bytes: its final aligned dword is still at u32::MAX - 3.
+    if output_bytes > u64::from(u32::MAX) + 1 {
+        return None;
+    }
     let draw_vertices = u64::from(groups)
         .checked_mul(u64::from(layout.max_primitives))?
         .checked_mul(3)?;
@@ -228,5 +234,19 @@ mod tests {
 
         let layout = mesh_compute_layout(1, u32::MAX, 0, 0, &[], &[]).unwrap();
         assert!(mesh_compute_dispatch(&layout, 1).is_none());
+    }
+
+    #[test]
+    fn enforces_the_raw_buffer_byte_offset_limit() {
+        let mut layout = mesh_compute_layout(1, 0, 0, 0, &[], &[]).unwrap();
+        layout.slot_bytes = u64::from(u32::MAX) + 1;
+        assert_eq!(
+            mesh_compute_dispatch(&layout, 1).unwrap().output_bytes,
+            u64::from(u32::MAX) + 1
+        );
+        assert!(mesh_compute_dispatch(&layout, 2).is_none());
+
+        layout.slot_bytes = (u64::from(u32::MAX) + 1) / 2 + 1;
+        assert!(mesh_compute_dispatch(&layout, 2).is_none());
     }
 }
