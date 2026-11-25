@@ -1455,9 +1455,15 @@ mod snapshot_tests {
         assert_eq!(state(snapshot.base + PIECE), MEM_COMMIT);
         assert_eq!(state(snapshot.base + 2 * PIECE), MEM_RESERVE);
         assert_eq!(snapshot.committed_bytes(), PIECE);
-        snapshot.commit(PIECE + 31, 2 * PIECE + 1);
+        snapshot.commit(2 * PIECE + 1, 3 * PIECE + 17);
         assert_eq!(state(snapshot.base + 2 * PIECE), MEM_COMMIT);
-        assert_eq!(snapshot.committed_bytes(), 2 * PIECE);
+        assert_eq!(state(snapshot.base + 3 * PIECE), MEM_COMMIT);
+        assert_eq!(snapshot.committed_bytes(), 3 * PIECE);
+
+        let mut partial = Snapshot::new(4097);
+        partial.commit(0, 4097);
+        assert_eq!(state(partial.base + 4096), MEM_COMMIT);
+        assert_eq!(partial.committed_bytes(), 8192);
     }
 }
 
