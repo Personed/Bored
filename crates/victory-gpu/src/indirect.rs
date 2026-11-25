@@ -2468,11 +2468,19 @@ void main() {
             return;
         };
         let b4 = bound(&other, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        assert_eq!(
-            b4.as_raw(),
-            b3.as_raw(),
-            "grown scratch buffer must be handed to another list"
-        );
+        if crate::host::indirect_pool() {
+            assert_eq!(
+                b4.as_raw(),
+                b3.as_raw(),
+                "grown scratch buffer must be handed to another list"
+            );
+        } else {
+            assert_ne!(
+                b4.as_raw(),
+                b3.as_raw(),
+                "without the pool the first list keeps its grown scratch"
+            );
+        }
         assert_eq!(other.indirect_state(&b4), args);
         other.close();
         assert_eq!(host.log_messages(), None, "the debug layer found an error");

@@ -1819,7 +1819,7 @@ static INDIRECT_SPARE: Mutex<Spare<ID3D12Resource>> = Mutex::new(Spare::new());
 const INDIRECT_SPARE_MOST: u64 = 128 << 20;
 
 /// Whether device-local indirect-argument scratch is shared between lists.
-fn indirect_pool() -> bool {
+pub(crate) fn indirect_pool() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_POOL").is_none_or(|v| v != "0"))
 }
