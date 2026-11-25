@@ -24,8 +24,7 @@ use windows_sys::Win32::System::Memory::{
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
-    K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
-    PROCESS_MEMORY_COUNTERS,
+    K32GetPerformanceInfo, PERFORMANCE_INFORMATION,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
@@ -49,6 +48,22 @@ pub(crate) fn on_wine() -> bool {
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes of title memory committed: physical pages allocated and not yet
+/// freed, plus `MEM_COMMIT` virtual allocations. This is what
+/// `XMemGetWorkingSetStatistics` reports as the title's use: counting the
+/// whole process instead had the layer's own memory (copy-back buffers,
+/// host heaps, the card's driver allocations) in the figure — 27 GB in
+/// run 60's gameplay against a limit of 13.5 GB — and a title budgeting
+/// its streaming from it believed it was far over its limit. Heap blocks
+/// (`XMemAlloc`) stay uncounted: the title hooks them into arenas of its
+/// own, which are physical pages or virtual allocations already here.
+static COMMITTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Sizes of committed virtual allocations by address, so `XMemFreeDefault`
+/// (the 32-bit path frees whole reservations) can uncount them.
+static COMMITTED_VIRTUAL: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
@@ -161,6 +176,13 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if !at.is_null() && !placeholder && kind & MEM_COMMIT != 0 {
+        COMMITTED.fetch_add(size, Ordering::Relaxed);
+        COMMITTED_VIRTUAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(at as usize, size);
     }
     at
 }
@@ -318,6 +340,13 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            if let Some(size) = COMMITTED_VIRTUAL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(address as usize))
+            {
+                COMMITTED.fetch_sub(size, Ordering::Relaxed);
+            }
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -444,6 +473,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    COMMITTED.fetch_add(size, Ordering::Relaxed);
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
@@ -472,10 +502,17 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
         return 0;
     }
     let mut physical = physical();
+    let mut freed = 0;
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        if physical.pages.remove(&unsafe { *pages.add(i) }).is_some() {
+            freed += PAGE;
+        }
     }
+    // Saturates: a double free must not wrap the title's figure around.
+    let _ = COMMITTED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+        Some(c.saturating_sub(freed))
+    });
     1
 }
 
@@ -963,27 +1000,21 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used: COMMITTED.load(Ordering::Relaxed),
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
     // What the title is told, logged at the first asking and at every
-    // 1,024th: "used" is all the process has committed, the layer's own
-    // memory and the card's included (27 GB in run 60's gameplay against a
-    // limit of 13.5 GB). A title that budgets its streaming from these two
-    // figures believes it is far over its limit.
-    // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
+    // 1,024th: "used" is the title's own committed memory (its physical
+    // pages and virtual allocations), not the process's — the layer's
+    // copy-back buffers, host heaps and driver allocations are not the
+    // title's to budget against. Before this count, the figure was the
+    // whole process's (27 GB in run 60's gameplay against a limit of
+    // 13.5 GB) and a title budgeting its streaming from it believed it
+    // was far over its limit.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
     if asked.is_multiple_of(1024) {
@@ -1123,9 +1154,19 @@ mod tests {
 
     #[test]
     fn transfers_shrink_the_title_budget() {
+        // A committed allocation of the title's own, so `title_used` is
+        // non-zero no matter which other tests ran.
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            MIB,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
         let mut before = WorkingSet::default();
         assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut before), 1);
-        assert!(before.title_used > 0);
+        assert!(before.title_used >= MIB);
         assert_eq!(XMemTransferMemory(0, 128 * MIB - 1), 1);
         assert_eq!(XMemTransferMemory(2, MIB), 0, "no tools memory");
         let standard = victory_gpu::console::current().title_memory().1;
