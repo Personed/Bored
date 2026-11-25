@@ -2265,12 +2265,7 @@ void main() {
         }
     }
 
-    // Ignored upstream of the merge: the dispatch is 2 groups of 64 threads
-    // and both race on the one budget word; which group's records the
-    // budget fits first is scheduling, not lane order. On the CI runner's
-    // card group 1 wins and records 64/65 fit instead of 1/2.
     #[test]
-    #[ignore = "budget charging order across the dispatch's two thread groups is hardware scheduling, not lane order"]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
@@ -2358,7 +2353,12 @@ void main() {
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
+                // Which two records the budget fits is hardware scheduling: the
+                // dispatch's two groups of 64 race on the one budget word, and
+                // either group can win (upstream's card fits 1/2, the CI
+                // runner's may fit 64/65). Everything else - saturation,
+                // zeroing, field preservation - is order-independent.
+                assert!(i != 0, "the first record is no draw and never fits");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
