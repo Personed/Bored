@@ -111,11 +111,14 @@ struct Region {
 /// and failed askings drop entries.
 static REGIONS: Mutex<BTreeMap<usize, Region>> = Mutex::new(BTreeMap::new());
 
-fn forget_region(base: usize) {
+fn forget_region(at: usize) {
+    // Interior writes count as much as ones at the base: any entry covering
+    // the write is stale.
+    let page = at / PAGE;
     REGIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, r| r.base != base);
+        .retain(|_, r| !(r.first <= page && page < r.last));
 }
 
 /// The allocation holding `at`, cached by allocation base (walking an
@@ -174,7 +177,9 @@ fn allocation(at: usize) -> Option<Region> {
         base,
         first: base.div_ceil(PAGE),
         last: end / PAGE,
-        mapped: info.Type == MEM_MAPPED,
+        // An entry the walk did not complete covers unverified pages:
+        // they are not one memory type, so nothing is skipped for them.
+        mapped: done && info.Type == MEM_MAPPED,
         whole: done && end - base <= (4usize << 30),
     };
     if r.first * PAGE > at || r.last <= r.first {
@@ -515,7 +520,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // write faults), and the world's copies ask about the same big buffers
     // dozens of times per submission.
     let region = if on_wine() { allocation(start) } else { None };
-    let mapped = region.is_some_and(|r| r.mapped);
+    let mapped = region.is_some_and(|r| r.mapped) && !ask_anyway();
     let (kfirst, klast) = match region {
         Some(r) if !r.mapped && r.whole && r.first <= first && last <= r.last => (r.first, r.last),
         _ => (first, last),
@@ -649,6 +654,18 @@ impl Tracked {
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+
+/// Whether the diagnostic switches ask the kernel even for memory known to
+/// be unwatchable (`VICTORY_VIEW_ASK=1` or `VICTORY_GUARD_ASK=1`).
+fn ask_anyway() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| {
+        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
+            .iter()
+            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
+    })
+}
+
 /// Whether the block holding `start` is view memory the guards already
 /// hold (read-only by our hand, or noted absent): asking the kernel's write
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
@@ -727,7 +744,7 @@ fn guard(start: usize, end: usize, known_mapped: bool) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = known_mapped
+    let known = (known_mapped && !ask_anyway())
         || !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
             let g = guards();
             let first = start / BLOCK;
