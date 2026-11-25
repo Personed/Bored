@@ -5,8 +5,11 @@
 //!    a hash of all that its host description holds (the translated
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
-//!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    folder in [`SHARDS`] files, chosen by that name; the host refuses a
+//!    library of another adapter or driver, and an entry whose description
+//!    differs, so neither is ever used. A save serialises and writes only
+//!    the shards that gained pipelines, because the host can only serialise
+//!    a library whole and one blob of the world's pipelines is over 600 MB.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -54,7 +57,9 @@ struct Library {
 // the mutex that holds the library.
 unsafe impl Send for Library {}
 
-const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// How many files the library is split into. A save serialises and writes
+/// only the shards that gained pipelines; see the module comment.
+const SHARDS: usize = 16;
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Loads of the same pipeline serialise (the host documents that one as not
 /// thread-safe); loads of different pipelines may overlap.
@@ -63,20 +68,38 @@ static LOADS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
-fn library() -> Option<&'static Mutex<Library>> {
-    static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
-    LIBRARY
+/// The file shard `shard` is kept in.
+fn shard_file(shard: usize) -> String {
+    format!("host-pipelines.{shard:02}.bin")
+}
+
+/// The shard a pipeline named `name` belongs to. The name is a hash, so this
+/// is spread and stable across runs: a pipeline always lands in the same
+/// file, which is what lets a save write only the files that changed.
+fn shard_of(name: &str) -> usize {
+    let mut h = 0u32;
+    for b in name.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(u32::from(b));
+    }
+    h as usize % SHARDS
+}
+
+/// One save at a time: serialising and publishing must not interleave, or an
+/// older complete snapshot could be published over a newer one.
+static SAVING: Mutex<()> = Mutex::new(());
+
+fn libraries() -> Option<&'static [Mutex<Library>; SHARDS]> {
+    static LIBRARIES: OnceLock<Option<[Mutex<Library>; SHARDS]>> = OnceLock::new();
+    LIBRARIES
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR
-                .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
-                .unwrap_or_default();
-            let library = open(&device, blob);
-            if library.is_none() {
-                tracing::warn!("no host pipeline library: pipelines are not kept");
+            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
+            let mut shards = Vec::with_capacity(SHARDS);
+            for shard in 0..SHARDS {
+                let blob = read(shard_file(shard)).unwrap_or_default();
+                shards.push(Mutex::new(open(&device, blob)?));
             }
-            library.map(Mutex::new)
+            shards.try_into().ok()
         })
         .as_ref()
 }
@@ -157,15 +180,16 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
+    let Some(libraries) = libraries() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    let shard = &libraries[shard_of(name)];
     // A load can be a whole compile under vkd3d-proton, whose library keeps
     // no compiled code; do not hold the store/serialise lock across it. The
     // host requires only same-name loads to serialise, so those get a lock of
     // their own and different pipelines still load in parallel.
-    let handle = library
+    let handle = shard
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .library
@@ -184,7 +208,7 @@ pub(crate) fn pipeline(
     // Compiled outside the lock: compiles take up to seconds.
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
-    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+    let mut l = shard.lock().unwrap_or_else(|e| e.into_inner());
     if l.stored.insert(name.to_owned()) {
         // SAFETY: a live pipeline; a name already stored in an earlier run
         // is refused, which leaves the library as it was.
@@ -195,12 +219,12 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the shards that gained pipelines since the last save, and the
+/// early list if it changed, when `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else {
+    let (Some(dir), Some(libraries)) = (DIR.get(), libraries()) else {
         return;
     };
     {
@@ -210,27 +234,14 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let blob = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                bytes
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
-            }
-        }
-    };
+    // Serialising and publishing are both inside this lock, so two saves
+    // cannot interleave and publish an older snapshot over a newer one.
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, "host pipeline library folder not made");
+        return;
+    }
+    let used_changed = USED_CHANGED.load(Ordering::Relaxed);
     let used: Vec<String> = USED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -238,19 +249,56 @@ pub(crate) fn save(now: bool) {
         .flatten()
         .cloned()
         .collect();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
-        Ok(()) => tracing::info!(
-            bytes = blob.len(),
+    let mut saved = 0u32;
+    let mut total = 0usize;
+    for (shard, library) in libraries.iter().enumerate() {
+        let (blob, added) = {
+            let l = library.lock().unwrap_or_else(|e| e.into_inner());
+            if l.added == 0 {
+                continue;
+            }
+            // SAFETY: a buffer of the size the library asks for.
+            let bytes = unsafe {
+                let mut bytes = vec![0u8; l.library.GetSerializedSize()];
+                l.library.Serialize(&mut bytes).map(|()| bytes)
+            };
+            match bytes {
+                Ok(bytes) => (bytes, l.added),
+                Err(e) => {
+                    tracing::warn!(error = %e, shard, "host pipeline library shard not serialised");
+                    continue;
+                }
+            }
+        };
+        match write_atomically(&dir.join(shard_file(shard)), &blob) {
+            Ok(()) => {
+                // Cleared only once the bytes are published, by what was
+                // serialised: a failed write leaves the shard dirty for the
+                // next save, and a store during the write keeps it dirty.
+                let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+                l.added = l.added.saturating_sub(added);
+                saved += 1;
+                total += blob.len();
+            }
+            Err(e) => tracing::warn!(error = %e, shard, "host pipeline library shard not saved"),
+        }
+    }
+    if used_changed || saved > 0 {
+        match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+            Ok(()) => USED_CHANGED.store(false, Ordering::Relaxed),
+            Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
+        }
+    }
+    if saved > 0 {
+        tracing::info!(
+            shards = saved,
+            bytes = total,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        );
     }
 }
 
@@ -312,6 +360,17 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn a_pipeline_lands_in_one_shard_and_the_shards_spread() {
+        let first = name("graphics", b"root", &[b"vs", b"ps"], "state");
+        assert_eq!(shard_of(&first), shard_of(&first), "stable across runs");
+        let mut seen = [0usize; SHARDS];
+        for i in 0..2048u32 {
+            seen[shard_of(&format!("{i:032x}"))] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 0), "every shard is used: {seen:?}");
     }
 
     #[test]
