@@ -9199,6 +9199,7 @@ impl Host {
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
+            copy.list.ensure()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
