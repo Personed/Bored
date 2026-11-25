@@ -806,13 +806,17 @@ pub(crate) fn remap_subresource(
     let title_mips = title_mips.max(1);
     let host_mips = title_mips.saturating_sub(mip_drop).max(1);
     if is_3d {
-        return (mip_drop..title_mips)
-            .contains(&console_sub)
-            .then_some(console_sub - mip_drop);
+        if !(mip_drop..title_mips).contains(&console_sub) {
+            return None;
+        }
+        return Some(console_sub - mip_drop);
     }
     let mip = console_sub % title_mips;
     let slice = console_sub / title_mips;
-    (mip >= mip_drop).then_some(slice * host_mips + mip - mip_drop)
+    if mip < mip_drop {
+        return None;
+    }
+    Some(slice * host_mips + mip - mip_drop)
 }
 
 /// A texture's host mip-drop count and surviving host mip count.
