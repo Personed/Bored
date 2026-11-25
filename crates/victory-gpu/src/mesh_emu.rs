@@ -302,6 +302,8 @@ impl Buffers {
         // SAFETY: an open list; all GPU addresses name live buffers kept for
         // the submission.
         unsafe {
+            // No SRV clamp precedes this pass: source buffers stay in UAV
+            // state, and this barrier orders any title compute producer.
             l.ResourceBarrier(&[uav_barrier()]);
             l.SetComputeRootSignature(prep_root);
             l.SetPipelineState(prep_pso);

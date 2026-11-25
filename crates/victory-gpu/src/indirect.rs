@@ -801,7 +801,9 @@ void main() {
         const RECORDS: u32 = 2;
         const ATTEMPTS: u32 = 16;
         const GROUP_CAP: u32 = 16;
-        const EXPECTED_MESH_BUDGET: u32 = ATTEMPTS * GROUP_CAP * 128;
+        const COUNTED_GROUPS: u32 = 5;
+        const EXPECTED_MESH_BUDGET: u32 =
+            COUNTED_GROUPS * 128 + ATTEMPTS * GROUP_CAP * 128;
         const DISPATCH_GROUPS: u32 = 64;
 
         let prep = compile_cs(&warp.device, crate::mesh_emu::PREP_SOURCE)
@@ -813,7 +815,7 @@ void main() {
         let (budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
         let (prepared, _, prepared_gpu) = warp.shared_buffer(256);
         let (slot_map, _, slot_map_gpu) = warp.shared_buffer(64 << 10);
-        let (next_args, next_args_ptr, next_args_gpu) = warp.shared_buffer(256);
+        let (next_args, next_args_ptr, _) = warp.shared_buffer(256);
         let (hits, hits_ptr, hits_gpu) = warp.shared_buffer(256);
         let scratch = warp.default_uav(256);
         let signature = warp.signature(2, STRIDE);
@@ -821,7 +823,7 @@ void main() {
         // SAFETY: these mapped buffers all hold at least the written bytes.
         unsafe {
             let words = args_ptr.cast::<u32>();
-            words.write_volatile(65_535);
+            words.write_volatile(COUNTED_GROUPS);
             words.add(1).write_volatile(1);
             words.add(2).write_volatile(1);
             words.add(3).write_volatile(65_535);
@@ -879,11 +881,53 @@ void main() {
                 warp.list.ResourceBarrier(&[uav_barrier()]);
             }
 
+            warp.list.ResourceBarrier(&[uav_barrier()]);
+            warp.list.SetComputeRootSignature(&prep.root);
+            warp.list.SetPipelineState(&prep.pso);
+            let constants = [STRIDE, RECORDS, 1, GROUP_CAP, 1, 1];
+            warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootUnorderedAccessView(1, args_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, count_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, prepared_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(4, slot_map_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(5, budget_gpu);
+            warp.list.Dispatch(1, 1, 1);
+            warp.list.ResourceBarrier(&[
+                uav_barrier(),
+                transition(
+                    &prepared,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ),
+                transition(
+                    &slot_map,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+            ]);
+            warp.list.SetComputeRootSignature(&warp.worker.root);
+            warp.list.SetPipelineState(&warp.worker.pso);
+            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            warp.list
+                .ExecuteIndirect(&signature, 1, &prepared, 0, None, 0);
+            warp.list.ResourceBarrier(&[
+                transition(
+                    &prepared,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+                transition(
+                    &slot_map,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+            ]);
+
             for _ in 0..ATTEMPTS {
                 warp.list.ResourceBarrier(&[uav_barrier()]);
                 warp.list.SetComputeRootSignature(&prep.root);
                 warp.list.SetPipelineState(&prep.pso);
-                let constants = [STRIDE, RECORDS, 1, GROUP_CAP, 1, 1];
+                let constants = [STRIDE, RECORDS, 1, GROUP_CAP, 0, 1];
                 warp.list
                     .SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootUnorderedAccessView(1, args_gpu);
@@ -892,21 +936,37 @@ void main() {
                 warp.list.SetComputeRootUnorderedAccessView(4, slot_map_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(5, budget_gpu);
                 warp.list.Dispatch(1, 1, 1);
+                warp.list.ResourceBarrier(&[
+                    uav_barrier(),
+                    transition(
+                        &prepared,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    ),
+                    transition(
+                        &slot_map,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    ),
+                ]);
+                warp.list.SetComputeRootSignature(&warp.worker.root);
+                warp.list.SetPipelineState(&warp.worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                warp.list
+                    .ExecuteIndirect(&signature, 1, &prepared, 0, None, 0);
+                warp.list.ResourceBarrier(&[
+                    transition(
+                        &prepared,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                    transition(
+                        &slot_map,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                ]);
             }
-
-            warp.list.ResourceBarrier(&[
-                uav_barrier(),
-                transition(
-                    &prepared,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                ),
-            ]);
-            warp.list.SetComputeRootSignature(&warp.worker.root);
-            warp.list.SetPipelineState(&warp.worker.pso);
-            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
-            warp.list
-                .ExecuteIndirect(&signature, 1, &prepared, 0, None, 0);
 
             assert!(record_clamp(
                 &warp.clamp,
@@ -938,7 +998,7 @@ void main() {
         assert_eq!(
             source,
             [
-                0xff, 0xff, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0, 1, 0,
+                5, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0, 1, 0,
                 0, 0,
             ],
             "prep must leave the source arguments unchanged"
@@ -950,7 +1010,7 @@ void main() {
         );
         assert_eq!(
             hit_count,
-            GROUP_CAP + DISPATCH_GROUPS,
+            COUNTED_GROUPS + ATTEMPTS * GROUP_CAP + DISPATCH_GROUPS,
             "mesh prep must emit the bounded dispatch and preserve later indirect work"
         );
     }
