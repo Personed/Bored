@@ -6889,7 +6889,10 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        if self.list.initialized() {
+        if self.list.initialized() || crate::cardmeter::on() {
+            // With card metering on the pair is made even before the first
+            // command: its begin timestamp belongs at the reset, not at
+            // whichever command first happens to make the pair.
             // SAFETY: the list is not executing.
             let allocator = self.list.allocator();
             let reset = unsafe {
