@@ -81,6 +81,118 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+fn on_wine() -> bool {
+    static WINE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    });
+    *WINE
+}
+
+/// A title allocation as Wine reports it, in [`PAGE`] units.
+#[derive(Clone, Copy)]
+struct Region {
+    /// The allocation base, for dropping stale entries.
+    base: usize,
+    first: usize,
+    last: usize,
+    /// A file view (xmem's physical pages): not write-watched.
+    mapped: bool,
+    /// Small enough (4 GiB at most) to be asked about whole.
+    whole: bool,
+}
+
+/// Allocations seen by [`allocation`], by first page. Remaps (xmem's views)
+/// and failed askings drop entries.
+static REGIONS: Mutex<BTreeMap<usize, Region>> = Mutex::new(BTreeMap::new());
+
+fn forget_region(at: usize) {
+    // Interior writes count as much as ones at the base: any entry covering
+    // the write is stale.
+    let page = at / PAGE;
+    REGIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, r| !(r.first <= page && page < r.last));
+}
+
+/// The allocation holding `at`, cached by allocation base (walking an
+/// allocation's regions under Wine costs one VirtualQuery each). Those
+/// above 4 GiB are not asked about whole.
+fn allocation(at: usize) -> Option<Region> {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let page = at / PAGE;
+    // Known allocations first: under Wine VirtualQuery takes the same lock
+    // the title's write faults do.
+    if let Some((_, &r)) = REGIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=page)
+        .next_back()
+        && page < r.last
+    {
+        return Some(r);
+    }
+    let query = |p: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        (n != 0).then_some(info)
+    };
+    let info = query(at)?;
+    let base = info.AllocationBase as usize;
+    if base == 0 {
+        return None;
+    }
+    // Walk the allocation's regions (Wine splits it by protection, one
+    // region per run of pages); a long walk stops, and the allocation is
+    // then only remembered as far as it went, never asked about whole.
+    let mut end = base;
+    let mut done = false;
+    for _ in 0..256 {
+        let Some(i) = query(end) else {
+            done = true;
+            break;
+        };
+        if i.AllocationBase as usize != base {
+            done = true;
+            break;
+        }
+        end = i.BaseAddress as usize + i.RegionSize;
+    }
+    if !done {
+        // At least past `at`, so the next asking here is a cache hit.
+        end = end.max((at / PAGE + 1) * PAGE).max(at + (256 << 20));
+    }
+    if end <= at {
+        return None;
+    }
+    let r = Region {
+        base,
+        first: base.div_ceil(PAGE),
+        last: end / PAGE,
+        // An entry the walk did not complete covers unverified pages:
+        // they are not one memory type, so nothing is skipped for them.
+        mapped: done && info.Type == MEM_MAPPED,
+        whole: done && end - base <= (4usize << 30),
+    };
+    if r.first * PAGE > at || r.last <= r.first {
+        return None;
+    }
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    // An allocation that replaced older ones in its range.
+    regions.retain(|_, o| o.last <= r.first || o.first >= r.last);
+    regions.insert(r.first, r);
+    Some(r)
+}
+
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -400,27 +512,60 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
+    // Under Wine: view memory cannot be watched (straight to its guards),
+    // and watched memory is asked about whole allocations at a time, so the
+    // other buffers in one are answered from the journal for the rest of
+    // the submission — one GetWriteWatch costs about 1 ms there whatever
+    // the range (contention on Wine's virtual-memory lock with the title's
+    // write faults), and the world's copies ask about the same big buffers
+    // dozens of times per submission.
+    let region = if on_wine() { allocation(start) } else { None };
+    let mapped = region.is_some_and(|r| r.mapped) && !ask_anyway();
+    let (kfirst, klast) = match region {
+        Some(r) if !r.mapped && r.whole && r.first <= first && last <= r.last => (r.first, r.last),
+        _ => (first, last),
+    };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = known_view
-        || unsafe {
+    let known_view = (guarded && known_view(first * PAGE)) || mapped;
+    let mut granularity = 0;
+    let mut ask = |j: &mut Journal, kfirst: usize, klast: usize| -> Option<usize> {
+        let mut count = (klast - kfirst) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        // SAFETY: the answer buffer holds `count` entries.
+        let ok = unsafe {
             GetWriteWatch(
                 WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
+                (kfirst * PAGE) as *const _,
+                (klast - kfirst) * PAGE,
                 j.found.as_mut_ptr().cast(),
                 &mut count,
                 &mut granularity,
             )
-        } != 0;
+        } == 0;
+        ok.then_some(count)
+    };
+    let mut answer = if known_view {
+        None
+    } else {
+        ask(j, kfirst, klast)
+    };
+    // The wide asking answered: the whole allocation is covered. The narrow
+    // retry's answer covers only the range asked.
+    let wide = answer.is_some() && (kfirst, klast) != (first, last);
+    if answer.is_none() && !known_view && (kfirst, klast) != (first, last) {
+        // The allocation was not one watched range after all (or is gone):
+        // just ours, and look it up again next time.
+        if let Some(r) = region {
+            forget_region(r.base);
+        }
+        answer = ask(j, first, last);
+    }
+    let mut count = answer.unwrap_or(0);
+    let failed = answer.is_none();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
@@ -437,7 +582,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        let written = guard(first * PAGE, last * PAGE, mapped);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         written?
@@ -456,6 +601,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
+    }
+    if wide && j.kept {
+        // A whole allocation asked while a submission's batch asking
+        // stands: its other buffers answer from the journal for the rest of
+        // the submission instead of scanning it whole once a flush each
+        // (under Wine, about 1 ms a scan). Only then: the coverage dies with
+        // the batch at `ask_once_end` — outside a submission it would go
+        // stale with nothing to end it.
+        j.ahead.push((kfirst, klast));
+        j.ahead_asked = now;
     }
     Some((
         now,
@@ -504,6 +659,18 @@ impl Tracked {
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
+
+
+/// Whether the diagnostic switches ask the kernel even for memory known to
+/// be unwatchable (`VICTORY_VIEW_ASK=1` or `VICTORY_GUARD_ASK=1`).
+fn ask_anyway() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| {
+        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
+            .iter()
+            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
+    })
+}
 
 /// Whether the block holding `start` is view memory the guards already
 /// hold (read-only by our hand, or noted absent): asking the kernel's write
@@ -574,7 +741,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+fn guard(start: usize, end: usize, known_mapped: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -583,11 +750,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
-    };
+    let known = (known_mapped && !ask_anyway())
+        || !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+            let g = guards();
+            let first = start / BLOCK;
+            g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+        };
     if !known && !is_view(start, end) {
         return None;
     }
@@ -860,6 +1028,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
+    forget_region(at);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -1026,6 +1195,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1175,7 +1345,7 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        assert!(guard(view, view + 2 * BLOCK, false).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         // `ReadFile` inside: the kernel writes the view.
@@ -1195,7 +1365,7 @@ mod tests {
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
         assert_eq!(
-            guard(view, view + 2 * BLOCK),
+            guard(view, view + 2 * BLOCK, false),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
         // SAFETY: our view.
@@ -1253,7 +1423,7 @@ mod tests {
         let late = start + 2 * BLOCK + 3 * KERNEL_PAGE;
         commit(start, BLOCK);
         commit(early, KERNEL_PAGE);
-        let refresh = || guard(start, start + SIZE).unwrap();
+        let refresh = || guard(start, start + SIZE, false).unwrap();
         assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE]);
         // The last block is still entirely reserved.
         assert!(!refresh().contains(&(late / PAGE)));
@@ -1334,15 +1504,15 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         // The range begins in the placeholder, its middle block is a view.
         assert!(is_view(p, p + 3 * BLOCK));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()), "nothing written since");
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(all));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(Vec::new()), "nothing written since");
         // SAFETY: inside the mapped middle block.
         unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(pages(1).collect()));
         let first = map(0);
         title_memory_remapped(p, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(0).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(pages(0).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(Vec::new()));
         // Memory of ours that is no view stays none.
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
@@ -1421,16 +1591,16 @@ mod tests {
         let first = map(0);
         let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
         let all: Vec<usize> = (0..3).flat_map(pages).collect();
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(all));
         assert_eq!(
-            guard(p, p + 3 * BLOCK),
+            guard(p, p + 3 * BLOCK, false),
             Some(Vec::new()),
             "nothing written since"
         );
         let second = map(1);
         title_memory_remapped(p + BLOCK, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(Vec::new()));
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -1500,14 +1670,14 @@ mod tests {
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
         // The first check takes it in (and every view of its pages).
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(Vec::new()), "nothing written yet");
         // Writing through the other view faults into the handler, which
         // opens that view and the guarded one: the next check sees it.
         // SAFETY: the second view, read-write once the handler has opened it.
         unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(vec![pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
     }
 
@@ -1518,12 +1688,12 @@ mod tests {
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(Vec::new()), "nothing written yet");
         title_memory_remapped(other, SIZE);
         crate::inplace::title_memory_view(other, SIZE, section, 0);
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
     }
 
@@ -1534,14 +1704,14 @@ mod tests {
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(Vec::new()), "nothing written yet");
         writing(other + BLOCK, BLOCK);
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(vec![pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(Vec::new()));
         // Half a page and the next: both blocks, not just the first's.
         writing(other + BLOCK / 2, BLOCK);
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, false), Some(vec![pages(0), pages(1)]));
         drop_views(section, &[guarded, other], SIZE);
     }
 
@@ -1556,20 +1726,20 @@ mod tests {
         const SIZE: usize = 2 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
-        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0), pages(one, 1)]));
-        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0), pages(two, 1)]), "the second view's first check");
-        assert_eq!(guard(one, one + SIZE), Some(Vec::new()), "nothing written yet");
-        assert_eq!(guard(two, two + SIZE), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(one, one + SIZE, false), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE, false), Some(vec![pages(two, 0), pages(two, 1)]), "the second view's first check");
+        assert_eq!(guard(one, one + SIZE, false), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(two, two + SIZE, false), Some(Vec::new()), "nothing written yet");
         // SAFETY: the second view, read-write once the handler has opened it.
         unsafe { ((two + BLOCK + 8) as *mut u8).write(1) };
-        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 1)]));
-        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 1)]), "written through this view, checked second");
+        assert_eq!(guard(one, one + SIZE, false), Some(vec![pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE, false), Some(vec![pages(two, 1)]), "written through this view, checked second");
         // SAFETY: the first view, as above.
         unsafe { ((one + 8) as *mut u8).write(1) };
-        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0)]));
-        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0)]), "written through this view, checked second");
-        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
-        assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE, false), Some(vec![pages(two, 0)]));
+        assert_eq!(guard(one, one + SIZE, false), Some(vec![pages(one, 0)]), "written through this view, checked second");
+        assert_eq!(guard(one, one + SIZE, false), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE, false), Some(Vec::new()));
         drop_views(section, &[one, two], SIZE);
     }
 
@@ -1582,11 +1752,11 @@ mod tests {
         for n in 0..MANY_VIEWS {
             crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
         }
-        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + BLOCK, false), Some(vec![one / PAGE]));
         assert!(writable(two), "another view of it is left alone");
         // SAFETY: the guarded view, opened by the handler.
         unsafe { ((one + 8) as *mut u8).write(1) };
-        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + BLOCK, false), Some(vec![one / PAGE]));
         title_memory_remapped(filler, MANY_VIEWS * BLOCK);
         drop_views(section, &[one, two], BLOCK);
     }
