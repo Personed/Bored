@@ -1978,10 +1978,10 @@ fn sweep_scratch_chunks() {
 /// ([`crate::shadow::cards`]): the fetch list and the compare.
 struct CardWork {
     /// Lists not in use for bringing copies up to date before a submission
-    /// or comparing them after it. With prelude sharing these come from the
-    /// common pool instead and this stays empty; without it they are kept
-    /// here as before, so that submissions sent ahead ([`late`]) each have
-    /// their own pair.
+    /// or comparing them after it. Two are reserved here whether preludes
+    /// are shared or not, so that admitting card copies keeps the fallback
+    /// guarantee the first submission always had; peaks beyond them may use
+    /// the common pool.
     spare: Vec<Prelude>,
     /// After a submission ran: the pieces that differ come down.
     fetch: Prelude,
@@ -4281,6 +4281,21 @@ enum MeshSupport {
     Unsupported,
 }
 
+/// A card-copy sync/compare prelude, and whether it came from the shared
+/// pool. The two reserved in `CardWork` are used first, preserving the
+/// allocation-failure fallback card copies had before sharing; shared
+/// preludes serve only peaks past them.
+fn take_card_prelude(host: &Host, work: &mut CardWork) -> Option<(Prelude, bool)> {
+    if let Some(prelude) = work.spare.pop() {
+        return Some((prelude, false));
+    }
+    if share_preludes() {
+        take_prelude(host).map(|prelude| (prelude, true))
+    } else {
+        host.make_prelude().map(|prelude| (prelude, false))
+    }
+}
+
 impl Host {
     fn mesh_support(&self) -> MeshSupport {
         static MESH: OnceLock<MeshSupport> = OnceLock::new();
@@ -4558,11 +4573,7 @@ impl Host {
                         },
                         ..Default::default()
                     })?;
-            let spare = if share_preludes() {
-                Vec::new()
-            } else {
-                vec![list()?, list()?]
-            };
+            let spare = vec![list()?, list()?];
             Ok(CardWork {
                 spare,
                 fetch: list()?,
@@ -4809,7 +4820,7 @@ impl Host {
             }
         }
         if !dirty.is_empty() {
-            let Some(sync) = work.spare.pop().or_else(|| take_prelude(self)) else {
+            let Some((sync, sync_shared)) = take_card_prelude(self, work) else {
                 fail(format_args!(
                     "no host list to bring host copies in the card's memory up to date"
                 ));
@@ -4913,7 +4924,7 @@ impl Host {
                     "host copies in the card's memory could not be brought up to date ({e})"
                 ));
             }
-            used.push((false, sync));
+            used.push((sync_shared, sync));
         }
         numbered();
         drop(order);
@@ -4961,7 +4972,7 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.spare.pop().or_else(|| take_prelude(self)) else {
+            let Some((check, check_shared)) = take_card_prelude(self, work) else {
                 fail(format_args!(
                     "no host list for the compare of host copies in the card's memory"
                 ));
@@ -5077,7 +5088,7 @@ impl Host {
                     "the compare of host copies in the card's memory could not be recorded ({e})"
                 )),
             }
-            plan.lists.push((true, check));
+            plan.lists.push((check_shared, check));
         }
         work.out += 1;
         Some(plan)
@@ -5103,8 +5114,8 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
-        for (_, list) in plan.lists {
-            if share_preludes() {
+        for (shared, list) in plan.lists {
+            if shared {
                 give_prelude(list);
             } else {
                 work.spare.push(list);
