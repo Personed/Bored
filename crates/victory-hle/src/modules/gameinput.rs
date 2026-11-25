@@ -96,7 +96,8 @@ struct PadState {
 /// XInput rest thresholds (`XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE` and
 /// `XINPUT_GAMEPAD_TRIGGER_THRESHOLD`), so virtual or untouched controllers
 /// do not silence the keyboard stand-in pad.
-const STICK_DEADZONE: f32 = 8689.0 / 32767.0;
+const LEFT_STICK_DEADZONE: f32 = 7849.0 / 32767.0;
+const RIGHT_STICK_DEADZONE: f32 = 8689.0 / 32767.0;
 const TRIGGER_DEADZONE: f32 = 30.0 / 255.0;
 
 impl PadState {
@@ -104,10 +105,10 @@ impl PadState {
         self.buttons != 0
             || self.left_trigger > TRIGGER_DEADZONE
             || self.right_trigger > TRIGGER_DEADZONE
-            || self.left_x.abs() > STICK_DEADZONE
-            || self.left_y.abs() > STICK_DEADZONE
-            || self.right_x.abs() > STICK_DEADZONE
-            || self.right_y.abs() > STICK_DEADZONE
+            || self.left_x.abs() > LEFT_STICK_DEADZONE
+            || self.left_y.abs() > LEFT_STICK_DEADZONE
+            || self.right_x.abs() > RIGHT_STICK_DEADZONE
+            || self.right_y.abs() > RIGHT_STICK_DEADZONE
     }
 }
 
@@ -1205,6 +1206,16 @@ mod host {
         /// The cursor was put in the window's centre at the last poll, so its
         /// distance from there is the mouse's movement since.
         mouse_centred: bool,
+        /// Movement not yet fully reported: polls outnumber the title's
+        /// frames, so a movement sliced over several polls would mostly
+        /// never reach a frame. The stick reports the accumulator and the
+        /// accumulator decays, spreading the movement over a few polls.
+        mouse_x: f32,
+        mouse_y: f32,
+        /// The window capture started on; re-centring pauses while any
+        /// other window (a text-entry dialog shares the process, so the
+        /// focus check alone passes it) is in front.
+        game_window: Option<isize>,
     }
 
     /// `VICTORY_MOUSE`: the mouse drives the stand-in pad's camera while the
@@ -1287,12 +1298,23 @@ mod host {
                 self.mouse_centred = false;
                 return MouseState::default();
             }
+            // SAFETY: a plain query.
+            let window = unsafe { GetForegroundWindow() } as isize;
+            if self.game_window.is_none() {
+                self.game_window = Some(window);
+            }
+            if Some(window) != self.game_window {
+                // Another window of ours is in front (the text-entry
+                // dialog shares the process): the user needs the cursor.
+                self.mouse_centred = false;
+                return MouseState::default();
+            }
             let mut rect = RECT::default();
             let mut at = POINT::default();
             // SAFETY: plain queries on our own foreground window; the
             // outputs are ours.
             let (centre, read) = unsafe {
-                if GetWindowRect(GetForegroundWindow(), &mut rect) == 0 {
+                if GetWindowRect(window as _, &mut rect) == 0 {
                     return MouseState::default();
                 }
                 let centre = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
@@ -1302,15 +1324,19 @@ mod host {
             };
             // The first poll after gaining focus only centres the cursor.
             let moved = std::mem::replace(&mut self.mouse_centred, true) && read;
-            let (dx, dy) = if moved {
-                (at.x - centre.0, at.y - centre.1)
-            } else {
-                (0, 0)
-            };
+            if moved {
+                self.mouse_x += (at.x - centre.0) as f32;
+                self.mouse_y += (at.y - centre.1) as f32;
+            }
+            let (x, y) = (self.mouse_x, self.mouse_y);
+            // The accumulator decays once reported, so the movement
+            // survives into the title's next frame without repeating.
+            self.mouse_x *= 0.5;
+            self.mouse_y *= 0.5;
             let scale = STICK_PER_PIXEL * sensitivity;
             MouseState {
-                x: dx as f32 * scale,
-                y: -(dy as f32) * scale,
+                x: x * scale,
+                y: -(y) * scale,
                 // SAFETY: a plain query (VK_LBUTTON).
                 left: unsafe { GetAsyncKeyState(0x01) } < 0,
                 // SAFETY: a plain query (VK_RBUTTON).
