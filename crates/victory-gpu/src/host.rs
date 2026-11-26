@@ -1885,7 +1885,7 @@ struct Upload {
 // written only through the list that holds the upload.
 unsafe impl Send for Upload {}
 
-/// Upload buffers no list holds, exact-size as the copies ask for them.
+/// Upload buffers no list holds, by their committed-allocation size.
 static UPLOAD_SPARE: Mutex<Spare<Upload>> = Mutex::new(Spare::new());
 
 /// At most this much upload memory is kept for reuse.
@@ -1907,6 +1907,9 @@ fn count_upload(size: u64, add: bool) {
 }
 
 fn take_upload(host: &Host, size: u64) -> Option<Upload> {
+    // Committed D3D12 buffers occupy whole 64 KiB allocations; pooling by
+    // that size makes the retention cap and reuse classes match reality.
+    let size = size.max(1).next_multiple_of(64 << 10);
     if upload_pool()
         && let Some(upload) = UPLOAD_SPARE
             .lock()
@@ -7918,8 +7921,9 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset. Exact-size buffers are shared between lists after reset and
-    /// swept when idle: texture copies otherwise make and free the same
+    /// reset. Buffers are shared between lists by committed-allocation
+    /// size after reset and swept when idle: texture copies otherwise make
+    /// and free the same
     /// upload buffers frame after frame.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let upload = take_upload(host, size)?;
