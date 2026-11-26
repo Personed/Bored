@@ -914,8 +914,12 @@ mod tests {
     #[test]
     fn streams_yield_their_shaders() {
         let (ms, ps) = ([9u8; 7], [4u8; 5]);
-        let mut backing = vec![0u8; 0x2b1];
-        let stream = &mut backing[1..];
+        let mut backing = vec![0u64; 0x2b1_usize.div_ceil(8)];
+        // SAFETY: the bytes of `backing`, which is eight-byte aligned.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), 0x2b1)
+        };
+        let stream = &mut bytes[1..];
         assert_ne!(stream.as_ptr() as usize % 8, 0);
         let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
         for (at, kind) in [
