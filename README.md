@@ -91,9 +91,12 @@ with all of them, from about 120 ms in the morning. Still far from the console's
   gathered record again at its draw and comparing on the card
   (`VICTORY_INDIRECT_WINDOW_CHECK=1`): 7.9 million records, none differed.
   About 600 of the ~1,600 draws that missed a window are served; the
-  others come after a dispatch or a storing draw in their list. With
-  `VICTORY_CARD_REHASH_RUNS=1`: 104 -> 97 ms a frame (10.3 frames a
-  second at 3,800 draws).
+  others come after a dispatch or a storing draw in their list.
+- Card rehash passes join ranges that touch by default
+  (`VICTORY_CARD_REHASH_RUNS=0` restores one pass a range): the same
+  pieces are hashed once in fewer dispatches. With the indirect gathers
+  above this measured 104 -> 97 ms a frame (10.3 frames a second at
+  3,800 draws).
 - What the card's time is now, added up: of ~87 ms busy in a 97 ms
   frame, the layer's own lists are ~19 ms and its clamp passes 10-20 ms;
   about 50 ms are the title's own ~30 compute passes and its geometry at

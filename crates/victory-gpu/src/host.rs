@@ -2345,8 +2345,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (on by default; `VICTORY_CARD_REHASH_RUNS=0` restores a pass per
+/// range sent up).
 ///
 /// These passes are ours, they run on the card before every submission's
 /// lists, and no timing so far names them: each walks its 64 KiB pieces
@@ -2359,16 +2359,16 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// `VICTORY_CARD_REHASH_RUNS=alt`: twenty seconds with, twenty without, in
 /// turn, each change said in the log: one run then measures both on the
 /// same scene (the card meter's "send-and-hash lists" in the frame log).
-/// Runs 105-110 found no change in the frame, but the card was not the
-/// frame's limit then.
+/// Runs 105-110 found no change while the card was not the frame's limit;
+/// in the first rooms joining the runs measured 104 -> 97 ms a frame.
 fn rehash_runs() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
     match *MODE.get_or_init(
         || match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
-            Ok("1") => 1,
+            Ok("0") => 0,
             Ok("alt") => 2,
-            _ => 0,
+            _ => 1,
         },
     ) {
         0 => false,
