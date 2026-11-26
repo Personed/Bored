@@ -4458,6 +4458,8 @@ float4 lit() : SV_Target { return 1.0; }
             compute_mip_drop_with_floor(desc, requested, 1024)
         }
         assert_eq!(eligible(&tex2d(2048, 2048, 0, 28, 0), 1), 1);
+        assert_eq!(eligible(&tex2d(4096, 4096, 0, 28, 0), 2), 2);
+        assert_eq!(eligible(&tex2d(2048, 2048, 0, 28, 0), 2), 1);
         assert_eq!(eligible(&tex2d(1024, 1024, 0, 28, 0), 2), 0);
         assert_eq!(eligible(&tex2d(1920, 1080, 0, 28, 0), 1), 0);
         assert_eq!(eligible(&tex2d(2048, 2048, 0, 28, 1), 1), 0);
