@@ -3140,6 +3140,18 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// With `before` sent in the same host submission ahead of `after`: whether
+/// preparing `after` on the CPU can read or write title memory that shaders
+/// of `before` may write. Such a dependency needs a submission boundary, so
+/// the first flight's copy-back has landed before the later part is prepared.
+pub(crate) fn writes_block(before: &[&HostList], after: &[&HostList]) -> bool {
+    let mut written = Vec::new();
+    for (_, ranges) in declared_writes(before) {
+        join_ranges(&mut written, ranges.iter().copied());
+    }
+    blocked_by(&written, after, false).is_some()
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.

@@ -685,6 +685,19 @@ impl Joined {
         self.parts >= join_most() || self.order.len() >= join_lists()
     }
 
+    /// Whether preparing `lists` in the same host submission as the parts
+    /// already taken can use title memory before shaders of those parts
+    /// have written it back. Such a part starts another host submission.
+    fn conflicts(&self, lists: &[crate::list::Detached], order: &[usize]) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let before: Vec<&crate::host::HostList> =
+            self.order.iter().map(|&i| self.lists[i].host()).collect();
+        let after: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+        crate::host::writes_block(&before, &after)
+    }
+
     /// Whether a bottom-of-pipe write of a part taken meets `wait`.
     fn meets(&self, wait: &crate::list::ValueWait) -> bool {
         let (address, bytes) = wait.place();
@@ -882,7 +895,16 @@ fn release_held_now(all: bool) {
                         }
                         if joining {
                             // Taken, to go with the parts that follow it.
-                            // The line stays open behind our mark.
+                            // The line stays open behind our mark. A part
+                            // whose preparation may read what shaders of the
+                            // parts taken write starts another submission:
+                            // otherwise that memory is prepared before the
+                            // writes have come back.
+                            if joined.conflicts(&lists, &order) {
+                                drop(held);
+                                send_joined(&mut joined);
+                                held = lock(line);
+                            }
                             if !joined.marked.contains(&q) {
                                 held.insert(0, Held::Running);
                                 joined.marked.push(q);
