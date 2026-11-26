@@ -1228,11 +1228,8 @@ impl Staging {
         let start = self.footprints[index].Offset;
         let end = self
             .footprints
-            .iter()
-            .map(|f| f.Offset)
-            .filter(|&at| at > start)
-            .min()
-            .unwrap_or(self.bytes);
+            .get(index + 1)
+            .map_or(self.bytes, |next| next.Offset);
         end.saturating_sub(start) as usize
     }
 
