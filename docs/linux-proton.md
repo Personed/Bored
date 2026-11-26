@@ -15,7 +15,13 @@ Tested on one machine (2026-11-24): CachyOS, Linux 7.3, AMD RX 9070 XT
   may not work: GE-Proton 11-11's vkd3d-proton turns some translated
   shaders into invalid SPIR-V, on which RADV crashes (`vkCreateGraphicsPipelines`,
   exit code 3).
-- A Vulkan driver with mesh shaders (RADV on RDNA 2 or later has them).
+- Shader model 6.6 through vkd3d-proton. A Vulkan driver with mesh
+  shaders is preferred (RADV on RDNA 2 or later has them); GPUs without
+  them, including Polaris cards such as the RX 580, use VIctory's mesh
+  emulation instead when the driver exposes shader model 6.6. The emulated
+  path is compatibility work, not a performance substitute for hardware
+  mesh shaders. `VICTORY_MESH_EMULATION=1` forces it for comparison and
+  `VICTORY_MESH_EMULATION=0` disables it.
 - `rustup` and [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)
   to build the Windows target on Linux.
 
