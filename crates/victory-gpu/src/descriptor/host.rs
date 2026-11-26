@@ -1947,7 +1947,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: if size == 0 { 0 } else { size.next_multiple_of(256) },
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -3074,6 +3074,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if address == 0 && size == 0 {
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                // SAFETY: a slot of our heap; a zero location makes a null view.
+                unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+                return Some(None);
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             let Some(desc) = constant_desc(gpu, size) else {
