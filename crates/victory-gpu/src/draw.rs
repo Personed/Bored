@@ -1868,7 +1868,9 @@ impl State {
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);
         if bake {
-            BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            let took = began.elapsed().as_micros() as u64;
+            crate::framelog::add(crate::framelog::T::BakeTextureUs, took);
+            BAKED_MS.fetch_add(took / 1000, Ordering::Relaxed);
         }
     }
 
@@ -1985,6 +1987,9 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        let pass_started = std::time::Instant::now();
+        let mut pass_bytes = 0;
+        let mut pass_slots = 0;
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
@@ -2315,6 +2320,8 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            pass_bytes += bytes;
+            pass_slots += 1;
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
@@ -2332,6 +2339,12 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        crate::framelog::add(
+            crate::framelog::T::HeapTextureUs,
+            pass_started.elapsed().as_micros() as u64,
+        );
+        crate::framelog::add(crate::framelog::T::HeapTextureBytes, pass_bytes);
+        crate::framelog::add(crate::framelog::T::HeapTextureSlots, pass_slots);
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
