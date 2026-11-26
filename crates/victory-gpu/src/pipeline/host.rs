@@ -624,6 +624,16 @@ fn emulated_mesh_pipeline(
             return None;
         }
     };
+    let fallback_gs = match ps_dxil {
+        Some(ps) => match victory_shader::emit::barycentric_gs(&unpack_vs, ps) {
+            Ok(gs) => gs,
+            Err(e) => {
+                tracing::warn!(error = %e, ?shaders, "barycentric fallback geometry shader generation failed");
+                return None;
+            }
+        },
+        None => None,
+    };
     let mut gfx_params = Vec::new();
     let mut gfx_ranges = Vec::new();
     let mut gfx_samplers = Vec::new();
@@ -672,6 +682,14 @@ fn emulated_mesh_pipeline(
             pShaderBytecode: unpack_vs.as_ptr().cast(),
             BytecodeLength: unpack_vs.len(),
         },
+        GS: fallback_gs
+            .as_ref()
+            .map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }
+            }),
         PS: ps_code,
         BlendState: g.blend,
         SampleMask: g.sample_mask,
@@ -695,12 +713,11 @@ fn emulated_mesh_pipeline(
         false
     };
     let state = g.describe();
-    let gfx_name = super::library::name(
-        "mesh-emu-gfx",
-        &gfx_root_blob,
-        &[&unpack_vs, ps_dxil.unwrap_or(&[])],
-        &state,
-    );
+    let mut gfx_shaders: Vec<&[u8]> = vec![&unpack_vs, ps_dxil.unwrap_or(&[])];
+    if let Some(gs) = &fallback_gs {
+        gfx_shaders.push(gs);
+    }
+    let gfx_name = super::library::name("mesh-emu-gfx", &gfx_root_blob, &gfx_shaders, &state);
     let made = if depth_bounds {
         graphics_depth_bounds_pipeline(&host.device, &gfx_root, &gfx_desc, g.depth1(), &gfx_name)
     } else {
@@ -1051,13 +1068,42 @@ impl HostPipeline {
         // that completes each one from the three vertices the vertex
         // shader made. Without it (refused here or by the host) the draws
         // fall back on what `draw` does for rectangles.
+        let rectangles = g.topology.0 == RECTANGLES;
+        let ps_dxil = stages
+            .get(1)
+            .and_then(|(s, _)| s.translated())
+            .map(|t| t.host.dxil.as_slice());
+        let needs_barycentric_fallback = match ps_dxil {
+            Some(ps) => match victory_shader::emit::requires_barycentric_fallback(ps) {
+                Ok(needs) => needs,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "pixel signature could not be read");
+                    return None;
+                }
+            },
+            None => false,
+        };
+        let vs_dxil = &stages[0].0.translated()?.host.dxil;
         let mut rect_gs = None;
-        if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+        if rectangles {
+            match victory_shader::emit::rect_list_gs(vs_dxil, ps_dxil) {
                 Ok(gs) => rect_gs = Some(gs),
-                Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage");
+                    if needs_barycentric_fallback {
+                        return None;
+                    }
+                }
+            }
+        } else if needs_barycentric_fallback {
+            match ps_dxil.map(|ps| victory_shader::emit::barycentric_gs(vs_dxil, ps)) {
+                Some(Ok(Some(gs))) => rect_gs = Some(gs),
+                Some(Ok(None)) => return None,
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, ?shaders, "no barycentric fallback geometry stage");
+                    return None;
+                }
+                None => return None,
             }
         }
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
@@ -1096,14 +1142,20 @@ impl HostPipeline {
         };
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
-        let name = |gs: Option<&Vec<u8>>| match gs {
-            Some(gs) => super::library::name(
+        let name = |gs: Option<&Vec<u8>>| match (gs, rectangles) {
+            (Some(gs), true) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
                 &state,
             ),
-            None => super::library::name(
+            (Some(gs), false) => super::library::name(
+                "graphics barycentric fallback",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &state,
+            ),
+            (None, _) => super::library::name(
                 "graphics",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
@@ -1123,7 +1175,7 @@ impl HostPipeline {
             )
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
-        if made.is_err() && rect_gs.is_some() {
+        if made.is_err() && rect_gs.is_some() && !needs_barycentric_fallback {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(
                 ?shaders,
@@ -1164,7 +1216,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
-            rects: rect_gs.is_some(),
+            rects: rectangles && rect_gs.is_some(),
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {

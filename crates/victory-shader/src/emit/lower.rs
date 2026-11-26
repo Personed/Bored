@@ -1026,10 +1026,19 @@ fn lane_constant_masks(st: &Structured) -> bool {
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Whether the host rasterizer supplies `SV_Barycentrics` (unknown hosts
+/// keep the native path; runtime devices set this after feature discovery).
+static HOST_BARYCENTRICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// The host GPU's `WaveLaneCountMax`: 32 lets console wave64 compute programs whose cross-lane
 /// code stays inside 32-lane halves run in waves of 32 instead of being refused.
 pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The host GPU's `D3D12_OPTIONS3.BarycentricsSupported`.
+pub fn set_host_barycentrics(supported: bool) {
+    HOST_BARYCENTRICS.store(supported, std::sync::atomic::Ordering::Relaxed);
 }
 
 thread_local! {
@@ -1039,6 +1048,9 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
+    /// A test's barycentrics capability, for its thread only.
+    pub(super) static TEST_HOST_BARYCENTRICS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1132,6 +1144,14 @@ pub fn host_max_wave() -> u32 {
         return lanes;
     }
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn host_barycentrics() -> bool {
+    #[cfg(test)]
+    if let Some(supported) = TEST_HOST_BARYCENTRICS.get() {
+        return supported;
+    }
+    HOST_BARYCENTRICS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -2844,45 +2864,16 @@ impl<'a> Lower<'a> {
         if index > 1 {
             return Val::Missing("pull-model barycentrics");
         }
-        // One element per interpolation mode (the console's own, if its
-        // signature declares one): DXIL allows two.
-        let bary = |e: &SigElement| e.kind == 28;
-        let id = match self
-            .s
-            .inputs
-            .iter()
-            .position(|e| bary(e) && (e.interp == mode || e.usage == 0))
-        {
-            Some(id) => id,
-            None => {
-                let index = self.s.inputs.iter().filter(|e| bary(e)).count() as u32;
-                if index >= 2 {
-                    return Val::Missing("barycentrics of a third interpolation mode");
-                }
-                // A system value the validator wants unpacked (packing
-                // location -1), like other non-packed system values.
-                self.s.inputs.push(SigElement {
-                    name: "SV_Barycentrics".into(),
-                    index,
-                    kind: 28,
-                    comp: 9,
-                    interp: mode,
-                    row: None,
-                    col: 0,
-                    cols: 3,
-                    usage: 0,
-                    half: false,
-                });
-                self.s.inputs.len() - 1
-            }
+        let fallback = !host_barycentrics();
+        // DXIL has two input slots; on older hosts, an ordinary interpolant
+        // is filled by the geometry stage with one-hot vertex weights.
+        let id = match super::barycentric::input_id(&mut self.s.inputs, mode, fallback) {
+            Ok(id) => id,
+            Err(reason) => return Val::Missing(reason),
         };
-        let e = &mut self.s.inputs[id];
-        if e.col != 0 || e.cols < 3 {
-            return Val::Missing("a console barycentrics element without i and j");
+        if !fallback {
+            self.s.flags |= flags::BARYCENTRICS;
         }
-        e.row = None;
-        e.interp = mode;
-        self.s.flags |= flags::BARYCENTRICS;
         self.load_any_input(id, index + 1)
     }
 

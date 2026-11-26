@@ -56,16 +56,31 @@ pub fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError
         }
     };
     let outputs = sig(vs, FourCC::OSG1)?;
-    let wanted = match ps {
-        Some(ps) => sig(ps, FourCC::ISG1)?,
-        None => Vec::new(),
+    let (wanted, ps_modes) = match ps {
+        Some(ps) => {
+            let c = Container::parse(ps)?;
+            let wanted = match c.part(FourCC::ISG1) {
+                Some(part) => super::signature(part.data)?,
+                None => Vec::new(),
+            };
+            let modes = c
+                .part(FourCC::PSV0)
+                .map(|part| super::mesh_emu::psv_input_interps(part.data))
+                .unwrap_or_default();
+            (wanted, modes)
+        }
+        None => (Vec::new(), Vec::new()),
     };
-    build(outputs, &wanted)
+    build(outputs, &wanted, &ps_modes)
 }
 
 /// [`rect_list_gs`] from the vertex shader's outputs and the pixel
 /// shader's inputs.
-fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u8>, ShaderError> {
+fn build(
+    mut outputs: Vec<SigElement>,
+    ps_inputs: &[SigElement],
+    ps_modes: &[(u32, u8, u8, u8)],
+) -> Result<Vec<u8>, ShaderError> {
     let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
     if outputs.iter().any(|e| e.row.is_none()) {
         return Err(unsupported("a rectangle list output without a register"));
@@ -89,11 +104,12 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         };
         e.usage = (1 << e.cols) - 1;
     }
+    let vertex_outputs = outputs.clone();
     let mut s = Shader::new(false);
     s.geometry = Some(Geometry {
         max_vertices: VERTICES,
     });
-    s.inputs = outputs.clone();
+    s.inputs = vertex_outputs;
     // The primitive id the pixel shader declares, as one more output.
     let wanted = ps_inputs
         .iter()
@@ -120,6 +136,35 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         }
         None => None,
     };
+    let mut bary_output_ids = Vec::new();
+    let first_bary_row = outputs
+        .iter()
+        .filter_map(|e| e.row)
+        .max()
+        .map_or(0, |row| row + 1);
+    for (row, bary) in (first_bary_row..).zip(
+        ps_inputs
+            .iter()
+            .filter(|e| super::barycentric::is_fallback_input(e)),
+    )
+    {
+        if bary.comp != 9 || bary.col != 0 || bary.cols != 3 {
+            return Err(unsupported("a malformed rectangle barycentric input"));
+        }
+        let mut output = bary.clone();
+        output.interp = ps_modes
+            .iter()
+            .find(|&&(row, col, kind, _)| {
+                Some(row) == bary.row && col == bary.col && kind == bary.kind
+            })
+            .map_or(2, |&(_, _, _, mode)| mode);
+        output.row = Some(row);
+        output.col = 0;
+        output.cols = 3;
+        output.usage = 0x7;
+        bary_output_ids.push(outputs.len());
+        outputs.push(output);
+    }
     let scalars: u32 = outputs.iter().map(|e| u32::from(e.cols)).sum();
     if scalars * VERTICES > MAX_SCALARS {
         return Err(unsupported(
@@ -233,6 +278,14 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
             let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(0), n];
             s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &args);
         }
+        let bary_vertex = (vertex % 3) as u8;
+        for &id in &bary_output_ids {
+            for col in 0..3u8 {
+                let value = s.m.f32(super::barycentric::weight_bits(col, bary_vertex));
+                let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), value];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+        }
         s.op(b, "emitStream", Attr::NoUnwind, s.t.void, 97, &[stream]);
         // The strip ends after the first triangle.
         if vertex == 2 {
@@ -311,7 +364,7 @@ mod tests {
     #[test]
     fn the_rectangle_stage_is_a_geometry_shader() {
         let wanted = [element("SV_PrimitiveID", 0, 10, 5, 3, 1)];
-        let gs = build(outputs(), &wanted).unwrap();
+        let gs = build(outputs(), &wanted, &[]).unwrap();
         let c = Container::parse(&gs).unwrap();
         // Program version: geometry (2), shader model 6.6.
         assert_eq!(c.part(FourCC::DXIL).unwrap().data[..4], [0x66, 0, 2, 0]);
@@ -334,27 +387,61 @@ mod tests {
             super::super::validator::Validator::default_path().as_deref(),
         ) {
             v.validate(&mut gs.clone()).unwrap();
-            let plain = build(outputs(), &[]).unwrap();
+            let plain = build(outputs(), &[], &[]).unwrap();
             v.validate(&mut plain.clone()).unwrap();
         }
+    }
+
+    #[test]
+    fn the_rectangle_stage_can_emit_barycentric_fallbacks() {
+        let mut bary = element(super::super::barycentric::FALLBACK_SEMANTIC, 0, 0, 9, 2, 3);
+        bary.usage = 0x7;
+        let gs = build(outputs(), &[bary], &[(2, 0, 0, 5)]).unwrap();
+        let c = Container::parse(&gs).unwrap();
+        let sig = |fourcc| super::super::signature(c.part(fourcc).unwrap().data).unwrap();
+        let outputs = sig(FourCC::OSG1);
+        assert_eq!(outputs.len(), 4);
+        assert_eq!(
+            outputs[3].name,
+            super::super::barycentric::FALLBACK_SEMANTIC
+        );
+
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let input_count = usize::from(psv[4 + 28]);
+        let output_count = usize::from(psv[4 + 29]);
+        assert_eq!((input_count, output_count), (3, 4));
+        let mut at = 4 + u32::from_le_bytes(psv[..4].try_into().unwrap()) as usize;
+        let bindings = u32::from_le_bytes(psv[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        if bindings != 0 {
+            let stride = u32::from_le_bytes(psv[at..at + 4].try_into().unwrap()) as usize;
+            at += 4 + bindings * stride;
+        }
+        let strings = u32::from_le_bytes(psv[at..at + 4].try_into().unwrap()) as usize;
+        at += 4 + strings;
+        let indices = u32::from_le_bytes(psv[at..at + 4].try_into().unwrap()) as usize;
+        at += 4 + indices * 4;
+        let stride = u32::from_le_bytes(psv[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        assert_eq!(psv[at + (input_count + 3) * stride + 13], 5);
     }
 
     /// Refused with a reason: no position, a primitive id in a register a
     /// vertex output has, more components than six vertices may carry.
     #[test]
     fn rectangle_stages_that_cannot_be_made_are_refused() {
-        assert!(build(outputs()[1..].to_vec(), &[]).is_err());
+        assert!(build(outputs()[1..].to_vec(), &[], &[]).is_err());
         let taken = [element("SV_PrimitiveID", 0, 10, 5, 1, 1)];
-        assert!(build(outputs(), &taken).is_err());
+        assert!(build(outputs(), &taken, &[]).is_err());
         let mut many = vec![element("SV_Position", 0, 3, 9, 0, 4)];
         many.extend((1..=43).map(|row| element("TEXCOORD", row - 1, 0, 9, row, 4)));
-        assert!(build(many, &[]).is_err());
+        assert!(build(many, &[], &[]).is_err());
     }
 
     /// A vertex shader that passes a position and a float4 through, and a
-    /// pixel shader that writes the float4.
+    /// pixel shader that writes the float4 or the three fallback weights.
     #[cfg(windows)]
-    fn pass_through() -> (super::super::HostShader, super::super::HostShader) {
+    fn pass_through(barycentrics: bool) -> (super::super::HostShader, super::super::HostShader) {
         let position = SigElement {
             interp: 4,
             usage: 15,
@@ -377,25 +464,43 @@ mod tests {
             },
         ];
         vs.outputs = vec![position.clone(), coord.clone()];
+        if barycentrics {
+            vs.inputs.pop();
+            vs.outputs.pop();
+        }
         let mut ps = Shader::new(true);
         ps.inputs = vec![
             SigElement {
                 usage: 0,
                 ..position
             },
-            coord,
+            if barycentrics {
+                SigElement {
+                    interp: 2,
+                    usage: 7,
+                    ..element(super::super::barycentric::FALLBACK_SEMANTIC, 0, 0, 9, 1, 3)
+                }
+            } else {
+                coord
+            },
         ];
         ps.outputs = vec![SigElement {
             usage: 15,
             ..element("SV_Target", 0, 16, 9, 0, 4)
         }];
         // Vertex: output id from input id. Pixel: target 0 from input 1.
-        for (s, copies) in [(&mut vs, &[(0, 0), (1, 1)][..]), (&mut ps, &[(1, 0)][..])] {
+        let vertex_copies = [(0, 0), (1, 1)];
+        let vertex_copies = &vertex_copies[..vs.outputs.len()];
+        for (s, copies) in [(&mut vs, vertex_copies), (&mut ps, &[(1, 0)][..])] {
             let b = s.entry;
             for &(from, to) in copies {
                 for col in 0..4 {
-                    let args = [s.m.i32(from), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
-                    let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                    let v = if col < s.inputs[from as usize].cols {
+                        let args = [s.m.i32(from), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                        s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
+                    } else {
+                        s.m.f32(1.0f32.to_bits())
+                    };
                     let args = [s.m.i32(to), s.m.i32(0), s.m.i8(col), v];
                     s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
                 }
@@ -433,7 +538,7 @@ mod tests {
             eprintln!("no SM 6.6 device; skipped");
             return;
         };
-        let (vs, ps) = pass_through();
+        let (vs, ps) = pass_through(false);
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -480,6 +585,54 @@ mod tests {
                 missing >= 24,
                 "{name}: only {missing} texels need the stage"
             );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fallback_weights_reach_the_pixel_shader() {
+        use super::super::host::{Draw, Host, stub_vs};
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let (vs, ps) = pass_through(true);
+        host.pipeline(&stub_vs(&ps).unwrap(), &ps).unwrap();
+        let root = host.root_signature(&vs, &ps).unwrap();
+        let rect = rect_list_gs(&vs.dxil, Some(&ps.dxil)).unwrap();
+        let vertices = [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0)]
+            .map(|(x, y)| [x, y, 0.5, 1.0, x, y, 0.0, 1.0])
+            .concat();
+        let draw = Draw {
+            roots: Vec::new(),
+            textures: &[],
+            samplers: &[],
+            vertices: &vertices,
+            stride: 32,
+            size: (8, 8),
+            mesh_groups: 0,
+        };
+        let near = |got: &[f32], want: &[f32]| {
+            assert!(
+                got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4),
+                "got {got:?}, expected {want:?}"
+            );
+        };
+        for gs in [None, Some(rect.as_slice())] {
+            let pso = host
+                .pipeline_with_gs(&root, &vs.dxil, gs, &ps.dxil)
+                .unwrap_or_else(|err| panic!("rectangle stage: {}, {err}", gs.is_some()));
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            if gs.is_some() {
+                // The rectangle's first triangle runs from top-left to
+                // bottom-left to the synthesized bottom-right vertex.
+                near(&texels[8], &[0.8125, 0.125, 0.0625, 1.0]);
+                for texel in texels {
+                    near(&[texel[..3].iter().sum(), texel[3]], &[1.0, 1.0]);
+                }
+            } else {
+                near(&texels[0], &[0.875, 0.0625, 0.0625, 1.0]);
+            }
         }
     }
 }

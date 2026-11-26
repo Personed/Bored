@@ -372,6 +372,11 @@ fn build_output_plan(
             .unwrap_or_default();
 
         for pi in &ps_inputs {
+            // The geometry barycentric fallback creates this varying after
+            // the unpack VS, using the primitive's vertex order.
+            if super::barycentric::is_fallback_input(pi) {
+                continue;
+            }
             if !matches!(pi.kind, 0 | 3 | 4 | 5 | 6 | 7) {
                 continue;
             }
@@ -540,7 +545,7 @@ fn find_mesh_output<'a>(outputs: &'a [MeshOutput], pi: &SigElement) -> Option<&'
 }
 
 /// Reads `(row, col, kind, interp)` tuples for `PSV0` input signature elements.
-fn psv_input_interps(psv: &[u8]) -> Vec<(u32, u8, u8, u8)> {
+pub(super) fn psv_input_interps(psv: &[u8]) -> Vec<(u32, u8, u8, u8)> {
     let Ok(info_size) = u32_at(psv, 0).map(|n| n as usize) else {
         return Vec::new();
     };
