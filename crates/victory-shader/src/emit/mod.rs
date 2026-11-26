@@ -122,6 +122,27 @@ pub use shader::{
     USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
+static HOST_MIN_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Set the wave-lane range reported by D3D12.
+pub fn set_host_wave_range(min: u32, max: u32) {
+    HOST_MIN_WAVE.store(min, std::sync::atomic::Ordering::Relaxed);
+    set_host_max_wave(max);
+}
+
+fn host_min_wave() -> u32 {
+    #[cfg(all(test, windows))]
+    if let Some(min) = TEST_HOST_MIN_WAVE.get() {
+        return min;
+    }
+    HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static TEST_HOST_MIN_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -221,6 +242,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&host_min_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
