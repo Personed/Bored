@@ -1863,12 +1863,13 @@ impl State {
                 "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
             );
         }
+        let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
         let took = self.heap_textures(list, heap, host).as_micros() as u64;
         PASS_BUDGET.set(None);
         if bake {
             crate::framelog::add(crate::framelog::T::BakeTextureUs, took);
-            BAKED_MS.fetch_add(took / 1000, Ordering::Relaxed);
+            BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
     }
 
