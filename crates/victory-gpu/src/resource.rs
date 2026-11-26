@@ -279,7 +279,8 @@ pub(crate) fn target_format(format: u32) -> u32 {
                 };
                 let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
-                let refused = asked.is_err() || support.Support1.0 & both != both;
+                let stores = support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+                let refused = asked.is_err() || support.Support1.0 & both != both || !stores;
                 if refused {
                     tracing::info!(
                         format = f,
