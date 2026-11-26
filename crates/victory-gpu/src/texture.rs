@@ -863,6 +863,13 @@ pub(crate) fn refresh_copy_source(resource: This, texture: &ID3D12Resource) {
         wait.set(wait.get() + 1);
         let read = staging.refresh_now();
         wait.set(wait.get() - 1);
+        // The copy's submission must look again even when this texture is
+        // partly mapped: more of it may arrive before the list runs.
+        staging
+            .last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .partial = None;
         let preparing = &crate::host::PREPARING;
         preparing[3].fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
     });
