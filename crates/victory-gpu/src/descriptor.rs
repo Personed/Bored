@@ -1526,6 +1526,14 @@ mod tests {
 
         #[cfg(windows)]
         {
+            assert!(
+                !SHADER_HEAPS
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|&(start, end, _)| (start..end).contains(&address)),
+                "the released heap left the registry"
+            );
             // Reuse the address without relying on the allocator to give it
             // to another test. The descriptor write must reach the new heap.
             assert_eq!(create(desc, placement, &mut h), S_OK);
