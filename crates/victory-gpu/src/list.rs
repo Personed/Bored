@@ -939,6 +939,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
+                crate::texture::refresh_copy_source(src, from);
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.

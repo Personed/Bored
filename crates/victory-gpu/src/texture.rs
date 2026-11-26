@@ -484,6 +484,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     true
 }
 
+thread_local! {
+    /// CopyResource sources waiting for remap exclusion on this thread.
+    static WAIT_FOR_COPY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether a texture refresh that finds the runtime remapping title memory
 /// goes on without waiting for it (on by default;
 /// `VICTORY_TEXTURE_NO_WAIT=0` restores the wait).
@@ -509,6 +514,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
+        && WAIT_FOR_COPY.with(|wait| wait.get() == 0)
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -842,6 +848,24 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+}
+
+/// Refreshes a texture used as a CopyResource source, waiting for remap
+/// exclusion even when ordinary texture refreshes do not. A failed refresh
+/// at submission must not leave the copy destination with pixels older than
+/// the copy the title asked for: the destination is host-written afterwards
+/// and cannot be repaired by the source's later upload.
+pub(crate) fn refresh_copy_source(resource: This, texture: &ID3D12Resource) {
+    let Some(staging) = staging(resource, texture) else {
+        return;
+    };
+    WAIT_FOR_COPY.with(|wait| {
+        wait.set(wait.get() + 1);
+        let read = staging.refresh_now();
+        wait.set(wait.get() - 1);
+        let preparing = &crate::host::PREPARING;
+        preparing[3].fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 /// Records, once per list, the copy of `resource`'s staging buffer into
