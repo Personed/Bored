@@ -2459,6 +2459,8 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// Work that reads title memory and writes host memory only.
+    HostRead(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -3137,13 +3139,30 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, runs, true, false)
+}
+
+/// With `before` sent in the same host submission ahead of `after`: whether
+/// preparing `after` on the CPU can read or write title memory that shaders
+/// of `before` may write. Such a dependency needs a submission boundary, so
+/// the first flight's copy-back has landed before the later part is prepared.
+pub(crate) fn writes_block(before: &[&HostList], after: &[&HostList]) -> bool {
+    let mut written = Vec::new();
+    for (_, ranges) in declared_writes(before) {
+        join_ranges(&mut written, ranges.iter().copied());
+    }
+    blocked_by(&written, after, false, true).is_some()
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    count: bool,
+    strict: bool,
+) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -3159,7 +3178,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !strict && !touches(written, dst, dst + len) && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3177,7 +3196,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if !strict && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3200,7 +3219,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) | Step::HostRead(_) => return Some(WHY_RUN),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
@@ -6392,7 +6411,9 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| {
+                    blocked_by(&line.written, runs, false, false).is_none()
+                });
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -8206,6 +8227,11 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// As [`HostList::defer_host`], for work that also reads title memory.
+    pub(crate) fn defer_host_read(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::HostRead(Box::new(work)));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
@@ -8278,7 +8304,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(work) | Step::HostRead(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
