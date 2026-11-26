@@ -2259,6 +2259,9 @@ fn mip_drop_floor() -> u64 {
         let configured = std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok());
+        if configured.is_some() {
+            return mip_drop_floor_value(None, configured);
+        }
         mip_drop_floor_value(
             crate::host::host().and_then(|h| h.dedicated_memory()),
             configured,
