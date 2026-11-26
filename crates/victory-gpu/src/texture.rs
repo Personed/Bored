@@ -142,11 +142,12 @@ struct Spare(ID3D12Resource, usize, u64);
 // spare.
 unsafe impl Send for Spare {}
 
-/// Spare staging buffers by size (a power of two), and their bytes in all.
+/// Spare staging buffers by allocation class (a power of two up to 8 MiB,
+/// then the driver's 64 KiB granularity), and their bytes in all.
 static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
 /// The most bytes kept spare, and the largest buffer that is pooled.
-const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+const SPARE_MOST: (u64, u64) = (256 << 20, 32 << 20);
 /// Staging buffers taken from the spare ones, and made, since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -160,12 +161,19 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] =
 /// threads for some 100 uploads, most of it the graphics kernel waiting)
 /// and more to free on the thread that submits. A streaming burst is 200
 /// to 500 uploads in a frame (run 222), and those are the frames that
-/// dip. Buffers of up to 8 MiB are now kept by size and used again,
-/// zeroed as a new one is (levels not there yet must read as zeros).
+/// dip. Buffers of up to 32 MiB are now kept by size and used again,
+/// zeroed as a new one is (levels not there yet must read as zeros). Small
+/// buffers use power-of-two classes for reuse; larger ones use the driver's
+/// 64 KiB allocation granularity, so pooling a 17 MiB texture does not
+/// allocate a 32 MiB buffer.
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let size = total.max(64 << 10).next_power_of_two();
+    let size = if total <= (8 << 20) {
+        total.max(64 << 10).next_power_of_two()
+    } else {
+        total.next_multiple_of(64 << 10)
+    };
     if size > SPARE_MOST.1
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0"))
     {
