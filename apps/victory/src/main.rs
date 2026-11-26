@@ -161,6 +161,9 @@ fn main() -> Result<()> {
             jobs,
             warm,
         } => {
+            if warm.is_some() {
+                victory_hle::modules::d3d12x::probe_shader_cache_host();
+            }
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
                 .ok()

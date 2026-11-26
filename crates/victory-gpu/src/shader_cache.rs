@@ -86,6 +86,11 @@ fn build() -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Initialize the local translation capabilities before applying offline overrides.
+pub fn probe_host() {
+    crate::descriptor::host::probe_view_limit();
+}
+
 /// The offline warm-up (`victory translate --warm`): `container` is
 /// translated into the cache unless it is there already. `Ok(true)`: it
 /// was translated now. Needs [`use_shader_cache`] and the same host facts
@@ -93,7 +98,7 @@ fn build() -> [u8; 32] {
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
     // The translation depends on the view-index cap as at runtime.
-    crate::descriptor::host::probe_view_limit();
+    probe_host();
     let ran = AtomicBool::new(false);
     // The mode the runtime translates with on this machine: an emulated
     // mesh shader's cache entry is another key than the native one's, so a
