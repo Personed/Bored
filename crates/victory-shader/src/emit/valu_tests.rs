@@ -2465,3 +2465,32 @@ fn v_sad_family_matches_rdna2() {
         },
     );
 }
+
+/// v_cvt_f32_u32 rounds a full-width unsigned conversion once: the WARP
+/// misroundings upstream observed (0xDE84_975E, 0xFFFF_FF7F), the neighbors
+/// of round-to-nearest midpoints, and the edges. Upstream 084d4ff's
+/// regression, on this tree's GPU case runner.
+#[test]
+fn cvt_f32_u32_rounds_full_width_inputs_once() {
+    // VOP1 v_cvt_f32_u32 = 0x06; the input arrives in v1 from user data.
+    let shader = build_valu_cs(&[vop1(0x06, 0, vgpr(1))]);
+    let mut inputs: Vec<u32> = vec![0, 1, 0xDE84_975E, 0xFFFF_FF7F, u32::MAX, 1 << 23, (1 << 24) + 1];
+    for exponent in 24..32u32 {
+        let base = 1u32 << exponent;
+        let ulp = base >> 23;
+        for midpoint in [base + ulp / 2, base + ulp + ulp / 2] {
+            inputs.extend([midpoint - 1, midpoint, midpoint + 1]);
+        }
+    }
+    inputs.sort_unstable();
+    inputs.dedup();
+    let cases: Vec<[u32; 4]> = inputs.iter().map(|&x| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, i, inp, got| {
+        let want = (inp[0] as f32).to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_f32_u32({:#010x}) = {:#010x}, want {want:#010x}",
+            inp[0], got,
+        );
+    });
+}
