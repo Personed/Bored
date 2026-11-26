@@ -367,6 +367,41 @@ impl Drop for Twin {
     }
 }
 
+/// Scratch buffers shared by depth-stencil twins, one per power-of-two
+/// size. A buffer each held as much video memory as its planes for good
+/// (upstream #2162 measured about 325 MB for 315 twins in the menu).
+/// Sharing is ordered: every copy starts with the buffer in the common
+/// state and returns it there, so copies in one list are ordered by those
+/// transitions, and lists run one after another on the host's queue.
+#[cfg(windows)]
+struct TwinScratch(Vec<(u64, windows::Win32::Graphics::Direct3D12::ID3D12Resource)>);
+
+// SAFETY: D3D12 resources are free-threaded; access is under the lock.
+#[cfg(windows)]
+unsafe impl Send for TwinScratch {}
+
+#[cfg(windows)]
+static TWIN_SCRATCH: std::sync::Mutex<TwinScratch> = std::sync::Mutex::new(TwinScratch(Vec::new()));
+
+/// The shared scratch buffer of at least `size` bytes: the one of its
+/// power-of-two class, made on first use. All of them together hold at
+/// most twice the largest.
+#[cfg(windows)]
+fn shared_twin_scratch(
+    host: &crate::host::Host,
+    size: u64,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    let class = size.max(1 << 16).next_power_of_two();
+    let mut all = TWIN_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
+        return Some(buffer.clone());
+    }
+    let buffer = host.uav_buffer(class)?;
+    crate::host::name(&buffer, || format!("depth twin copies {class:#x}"));
+    all.0.push((class, buffer.clone()));
+    Some(buffer)
+}
+
 /// Colour twins alive, depth textures with unordered access left without
 /// one, and the copies recorded into depth textures and into twins since
 /// the last frame-rate line.
@@ -523,7 +558,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        let Some(buffer) = shared_twin_scratch(host, bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };

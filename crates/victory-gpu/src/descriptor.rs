@@ -945,9 +945,9 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 ///
-/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
-/// `CreateConstantBufferView` with a null description. Leaving the slot
-/// untouched would keep a stale view active.
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), as D3D12 does with a
+/// null description. Leaving the slot untouched would keep a stale view
+/// active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     let view = match words(desc) {
         Some([lo, hi, size, _]) => {
@@ -1311,6 +1311,19 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// A null CBV description overwrites the slot, so a later read does
+    /// not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let mut slots = [0u64; 2 * 4];
+        let at = slots.as_mut_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], at);
+        assert_eq!(view(at), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Constant(0, 0)));
     }
 
     #[test]
