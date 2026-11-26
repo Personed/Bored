@@ -2962,6 +2962,7 @@ fn typed_store(format: u32) -> bool {
         }
         .is_ok()
             && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+            && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0
     });
     known.push((format, ok));
     ok
