@@ -494,7 +494,8 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
 }
 
 /// Whether what shaders wrote goes back into title view memory through a
-/// view of our own (`VICTORY_BACK_OWN_VIEW=1`; off by default).
+/// view of our own (on by default; `VICTORY_BACK_OWN_VIEW=0` turns it
+/// off).
 ///
 /// The copy-back writes title memory at the title's address, so it opens
 /// the guard on the 64 KiB block first (and on every other view of the
@@ -517,9 +518,9 @@ pub(crate) fn back_own() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_OWN_VIEW").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
