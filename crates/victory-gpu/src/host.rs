@@ -8352,9 +8352,10 @@ fn wide_refresh() -> bool {
 
 /// Whether a range of a host copy brought up to date in a submission is
 /// left alone for the rest of that submission, until a step of ours writes
-/// title memory there (`VICTORY_REFRESH_ONCE=1`; off by default). After
-/// upstream VIctory 6d021fe ("a copy's range brought up to date is not
-/// copied again in the submission until a step writes title memory").
+/// title memory there (on by default; `VICTORY_REFRESH_ONCE=0` turns it
+/// off). After upstream VIctory 6d021fe ("a copy's range brought up to
+/// date is not copied again in the submission until a step writes title
+/// memory").
 ///
 /// A list of dispatches records "refresh this range, shaders write it" for
 /// every dispatch, and each of those refreshes was done on its own
@@ -8380,7 +8381,7 @@ fn refresh_once() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_ONCE").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
