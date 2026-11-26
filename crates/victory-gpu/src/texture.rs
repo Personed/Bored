@@ -1222,11 +1222,24 @@ impl Staging {
         unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
     }
 
+    /// Bytes of staging belonging to subresource `index`, up to the next
+    /// subresource or the exact end of the Direct3D footprints.
+    fn subresource_len(&self, index: usize) -> usize {
+        let start = self.footprints[index].Offset;
+        let end = self
+            .footprints
+            .iter()
+            .map(|f| f.Offset)
+            .filter(|&at| at > start)
+            .min()
+            .unwrap_or(self.bytes);
+        end.saturating_sub(start) as usize
+    }
+
     /// Zero subresources `first` and later, leaving earlier ones alone.
     fn zero_subresources_from(&self, first: usize) {
-        for (footprint, &rows) in self.footprints.iter().zip(&self.rows).skip(first) {
-            let f = footprint.Footprint;
-            let len = f.RowPitch as usize * rows as usize * f.Depth as usize;
+        for (i, footprint) in self.footprints.iter().enumerate().skip(first) {
+            let len = self.subresource_len(i);
             // SAFETY: the subresource's part of the mapped staging buffer.
             unsafe { std::ptr::write_bytes(self.data.add(footprint.Offset as usize), 0, len) };
         }
@@ -1569,7 +1582,7 @@ impl Staging {
             let mip = host_mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
+            let len = self.subresource_len(i);
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
