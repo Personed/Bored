@@ -60,14 +60,20 @@ pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_none_or(|v| v != "0");
-        if on {
-            install();
-            tracing::info!(
-                "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=0 turns them off)"
-            );
+        if !on {
+            return false;
         }
-        on
+        if !install() {
+            tracing::warn!(
+                "no vectored handler for copies of title memory in place; the kernel's copy is used"
+            );
+            return false;
+        }
+        tracing::info!(
+            "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
+             page that is not there (VICTORY_COPY_PLAIN=0 turns them off)"
+        );
+        true
     })
 }
 
@@ -140,7 +146,7 @@ fn note_fault(from: usize, len: usize) {
 /// The handler that turns a read fault inside [`guarded`] into its return
 /// of false; put first in the line, once.
 #[cfg(target_arch = "x86_64")]
-fn install() {
+fn install() -> bool {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR,
     };
@@ -167,15 +173,15 @@ fn install() {
         }
         EXCEPTION_CONTINUE_SEARCH
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // SAFETY: a handler that reads the record it is given and nothing else.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_fault));
-    });
+    *INSTALLED.get_or_init(|| unsafe { !AddVectoredExceptionHandler(1, Some(on_fault)).is_null() })
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn install() {}
+fn install() -> bool {
+    false
+}
 
 /// Copies `len` bytes from `from` to `to` in place; false if a page of the
 /// source was not there (then some of `to` may have been written).
@@ -184,7 +190,9 @@ fn install() {}
 /// `from` may be anything.
 #[cfg(target_arch = "x86_64")]
 fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
-    install();
+    if !install() {
+        return false;
+    }
     // SAFETY: the destination is the caller's to write; a source page that
     // is not there ends the copy with 0 instead of a fault ([`install`]).
     unsafe { victory_copy_guarded(to, from, len) != 0 }
