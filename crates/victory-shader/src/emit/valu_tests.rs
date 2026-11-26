@@ -522,7 +522,11 @@ fn permlane_source(lane: u32, s1: u32, s2: u32, cross: bool) -> u32 {
 
 #[test]
 fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
-    if !hardware_supports_wave_size(32) {
+    let fixed_wave64 = Host::new(false)
+        .ok()
+        .and_then(|host| host.wave_lane_range().ok())
+        == Some((64, 64));
+    if !fixed_wave64 && !hardware_supports_wave_size(32) {
         return;
     }
     // 32 lanes, each with its lane number in v0; v1 = permute(v0, s0, s1);
@@ -539,10 +543,18 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
             // v_readlane_b32 s12, v1, read (inline constant 128 + read)
             body.extend_from_slice(&vop3(0x360, 12, vgpr(1), 128 + u16::from(read), 0));
             body.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
-            let shader = build_cs(&body, 32, 0);
+            let shader = if fixed_wave64 {
+                let min = super::TEST_HOST_MIN_WAVE.replace(Some(64));
+                let max = super::lower::TEST_HOST_WAVE.replace(Some(64));
+                let shader = build_cs(&body, 32, 0);
+                super::lower::TEST_HOST_WAVE.set(max);
+                super::TEST_HOST_MIN_WAVE.set(min);
+                shader
+            } else {
+                build_cs(&body, 32, 0)
+            };
             let inputs: Vec<[u32; 4]> = selectors.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
-            // Cross-lane code declares WaveSize(32), which WARP's pipeline
-            // creation refuses: hardware only.
+            // Run on the hardware whose wave size was selected above.
             run_cases_on(
                 &shader,
                 &inputs,

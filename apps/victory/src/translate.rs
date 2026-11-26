@@ -166,11 +166,23 @@ fn mesh_mode(host: Option<&Host>) -> emit::MeshMode {
     }
 }
 
+fn configure_wave_range(host: Option<&Host>) {
+    let lanes = |key| std::env::var(key).ok().and_then(|v| v.parse::<u32>().ok());
+    let override_max = lanes("VICTORY_HOST_MAX_WAVE").or_else(|| lanes("VICTORY_HOST_WAVE"));
+    if let Some(max) = override_max {
+        let min = lanes("VICTORY_HOST_MIN_WAVE").unwrap_or(0);
+        emit::set_host_wave_range(min, max);
+    } else if let Some(Ok((min, max))) = host.map(Host::wave_lane_range) {
+        emit::set_host_wave_range(min, max);
+    }
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
 pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+    configure_wave_range(None);
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -284,14 +296,6 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
-    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
-    // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        victory_shader::emit::set_host_max_wave(n);
-    }
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -312,6 +316,7 @@ pub fn run(
     } else {
         None
     };
+    configure_wave_range(probe_host.as_ref());
     let mesh = mesh_mode(probe_host.as_ref());
     drop(probe_host);
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));

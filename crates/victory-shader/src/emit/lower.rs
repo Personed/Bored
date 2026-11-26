@@ -2506,6 +2506,16 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        // With at most 32 threads, a host wave holds only one console
+        // wave. Keep wave32 lowering and request the host's fixed width.
+        if !self.x.native.wave64
+            && self.s.wave_size == Some(32)
+            && self.s.threads.is_some_and(|dims| dims.iter().product::<u32>() <= 32)
+            && super::host_min_wave() == 64
+            && host_max_wave() == 64
+        {
+            self.s.wave_size = Some(64);
+        }
         let wave_size = self.s.wave_size;
         let mesh_emu = self.mesh_emu.take().map(|m| {
             let to_outputs = |sigs: Vec<SigElement>, offsets: Vec<u32>| {

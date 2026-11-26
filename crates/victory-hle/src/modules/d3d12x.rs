@@ -36,6 +36,12 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// Probe local capabilities before applying offline shader-cache overrides.
+pub fn probe_shader_cache_host() {
+    #[cfg(windows)]
+    victory_gpu::shader_cache::probe_host();
+}
+
 /// The offline warm-up: see `victory_gpu::shader_cache::warm`.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]

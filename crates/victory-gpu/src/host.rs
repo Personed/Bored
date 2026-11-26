@@ -759,7 +759,7 @@ fn create() -> windows::core::Result<Host> {
                 max = o1.WaveLaneCountMax,
                 "host wave lanes"
             );
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            victory_shader::emit::set_host_wave_range(o1.WaveLaneCountMin, o1.WaveLaneCountMax);
         }
         let mut o3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
         let barycentrics = device
