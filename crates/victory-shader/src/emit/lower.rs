@@ -2864,100 +2864,14 @@ impl<'a> Lower<'a> {
         if index > 1 {
             return Val::Missing("pull-model barycentrics");
         }
-        // One element per interpolation mode (the console's own, if its
-        // signature declares one): DXIL allows two. On hosts without
-        // `SV_Barycentrics`, use an ordinary varying that the host geometry
-        // stage fills with perspective- or linear-correct one-hot weights.
-        let is_bary =
-            |e: &SigElement| e.kind == 28 || e.name == super::barycentric::FALLBACK_SEMANTIC;
-        let existing = self
-            .s
-            .inputs
-            .iter()
-            .position(|e| is_bary(e) && (e.interp == mode || e.usage == 0));
         let fallback = !host_barycentrics();
-        let id = if fallback {
-            let slot = existing.map_or_else(
-                || self.s.inputs.iter().filter(|e| is_bary(e)).count(),
-                |id| self.s.inputs[..id].iter().filter(|e| is_bary(e)).count(),
-            );
-            if slot >= 2 {
-                return Val::Missing("barycentrics of a third interpolation mode");
-            }
-            let next_row = || {
-                self.s
-                    .inputs
-                    .iter()
-                    .filter_map(|e| e.row)
-                    .max()
-                    .map_or(0, |row| row + 1)
-            };
-            let row = existing
-                .and_then(|id| self.s.inputs[id].row)
-                .unwrap_or_else(next_row);
-            match existing {
-                Some(id) => {
-                    let e = &mut self.s.inputs[id];
-                    e.name = super::barycentric::FALLBACK_SEMANTIC.into();
-                    e.index = slot as u32;
-                    e.kind = 0;
-                    e.comp = 9;
-                    e.interp = mode;
-                    e.row = Some(row);
-                    e.col = 0;
-                    e.cols = 3;
-                    e.usage = 0x7;
-                    id
-                }
-                None => {
-                    self.s.inputs.push(SigElement {
-                        name: super::barycentric::FALLBACK_SEMANTIC.into(),
-                        index: slot as u32,
-                        kind: 0,
-                        comp: 9,
-                        interp: mode,
-                        row: Some(row),
-                        col: 0,
-                        cols: 3,
-                        usage: 0x7,
-                        half: false,
-                    });
-                    self.s.inputs.len() - 1
-                }
-            }
-        } else {
-            match existing {
-                Some(id) => id,
-                None => {
-                    let index = self.s.inputs.iter().filter(|e| e.kind == 28).count() as u32;
-                    if index >= 2 {
-                        return Val::Missing("barycentrics of a third interpolation mode");
-                    }
-                    // A system value the validator wants unpacked (packing
-                    // location -1), like other non-packed system values.
-                    self.s.inputs.push(SigElement {
-                        name: "SV_Barycentrics".into(),
-                        index,
-                        kind: 28,
-                        comp: 9,
-                        interp: mode,
-                        row: None,
-                        col: 0,
-                        cols: 3,
-                        usage: 0,
-                        half: false,
-                    });
-                    self.s.inputs.len() - 1
-                }
-            }
+        // DXIL has two input slots; on older hosts, an ordinary interpolant
+        // is filled by the geometry stage with one-hot vertex weights.
+        let id = match super::barycentric::input_id(&mut self.s.inputs, mode, fallback) {
+            Ok(id) => id,
+            Err(reason) => return Val::Missing(reason),
         };
-        let e = &mut self.s.inputs[id];
-        if e.col != 0 || e.cols < 3 {
-            return Val::Missing("a console barycentrics element without i and j");
-        }
-        e.interp = mode;
         if !fallback {
-            e.row = None;
             self.s.flags |= flags::BARYCENTRICS;
         }
         self.load_any_input(id, index + 1)

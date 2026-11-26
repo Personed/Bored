@@ -19,6 +19,98 @@ pub(crate) fn is_fallback_input(e: &SigElement) -> bool {
     e.kind == 0 && e.name == FALLBACK_SEMANTIC
 }
 
+/// Find or add the pixel input for one barycentric interpolation mode.
+pub(crate) fn input_id(
+    inputs: &mut Vec<SigElement>,
+    mode: u8,
+    fallback: bool,
+) -> std::result::Result<usize, &'static str> {
+    let is_bary = |e: &SigElement| e.kind == 28 || e.name == FALLBACK_SEMANTIC;
+    let existing = inputs
+        .iter()
+        .position(|e| is_bary(e) && (e.interp == mode || e.usage == 0));
+    let id = if fallback {
+        let slot = existing.map_or_else(
+            || inputs.iter().filter(|e| is_bary(e)).count(),
+            |id| inputs[..id].iter().filter(|e| is_bary(e)).count(),
+        );
+        if slot >= 2 {
+            return Err("barycentrics of a third interpolation mode");
+        }
+        let row = existing
+            .and_then(|id| inputs[id].row)
+            .unwrap_or_else(|| {
+                inputs
+                    .iter()
+                    .filter_map(|e| e.row)
+                    .max()
+                    .map_or(0, |row| row + 1)
+            });
+        match existing {
+            Some(id) => {
+                let e = &mut inputs[id];
+                e.name = FALLBACK_SEMANTIC.into();
+                e.index = slot as u32;
+                e.kind = 0;
+                e.comp = 9;
+                e.interp = mode;
+                e.row = Some(row);
+                e.col = 0;
+                e.cols = 3;
+                e.usage = 0x7;
+                id
+            }
+            None => {
+                inputs.push(SigElement {
+                    name: FALLBACK_SEMANTIC.into(),
+                    index: slot as u32,
+                    kind: 0,
+                    comp: 9,
+                    interp: mode,
+                    row: Some(row),
+                    col: 0,
+                    cols: 3,
+                    usage: 0x7,
+                    half: false,
+                });
+                inputs.len() - 1
+            }
+        }
+    } else {
+        match existing {
+            Some(id) => id,
+            None => {
+                let index = inputs.iter().filter(|e| e.kind == 28).count() as u32;
+                if index >= 2 {
+                    return Err("barycentrics of a third interpolation mode");
+                }
+                inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index,
+                    kind: 28,
+                    comp: 9,
+                    interp: mode,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                inputs.len() - 1
+            }
+        }
+    };
+    let e = &mut inputs[id];
+    if e.col != 0 || e.cols < 3 {
+        return Err("a console barycentrics element without i and j");
+    }
+    e.interp = mode;
+    if !fallback {
+        e.row = None;
+    }
+    Ok(id)
+}
+
 /// Whether `ps_dxil` needs the geometry-stage fallback.
 pub fn requires_barycentric_fallback(ps_dxil: &[u8]) -> Result<bool, ShaderError> {
     let c = Container::parse(ps_dxil)?;
