@@ -1863,12 +1863,10 @@ impl State {
                 "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
             );
         }
-        let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
-        self.heap_textures(list, heap, host);
+        let took = self.heap_textures(list, heap, host).as_micros() as u64;
         PASS_BUDGET.set(None);
         if bake {
-            let took = began.elapsed().as_micros() as u64;
             crate::framelog::add(crate::framelog::T::BakeTextureUs, took);
             BAKED_MS.fetch_add(took / 1000, Ordering::Relaxed);
         }
@@ -1982,10 +1980,10 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
-    ) {
+    ) -> std::time::Duration {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
-            return;
+            return std::time::Duration::ZERO;
         }
         let pass_started = std::time::Instant::now();
         let mut pass_bytes = 0;
@@ -2278,7 +2276,7 @@ impl State {
                     "the host device went while textures picked by index were made ready; last: {text}"
                 );
                 crate::host::log_removal_context();
-                return;
+                return std::time::Duration::ZERO;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -2345,6 +2343,7 @@ impl State {
         );
         crate::framelog::add(crate::framelog::T::HeapTextureBytes, pass_bytes);
         crate::framelog::add(crate::framelog::T::HeapTextureSlots, pass_slots);
+        pass_started.elapsed()
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
