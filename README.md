@@ -64,8 +64,8 @@ with all of them, from about 120 ms in the morning. Still far from the console's
   thread (about 95 ms of a 120 ms frame in the morning) and the card
   (about 102 ms busy, by a timestamp pair around every host list:
   `cardmeter.rs`). Taking time off one alone moved the frame by 0 to 7 %.
-- `VICTORY_JOIN_PARTS=1` (off by default): the title's lists wait for
-  memory values, which cut its ~15 submissions a frame into ~29 parts;
+- `VICTORY_JOIN_PARTS` (on by default; `=0` restores the old path): the
+  title's lists wait for memory values, which cut its ~15 submissions a frame into ~29 parts;
   parts that follow one another now go to the host as one submission
   (9 a frame), the same lists in the same order. About 6 %.
 - `VICTORY_BACK_OWN_VIEW` (on by default; `=0` restores the old path):

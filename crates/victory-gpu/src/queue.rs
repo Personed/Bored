@@ -547,9 +547,9 @@ thread_local! {
 }
 
 /// Whether parts that follow one another in the queues' lines go to the
-/// host as one submission (`VICTORY_JOIN_PARTS=1`; `alt`: twenty seconds
-/// with, twenty without, in turn, each change said in the log). Off by
-/// default. Needs [`behind`].
+/// host as one submission (on by default; `VICTORY_JOIN_PARTS=0` turns it
+/// off, `alt`: twenty seconds with, twenty without, in turn, each change
+/// said in the log). Needs [`behind`].
 ///
 /// Why: the title's lists wait for memory values (19 to 20 waits a frame
 /// in the first rooms, each met by the bottom-of-pipe write of the part
@@ -584,13 +584,13 @@ fn join_parts() -> bool {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let mode = *MODE.get_or_init(|| {
         let mode = match std::env::var("VICTORY_JOIN_PARTS").as_deref() {
-            Ok("1") => 1,
+            Ok("0") => 0,
             Ok("alt") => 2,
-            _ => 0,
+            _ => 1,
         };
         if mode != 0 {
             tracing::info!(
-                "parts that follow one another in the queues' lines go to the host as one submission, at most {} parts or {} lists (VICTORY_JOIN_PARTS=1; alt: in turn)",
+                "parts that follow one another in the queues' lines go to the host as one submission, at most {} parts or {} lists (on by default; VICTORY_JOIN_PARTS=0 turns it off, alt: in turn)",
                 join_most(),
                 join_lists()
             );
