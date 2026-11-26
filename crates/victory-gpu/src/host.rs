@@ -2459,6 +2459,8 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// Work that reads title memory and writes host memory only.
+    HostRead(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -3217,8 +3219,7 @@ fn blocked_by(
                         return Some(WHY_READ);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
-                Step::Host(_) if strict => return Some(WHY_RUN),
+                Step::Run(_) | Step::HostRead(_) => return Some(WHY_RUN),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
@@ -6410,7 +6411,9 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false, false).is_none());
+                relay_wait(why, |line| {
+                    blocked_by(&line.written, runs, false, false).is_none()
+                });
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -8224,6 +8227,11 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// As [`HostList::defer_host`], for work that also reads title memory.
+    pub(crate) fn defer_host_read(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::HostRead(Box::new(work)));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
@@ -8296,7 +8304,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(work) | Step::HostRead(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
