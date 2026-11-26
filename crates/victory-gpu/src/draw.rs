@@ -2337,13 +2337,14 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        let pass_took = pass_started.elapsed();
         crate::framelog::add(
             crate::framelog::T::HeapTextureUs,
-            pass_started.elapsed().as_micros() as u64,
+            pass_took.as_micros() as u64,
         );
         crate::framelog::add(crate::framelog::T::HeapTextureBytes, pass_bytes);
         crate::framelog::add(crate::framelog::T::HeapTextureSlots, pass_slots);
-        pass_started.elapsed()
+        pass_took
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
