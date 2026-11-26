@@ -1865,9 +1865,10 @@ impl State {
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
-        self.heap_textures(list, heap, host);
+        let took = self.heap_textures(list, heap, host).as_micros() as u64;
         PASS_BUDGET.set(None);
         if bake {
+            crate::framelog::add(crate::framelog::T::BakeTextureUs, took);
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
     }
@@ -1980,11 +1981,14 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
-    ) {
+    ) -> std::time::Duration {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
-            return;
+            return std::time::Duration::ZERO;
         }
+        let pass_started = std::time::Instant::now();
+        let mut pass_bytes = 0;
+        let mut pass_slots = 0;
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
@@ -2273,7 +2277,7 @@ impl State {
                     "the host device went while textures picked by index were made ready; last: {text}"
                 );
                 crate::host::log_removal_context();
-                return;
+                return std::time::Duration::ZERO;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -2315,6 +2319,8 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            pass_bytes += bytes;
+            pass_slots += 1;
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
@@ -2332,6 +2338,14 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        let pass_took = pass_started.elapsed();
+        crate::framelog::add(
+            crate::framelog::T::HeapTextureUs,
+            pass_took.as_micros() as u64,
+        );
+        crate::framelog::add(crate::framelog::T::HeapTextureBytes, pass_bytes);
+        crate::framelog::add(crate::framelog::T::HeapTextureSlots, pass_slots);
+        pass_took
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
