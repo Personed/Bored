@@ -152,8 +152,8 @@ const SPARE_MOST: (u64, u64) = (256 << 20, 32 << 20);
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// A mapped upload buffer of `total` bytes for a texture's staging, all
-/// zeros, and its pool size (0: not pooled).
+/// A mapped upload buffer of `total` bytes for a texture's staging, and
+/// its pool size (0: not pooled).
 ///
 /// Every texture the title streams in got a buffer of its own from the
 /// host and gave it back when its staging went: about a quarter of a
@@ -161,11 +161,12 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] =
 /// threads for some 100 uploads, most of it the graphics kernel waiting)
 /// and more to free on the thread that submits. A streaming burst is 200
 /// to 500 uploads in a frame (run 222), and those are the frames that
-/// dip. Buffers of up to 32 MiB are now kept by size and used again,
-/// zeroed as a new one is (levels not there yet must read as zeros). Small
-/// buffers use power-of-two classes for reuse; larger ones use the driver's
-/// 64 KiB allocation granularity, so pooling a 17 MiB texture does not
-/// allocate a 32 MiB buffer.
+/// dip. Buffers of up to 32 MiB are now kept by size and used again. They
+/// are not zeroed when reused: the first refresh detiles the texture over
+/// every texel row before the upload runs, and the paths that cannot fill
+/// it zero it then. Small buffers use power-of-two classes for reuse;
+/// larger ones use the driver's 64 KiB allocation granularity, so pooling
+/// a 17 MiB texture does not allocate a 32 MiB buffer.
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -191,9 +192,6 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
     };
     if let Some(Spare(buffer, data, _)) = spare {
         SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // SAFETY: the buffer's own mapping, `size` bytes, which nothing
-        // else holds.
-        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
         return Some((buffer, data as *mut u8, size));
     }
     SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1202,6 +1200,16 @@ impl Staging {
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Last::default();
     }
 
+    /// Zero the staging buffer when its first fill cannot run: a fresh
+    /// host allocation is zeroed by the operating system, and a pooled one
+    /// must not carry the previous texture into an upload that has nothing
+    /// yet.
+    fn zero(&self) {
+        // SAFETY: the buffer's own mapping, `bytes` bytes, written under
+        // the same exclusion as a refresh.
+        unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)
@@ -1423,6 +1431,9 @@ impl Staging {
                     read.get(at..at.saturating_add(len))
                         .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
                 }) {
+                    if !self.filled.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.zero();
+                    }
                     return false;
                 }
                 self.detile(read);
@@ -1496,15 +1507,19 @@ impl Staging {
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
+            if !self.filled.load(Relaxed) {
+                self.zero();
+            }
             0
         }
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.filled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        let was_filled = self.filled.load(Relaxed);
+        self.dirty.store(true, Relaxed);
+        self.filled.store(true, Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1547,6 +1562,9 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                if !was_filled {
+                    self.zero();
+                }
                 return;
             }
         }
