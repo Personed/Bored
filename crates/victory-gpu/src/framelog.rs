@@ -69,7 +69,7 @@ pub enum T {
     RefreshStillUs,
     Uploads,
     /// The pass that makes and uploads textures picked by index: wall time,
-    /// bytes and textures uploaded. Of its time, the part before bake draws.
+    /// bytes and slots uploaded. Of its time, the part before bake draws.
     HeapTextureUs,
     HeapTextureBytes,
     HeapTextureSlots,
@@ -475,7 +475,7 @@ fn text(f: &Frame) -> String {
          ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us); by its own clock, of the lists of a moment ago: our \
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
-         still), {:.0} uploads, staging {:.0} made {:.0} reused; picked by index {:.1} ms ({:.1} before bakes), {:.0} textures {:.1} MB | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
+         still), {:.0} uploads, staging {:.0} made {:.0} reused; picked by index {:.1} ms ({:.1} before bakes), {:.0} slots {:.1} MB | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
