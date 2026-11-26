@@ -1,5 +1,5 @@
 //! Copies of title memory made in place, by this process, with a way back
-//! when a page is not there (`VICTORY_COPY_PLAIN=1`; off by default).
+//! when a page is not there (on by default; `VICTORY_COPY_PLAIN=0` turns it off).
 //!
 //! Every copy of title memory into a host buffer goes through the kernel
 //! (`ReadProcessMemory` on our own process, `crate::host::copy_mapped`):
@@ -55,19 +55,25 @@ unsafe extern "C" {
 }
 
 /// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
+/// (on by default; `VICTORY_COPY_PLAIN=0` turns them off).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
-        if on {
-            install();
-            tracing::info!(
-                "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=1)"
-            );
+        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_none_or(|v| v != "0");
+        if !on {
+            return false;
         }
-        on
+        if !install() {
+            tracing::warn!(
+                "no vectored handler for copies of title memory in place; the kernel's copy is used"
+            );
+            return false;
+        }
+        tracing::info!(
+            "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
+             page that is not there (VICTORY_COPY_PLAIN=0 turns them off)"
+        );
+        true
     })
 }
 
@@ -140,7 +146,7 @@ fn note_fault(from: usize, len: usize) {
 /// The handler that turns a read fault inside [`guarded`] into its return
 /// of false; put first in the line, once.
 #[cfg(target_arch = "x86_64")]
-fn install() {
+fn install() -> bool {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR,
     };
@@ -167,15 +173,15 @@ fn install() {
         }
         EXCEPTION_CONTINUE_SEARCH
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // SAFETY: a handler that reads the record it is given and nothing else.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_fault));
-    });
+    *INSTALLED.get_or_init(|| unsafe { !AddVectoredExceptionHandler(1, Some(on_fault)).is_null() })
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn install() {}
+fn install() -> bool {
+    false
+}
 
 /// Copies `len` bytes from `from` to `to` in place; false if a page of the
 /// source was not there (then some of `to` may have been written).
@@ -184,7 +190,9 @@ fn install() {}
 /// `from` may be anything.
 #[cfg(target_arch = "x86_64")]
 fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
-    install();
+    if !install() {
+        return false;
+    }
     // SAFETY: the destination is the caller's to write; a source page that
     // is not there ends the copy with 0 instead of a fault ([`install`]).
     unsafe { victory_copy_guarded(to, from, len) != 0 }
@@ -229,7 +237,7 @@ pub(crate) fn line(frames: f64) {
     let [copies, bytes, gone, lately, small] =
         [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
+        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=0 turns them off): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
          faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
         bytes / 1e6

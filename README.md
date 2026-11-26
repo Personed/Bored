@@ -219,10 +219,10 @@ What did it, on top of the list below:
     sync looks at a changed page's records under one lock, fingerprint
     first; guarded view memory is left out of a submission's write-watch
     askings ahead (after triippywhale).
-  - `VICTORY_COPY_PLAIN=1`: copies of title memory made in place by this
-    process, with a handler that falls back to the kernel's copy on a
-    missing page. Its first form also took the layer's one-byte "is this
-    page there" reads, 1,000 to 1,300 faults a frame, and won nothing;
+  - Copies of title memory are made in place by this process by default
+    (`VICTORY_COPY_PLAIN=0` restores the kernel's copy), with a handler
+    that falls back to the kernel's copy on a missing page. Its first
+    form also took the layer's one-byte "is this page there" reads, 1,000 to 1,300 faults a frame, and won nothing;
     reads under 256 bytes now stay with the kernel and a source that
     faulted is left alone for two seconds (4 to 9 faults a frame). The
     submit thread's kernel time fell from 44 to 20 ms a frame; the
