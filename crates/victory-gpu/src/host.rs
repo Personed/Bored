@@ -2360,7 +2360,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// turn, each change said in the log: one run then measures both on the
 /// same scene (the card meter's "send-and-hash lists" in the frame log).
 /// Runs 105-110 found no change while the card was not the frame's limit;
-/// in the first rooms joining the runs measured 104 -> 97 ms a frame.
+/// in the first rooms, with indirect gathers on, joining the runs measured
+/// 104 -> 97 ms a frame.
 fn rehash_runs() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
