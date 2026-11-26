@@ -68,9 +68,9 @@ with all of them, from about 120 ms in the morning. Still far from the console's
   memory values, which cut its ~15 submissions a frame into ~29 parts;
   parts that follow one another now go to the host as one submission
   (9 a frame), the same lists in the same order. About 6 %.
-- `VICTORY_BACK_OWN_VIEW=1` (off by default): what shaders wrote goes
-  back into title view memory through a view of the layer's own, so the
-  copy that wrote it is not read in again. About 9 % (submit thread 93 ->
+- `VICTORY_BACK_OWN_VIEW` (on by default; `=0` restores the old path):
+  what shaders wrote goes back into title view memory through a view of
+  the layer's own, so the copy that wrote it is not read in again. About 9 % (submit thread 93 ->
   81 ms a frame, 104 -> 80 MB a frame checked). A CORRECTION: an earlier
   run seemed to show washed-out frames with this switch; the same frames
   turn up in about 6 of 21 runs with no switch at all (cause not known),

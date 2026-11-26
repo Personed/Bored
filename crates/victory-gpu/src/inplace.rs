@@ -348,19 +348,12 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
         v.sections.push((section, bytes, committed));
     }
     // A view of our own made on an earlier section that had this handle's
-    // number shows that section's pages, not this one's: it is forgotten
-    // (left mapped: nothing reads it any more) and the next store through
-    // a view of ours maps this section.
-    let gone = OWN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()
-        .and_then(|own| own.remove(&section))
-        .flatten();
-    if gone.is_some() {
+    // number shows that section's pages, not this one's: unmap it, and the
+    // next store through a view of ours maps this section.
+    if unmap_own(section) {
         tracing::info!(
             section,
-            "a section handle's number came round again: our own view of the earlier section is forgotten"
+            "a section handle's number came round again: our own view of the earlier section is unmapped"
         );
     }
 }
@@ -407,10 +400,12 @@ pub(crate) fn views_gone(at: usize, len: usize) {
                 .map(|(base, _)| *base),
         )
         .collect();
+    let mut sections = std::collections::HashSet::new();
     for base in gone {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
         };
+        sections.insert(section);
         for k in 0..bytes.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
             if let Some(pages) = v.pages.get_mut(&key) {
@@ -422,6 +417,38 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
+    for section in sections {
+        if v.pages.keys().any(|(s, _)| *s == section) {
+            continue;
+        }
+        if unmap_own(section) {
+            tracing::debug!(
+                section,
+                "own view of title pages unmapped: no title view of the section remains"
+            );
+        }
+    }
+}
+
+/// Unmaps our view of `section`, if one is held. True if there was one.
+fn unmap_own(section: usize) -> bool {
+    let own = OWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|own| own.remove(&section))
+        .flatten();
+    let Some(own) = own else {
+        return false;
+    };
+    // SAFETY: the view was mapped in `write_own` and is removed from `OWN`
+    // before this, so nothing else unmaps it.
+    unsafe {
+        mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS {
+            Value: own.base as *mut c_void,
+        })
+    };
+    true
 }
 
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
