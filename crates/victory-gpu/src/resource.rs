@@ -2221,12 +2221,12 @@ fn configured_mip_drop() -> Option<u32> {
     })
 }
 
-/// Baseline mip drop: the user's setting, otherwise one level on adapters
+/// Baseline mip drop: the user's setting, otherwise two levels on adapters
 /// with at most 8.5 GiB of dedicated memory (RX 580-class budgets).
 #[cfg(windows)]
 fn requested_mip_drop() -> u32 {
     let automatic = match crate::host::host().and_then(|h| h.dedicated_memory()) {
-        Some(memory) if memory > 0 && memory <= (17 << 29) => 1,
+        Some(memory) if memory > 0 && memory <= (17 << 29) => 2,
         _ => 0,
     };
     configured_mip_drop()
