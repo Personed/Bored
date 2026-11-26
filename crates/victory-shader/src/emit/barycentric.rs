@@ -14,6 +14,15 @@ use crate::dxbc::{Container, FourCC};
 /// Private semantic used only when the host cannot provide the system value.
 pub(crate) const FALLBACK_SEMANTIC: &str = "VICTORY_BARYCENTRIC_FALLBACK";
 
+/// Floating-point bits of one channel of a vertex's one-hot weight.
+pub(super) fn weight_bits(channel: u8, vertex: u8) -> u32 {
+    if channel == vertex {
+        1.0f32.to_bits()
+    } else {
+        0.0f32.to_bits()
+    }
+}
+
 /// Whether `ps_dxil` has an input synthesized by the barycentric fallback.
 pub(crate) fn is_fallback_input(e: &SigElement) -> bool {
     e.kind == 0 && e.name == FALLBACK_SEMANTIC
@@ -266,7 +275,7 @@ fn build(
                 );
             } else if bary_output_ids.contains(&id) {
                 for col in 0..3u8 {
-                    let value = s.m.f32(u32::from(col == vertex as u8));
+                    let value = s.m.f32(weight_bits(col, vertex as u8));
                     store(&mut s, id, col, value);
                 }
             }

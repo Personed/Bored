@@ -281,7 +281,7 @@ fn build(
         let bary_vertex = (vertex % 3) as u8;
         for &id in &bary_output_ids {
             for col in 0..3u8 {
-                let value = s.m.f32(u32::from(col == bary_vertex));
+                let value = s.m.f32(super::barycentric::weight_bits(col, bary_vertex));
                 let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), value];
                 s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
             }
@@ -439,9 +439,9 @@ mod tests {
     }
 
     /// A vertex shader that passes a position and a float4 through, and a
-    /// pixel shader that writes the float4.
+    /// pixel shader that writes the float4 or the three fallback weights.
     #[cfg(windows)]
-    fn pass_through() -> (super::super::HostShader, super::super::HostShader) {
+    fn pass_through(barycentrics: bool) -> (super::super::HostShader, super::super::HostShader) {
         let position = SigElement {
             interp: 4,
             usage: 15,
@@ -464,25 +464,43 @@ mod tests {
             },
         ];
         vs.outputs = vec![position.clone(), coord.clone()];
+        if barycentrics {
+            vs.inputs.pop();
+            vs.outputs.pop();
+        }
         let mut ps = Shader::new(true);
         ps.inputs = vec![
             SigElement {
                 usage: 0,
                 ..position
             },
-            coord,
+            if barycentrics {
+                SigElement {
+                    interp: 2,
+                    usage: 7,
+                    ..element(super::super::barycentric::FALLBACK_SEMANTIC, 0, 0, 9, 1, 3)
+                }
+            } else {
+                coord
+            },
         ];
         ps.outputs = vec![SigElement {
             usage: 15,
             ..element("SV_Target", 0, 16, 9, 0, 4)
         }];
         // Vertex: output id from input id. Pixel: target 0 from input 1.
-        for (s, copies) in [(&mut vs, &[(0, 0), (1, 1)][..]), (&mut ps, &[(1, 0)][..])] {
+        let vertex_copies = [(0, 0), (1, 1)];
+        let vertex_copies = &vertex_copies[..vs.outputs.len()];
+        for (s, copies) in [(&mut vs, vertex_copies), (&mut ps, &[(1, 0)][..])] {
             let b = s.entry;
             for &(from, to) in copies {
                 for col in 0..4 {
-                    let args = [s.m.i32(from), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
-                    let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                    let v = if col < s.inputs[from as usize].cols {
+                        let args = [s.m.i32(from), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                        s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
+                    } else {
+                        s.m.f32(1.0f32.to_bits())
+                    };
                     let args = [s.m.i32(to), s.m.i32(0), s.m.i8(col), v];
                     s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
                 }
@@ -520,7 +538,7 @@ mod tests {
             eprintln!("no SM 6.6 device; skipped");
             return;
         };
-        let (vs, ps) = pass_through();
+        let (vs, ps) = pass_through(false);
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -567,6 +585,54 @@ mod tests {
                 missing >= 24,
                 "{name}: only {missing} texels need the stage"
             );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fallback_weights_reach_the_pixel_shader() {
+        use super::super::host::{Draw, Host, stub_vs};
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let (vs, ps) = pass_through(true);
+        host.pipeline(&stub_vs(&ps).unwrap(), &ps).unwrap();
+        let root = host.root_signature(&vs, &ps).unwrap();
+        let rect = rect_list_gs(&vs.dxil, Some(&ps.dxil)).unwrap();
+        let vertices = [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0)]
+            .map(|(x, y)| [x, y, 0.5, 1.0, x, y, 0.0, 1.0])
+            .concat();
+        let draw = Draw {
+            roots: Vec::new(),
+            textures: &[],
+            samplers: &[],
+            vertices: &vertices,
+            stride: 32,
+            size: (8, 8),
+            mesh_groups: 0,
+        };
+        let near = |got: &[f32], want: &[f32]| {
+            assert!(
+                got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4),
+                "got {got:?}, expected {want:?}"
+            );
+        };
+        for gs in [None, Some(rect.as_slice())] {
+            let pso = host
+                .pipeline_with_gs(&root, &vs.dxil, gs, &ps.dxil)
+                .unwrap_or_else(|err| panic!("rectangle stage: {}, {err}", gs.is_some()));
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            if gs.is_some() {
+                // The rectangle's first triangle runs from top-left to
+                // bottom-left to the synthesized bottom-right vertex.
+                near(&texels[8], &[0.8125, 0.125, 0.0625, 1.0]);
+                for texel in texels {
+                    near(&[texel[..3].iter().sum(), texel[3]], &[1.0, 1.0]);
+                }
+            } else {
+                near(&texels[0], &[0.875, 0.0625, 0.0625, 1.0]);
+            }
         }
     }
 }

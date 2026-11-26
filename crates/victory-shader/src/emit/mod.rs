@@ -1728,6 +1728,14 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_barycentrics(words, input_addr, true)
+    }
+
+    fn pixel_with_barycentrics(
+        words: &[u32],
+        input_addr: u32,
+        native_barycentrics: bool,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1761,7 +1769,10 @@ mod barycentric_tests {
         let res = resource::track(&p, &native.layout, native.stage, None)?;
         let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
-        emit(&c, &native, &p, &st, &io, &res)
+        let previous = lower::TEST_HOST_BARYCENTRICS.replace(Some(native_barycentrics));
+        let result = emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_BARYCENTRICS.set(previous);
+        result
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
@@ -1809,13 +1820,9 @@ mod barycentric_tests {
 
     #[test]
     fn unsupported_host_barycentrics_use_a_private_interpolant() {
-        lower::TEST_HOST_BARYCENTRICS.set(Some(false));
         let [e0, e1] = exp_mrt0(2);
         let words = [v_add_f32(2, 0, 1), e0, e1, S_ENDPGM];
-        let result = pixel(&words, PERSP_CENTER);
-        lower::TEST_HOST_BARYCENTRICS.set(None);
-
-        let shader = result.unwrap();
+        let shader = pixel_with_barycentrics(&words, PERSP_CENTER, false).unwrap();
         let (features, inputs) = parts(&shader);
         assert_eq!(
             features & 0x2_0000,

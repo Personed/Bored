@@ -663,7 +663,7 @@ pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     let inputs = sig(&ps.dxil, FourCC::ISG1)?;
     let mut outputs: Vec<SigElement> = inputs
         .into_iter()
-        .filter(|e| matches!(e.kind, 0 | 3 | 6 | 7))
+        .filter(|e| matches!(e.kind, 0 | 3 | 6 | 7) && !super::barycentric::is_fallback_input(e))
         .collect();
     if !outputs.iter().any(|e| e.kind == 3) {
         let row = outputs
