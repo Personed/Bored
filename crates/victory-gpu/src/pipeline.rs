@@ -762,9 +762,10 @@ pub(crate) extern "system" fn create_stream(
             break;
         };
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8, which the
+            // stream slice does not promise to be aligned.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -913,7 +914,9 @@ mod tests {
     #[test]
     fn streams_yield_their_shaders() {
         let (ms, ps) = ([9u8; 7], [4u8; 5]);
-        let mut stream = vec![0u8; 0x2b0];
+        let mut backing = vec![0u8; 0x2b1];
+        let stream = &mut backing[1..];
+        assert_ne!(stream.as_ptr() as usize % 8, 0);
         let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
         for (at, kind) in [
             (0x10, 24),
