@@ -2485,7 +2485,7 @@ fn cvt_f32_u32_rounds_full_width_inputs_once() {
     inputs.sort_unstable();
     inputs.dedup();
     let cases: Vec<[u32; 4]> = inputs.iter().map(|&x| [x, 0, 0, 0]).collect();
-    run_cases(&shader, &cases, |backend, i, inp, got| {
+    run_cases(&shader, &cases, |backend, _i, inp, got| {
         let want = (inp[0] as f32).to_bits();
         assert_eq!(
             got, want,
