@@ -121,6 +121,16 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
+            let mut options3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            let barycentrics = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options3).cast(),
+                    size_of_val(&options3) as u32,
+                )
+                .is_ok()
+                && options3.BarycentricsSupported.as_bool();
+            super::set_host_barycentrics(barycentrics);
             Ok(Host { device })
         }
     }
@@ -338,6 +348,12 @@ impl Host {
         gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        let fallback_gs = if gs.is_none() {
+            super::barycentric_gs(vs, ps).map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        let gs = gs.or(fallback_gs.as_deref());
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -439,6 +455,14 @@ impl Host {
         ms: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        if sig(ps, FourCC::ISG1)?
+            .iter()
+            .any(super::barycentric::is_fallback_input)
+        {
+            return Err(
+                "barycentric fallback cannot be inserted after a native mesh shader".into(),
+            );
+        }
         /// A stream subobject: its type, then its description, pointer-aligned.
         #[repr(C, align(8))]
         struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);

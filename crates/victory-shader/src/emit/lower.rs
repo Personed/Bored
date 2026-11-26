@@ -1026,10 +1026,19 @@ fn lane_constant_masks(st: &Structured) -> bool {
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Whether the host rasterizer supplies `SV_Barycentrics` (unknown hosts
+/// keep the native path; runtime devices set this after feature discovery).
+static HOST_BARYCENTRICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// The host GPU's `WaveLaneCountMax`: 32 lets console wave64 compute programs whose cross-lane
 /// code stays inside 32-lane halves run in waves of 32 instead of being refused.
 pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The host GPU's `D3D12_OPTIONS3.BarycentricsSupported`.
+pub fn set_host_barycentrics(supported: bool) {
+    HOST_BARYCENTRICS.store(supported, std::sync::atomic::Ordering::Relaxed);
 }
 
 thread_local! {
@@ -1039,6 +1048,9 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
+    /// A test's barycentrics capability, for its thread only.
+    pub(super) static TEST_HOST_BARYCENTRICS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1132,6 +1144,14 @@ pub fn host_max_wave() -> u32 {
         return lanes;
     }
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn host_barycentrics() -> bool {
+    #[cfg(test)]
+    if let Some(supported) = TEST_HOST_BARYCENTRICS.get() {
+        return supported;
+    }
+    HOST_BARYCENTRICS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -2845,44 +2865,101 @@ impl<'a> Lower<'a> {
             return Val::Missing("pull-model barycentrics");
         }
         // One element per interpolation mode (the console's own, if its
-        // signature declares one): DXIL allows two.
-        let bary = |e: &SigElement| e.kind == 28;
-        let id = match self
+        // signature declares one): DXIL allows two. On hosts without
+        // `SV_Barycentrics`, use an ordinary varying that the host geometry
+        // stage fills with perspective- or linear-correct one-hot weights.
+        let is_bary =
+            |e: &SigElement| e.kind == 28 || e.name == super::barycentric::FALLBACK_SEMANTIC;
+        let existing = self
             .s
             .inputs
             .iter()
-            .position(|e| bary(e) && (e.interp == mode || e.usage == 0))
-        {
-            Some(id) => id,
-            None => {
-                let index = self.s.inputs.iter().filter(|e| bary(e)).count() as u32;
-                if index >= 2 {
-                    return Val::Missing("barycentrics of a third interpolation mode");
+            .position(|e| is_bary(e) && (e.interp == mode || e.usage == 0));
+        let fallback = !host_barycentrics();
+        let id = if fallback {
+            let slot = existing.map_or_else(
+                || self.s.inputs.iter().filter(|e| is_bary(e)).count(),
+                |id| self.s.inputs[..id].iter().filter(|e| is_bary(e)).count(),
+            );
+            if slot >= 2 {
+                return Val::Missing("barycentrics of a third interpolation mode");
+            }
+            let next_row = || {
+                self.s
+                    .inputs
+                    .iter()
+                    .filter_map(|e| e.row)
+                    .max()
+                    .map_or(0, |row| row + 1)
+            };
+            let row = existing
+                .and_then(|id| self.s.inputs[id].row)
+                .unwrap_or_else(next_row);
+            match existing {
+                Some(id) => {
+                    let e = &mut self.s.inputs[id];
+                    e.name = super::barycentric::FALLBACK_SEMANTIC.into();
+                    e.index = slot as u32;
+                    e.kind = 0;
+                    e.comp = 9;
+                    e.interp = mode;
+                    e.row = Some(row);
+                    e.col = 0;
+                    e.cols = 3;
+                    e.usage = 0x7;
+                    id
                 }
-                // A system value the validator wants unpacked (packing
-                // location -1), like other non-packed system values.
-                self.s.inputs.push(SigElement {
-                    name: "SV_Barycentrics".into(),
-                    index,
-                    kind: 28,
-                    comp: 9,
-                    interp: mode,
-                    row: None,
-                    col: 0,
-                    cols: 3,
-                    usage: 0,
-                    half: false,
-                });
-                self.s.inputs.len() - 1
+                None => {
+                    self.s.inputs.push(SigElement {
+                        name: super::barycentric::FALLBACK_SEMANTIC.into(),
+                        index: slot as u32,
+                        kind: 0,
+                        comp: 9,
+                        interp: mode,
+                        row: Some(row),
+                        col: 0,
+                        cols: 3,
+                        usage: 0x7,
+                        half: false,
+                    });
+                    self.s.inputs.len() - 1
+                }
+            }
+        } else {
+            match existing {
+                Some(id) => id,
+                None => {
+                    let index = self.s.inputs.iter().filter(|e| e.kind == 28).count() as u32;
+                    if index >= 2 {
+                        return Val::Missing("barycentrics of a third interpolation mode");
+                    }
+                    // A system value the validator wants unpacked (packing
+                    // location -1), like other non-packed system values.
+                    self.s.inputs.push(SigElement {
+                        name: "SV_Barycentrics".into(),
+                        index,
+                        kind: 28,
+                        comp: 9,
+                        interp: mode,
+                        row: None,
+                        col: 0,
+                        cols: 3,
+                        usage: 0,
+                        half: false,
+                    });
+                    self.s.inputs.len() - 1
+                }
             }
         };
         let e = &mut self.s.inputs[id];
         if e.col != 0 || e.cols < 3 {
             return Val::Missing("a console barycentrics element without i and j");
         }
-        e.row = None;
         e.interp = mode;
-        self.s.flags |= flags::BARYCENTRICS;
+        if !fallback {
+            e.row = None;
+            self.s.flags |= flags::BARYCENTRICS;
+        }
         self.load_any_input(id, index + 1)
     }
 

@@ -80,6 +80,7 @@
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
 
+mod barycentric;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
@@ -111,8 +112,9 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use barycentric::{barycentric_gs, requires_barycentric_fallback};
 pub use bitcode::census;
-pub use lower::set_host_max_wave;
+pub use lower::{set_host_barycentrics, set_host_max_wave};
 pub use mesh_emu::{INDIRECT_SLOT_MAP_FLAG, MeshEmu, MeshMode, MeshOutput, unpack_vertex_shader};
 pub use rect::rect_list_gs;
 pub use sampler::StaticSampler;
@@ -221,6 +223,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.push(u8::from(lower::host_barycentrics()));
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
@@ -1801,6 +1804,35 @@ mod barycentric_tests {
         let isg1 = isg1.part(FourCC::ISG1).unwrap().data;
         let rw: Vec<u8> = (0..2).map(|k| isg1[8 + 32 * k + 25]).collect();
         assert!(rw.contains(&0b110), "{rw:?}");
+        validate(&shader);
+    }
+
+    #[test]
+    fn unsupported_host_barycentrics_use_a_private_interpolant() {
+        lower::TEST_HOST_BARYCENTRICS.set(Some(false));
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, S_ENDPGM];
+        let result = pixel(&words, PERSP_CENTER);
+        lower::TEST_HOST_BARYCENTRICS.set(None);
+
+        let shader = result.unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(
+            features & 0x2_0000,
+            0,
+            "fallback still requires native barycentrics"
+        );
+        let fallback: Vec<_> = inputs
+            .iter()
+            .filter(|e| e.name == barycentric::FALLBACK_SEMANTIC)
+            .collect();
+        assert_eq!(fallback.len(), 1, "{inputs:?}");
+        assert_eq!(
+            (fallback[0].kind, fallback[0].index, fallback[0].cols),
+            (0, 0, 3)
+        );
+        assert!(fallback[0].row.is_some());
+        assert!(requires_barycentric_fallback(&shader.dxil).unwrap());
         validate(&shader);
     }
 
