@@ -125,6 +125,22 @@ impl Host {
         }
     }
 
+    /// The host adapter's supported wave-lane range reported by D3D12.
+    pub fn wave_lane_range(&self) -> Result<(u32, u32), String> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: `options` is a valid output structure of the supplied size.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .map_err(err)?;
+        }
+        Ok((options.WaveLaneCountMin, options.WaveLaneCountMax))
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

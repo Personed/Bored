@@ -261,6 +261,31 @@ fn run_cases_on(
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 
+/// These cases require a WaveSize(32) pipeline. D3D12 shader-model 6.6 support
+/// alone does not guarantee that the selected adapter accepts that wave size.
+fn hardware_supports_wave_size(lanes: u32) -> bool {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no hardware D3D12 device available for WaveSize({lanes}); skipped");
+        return false;
+    };
+    match host.wave_lane_range() {
+        Ok((min, max)) => {
+            let supported = (min..=max).contains(&lanes);
+            if !supported {
+                eprintln!(
+                    "hardware adapter supports wave sizes {min}..={max}, not WaveSize({lanes}); skipped"
+                );
+            }
+            supported
+        }
+        Err(error) => {
+            eprintln!("could not query hardware wave-size support ({error}); running test");
+            true
+        }
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
@@ -497,6 +522,9 @@ fn permlane_source(lane: u32, s1: u32, s2: u32, cross: bool) -> u32 {
 
 #[test]
 fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
+    if !hardware_supports_wave_size(32) {
+        return;
+    }
     // 32 lanes, each with its lane number in v0; v1 = permute(v0, s0, s1);
     // lane `read` of v1 into s12, then into v0 for the store.
     let selectors: [(u32, u32); 3] = [
@@ -1380,6 +1408,9 @@ fn lds_min_max_ref(old: u32, data: u32, max: bool) -> u32 {
 
 #[test]
 fn ds_min_max_f32_order_floats_and_return_the_old_value() {
+    if !hardware_supports_wave_size(32) {
+        return;
+    }
     let values = [
         0.0f32,
         -0.0,
@@ -1654,6 +1685,9 @@ fn v_cvt_f32_f64_matches_ieee754() {
 
 #[test]
 fn whole_wave_f64_sum_and_cvt_f32_f64() {
+    if !hardware_supports_wave_size(32) {
+        return;
+    }
     let s_or_saveexec_b32 =
         |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32;
     let v_mov_dpp8 =
