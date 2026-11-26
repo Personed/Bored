@@ -2488,13 +2488,9 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         // With at most 32 threads, a host wave holds only one console
         // wave. Keep wave32 lowering and request the host's fixed width.
-        if !self.x.native.wave64
-            && self.s.wave_size == Some(32)
-            && self.s.threads.is_some_and(|dims| dims.iter().product::<u32>() <= 32)
-            && super::host_min_wave() == 64
-            && host_max_wave() == 64
+        if let Some(wave_size) = self.fixed_wave_size_override()
         {
-            self.s.wave_size = Some(64);
+            self.s.wave_size = Some(wave_size);
         }
         let wave_size = self.s.wave_size;
         let mesh_emu = self.mesh_emu.take().map(|m| {
@@ -12133,3 +12129,51 @@ include!("lower/tests.rs");
 
 #[cfg(test)]
 include!("lower/code_table_tests.rs");
+
+
+
+impl<'a> Lower<'a> {
+    fn fixed_wave_size_override(&self) -> Option<u32> {
+        host_wave_size_override(
+            self.x.native.wave64,
+            self.s.wave_size,
+            self.s.threads,
+            super::host_min_wave(),
+            host_max_wave(),
+            )
+    }
+}
+
+/// Whether a console wave32 compute group fits in one fixed host wave64.
+fn host_wave_size_override(
+    native_wave64: bool,
+    console_wave_size: Option<u32>,
+    threads: Option<[u32; 3]>,
+    host_min_wave: u32,
+    host_max_wave: u32,
+    ) -> Option<u32> {
+    (!native_wave64
+     && console_wave_size == Some(32)
+     && threads.is_some_and(|dims| dims.iter().product::<u32>() <= 32)
+     && host_min_wave == 64
+     && host_max_wave == 64)
+    .then_some(64)
+}
+
+#[cfg(test)]
+mod host_wave_size_tests {
+    use super::host_wave_size_override;
+
+#[test]
+    fn override_requires_one_wave32_group_and_a_fixed_wave64_host() {
+        let choose = |threads, min, max| host_wave_size_override(false, Some(32), Some(threads), min, max);
+        assert_eq!(choose([32, 1, 1], 64, 64), Some(64));
+        assert_eq!(choose([16, 2, 1], 64, 64), Some(64));
+        assert_eq!(choose([33, 1, 1], 64, 64), None);
+        assert_eq!(choose([32, 1, 1], 32, 64), None);
+        assert_eq!(choose([32, 1, 1], 64, 128), None);
+        assert_eq!(host_wave_size_override(true, Some(32), Some([32, 1, 1]), 64, 64), None);
+        assert_eq!(host_wave_size_override(false, None, Some([32, 1, 1]), 64, 64), None);
+        assert_eq!(host_wave_size_override(false, Some(32), None, 64, 64), None);
+    }
+}
