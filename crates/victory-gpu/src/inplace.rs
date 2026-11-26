@@ -348,19 +348,12 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
         v.sections.push((section, bytes, committed));
     }
     // A view of our own made on an earlier section that had this handle's
-    // number shows that section's pages, not this one's: it is forgotten
-    // (left mapped: nothing reads it any more) and the next store through
-    // a view of ours maps this section.
-    let gone = OWN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()
-        .and_then(|own| own.remove(&section))
-        .flatten();
-    if gone.is_some() {
+    // number shows that section's pages, not this one's: unmap it, and the
+    // next store through a view of ours maps this section.
+    if unmap_own(section) {
         tracing::info!(
             section,
-            "a section handle's number came round again: our own view of the earlier section is forgotten"
+            "a section handle's number came round again: our own view of the earlier section is unmapped"
         );
     }
 }
@@ -422,6 +415,40 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
+}
+
+/// The runtime is dropping `section`'s handle: unmap our view of it and
+/// forget what we know of it. Views of the title's hold the section alive,
+/// so none should remain here.
+pub fn title_memory_section_gone(section: usize) {
+    views().sections.retain(|s| s.0 != section);
+    if unmap_own(section) {
+        tracing::debug!(
+            section,
+            "own view of title pages unmapped: the section is gone"
+        );
+    }
+}
+
+/// Unmaps our view of `section`, if one is held. True if there was one.
+fn unmap_own(section: usize) -> bool {
+    let own = OWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|own| own.remove(&section))
+        .flatten();
+    let Some(own) = own else {
+        return false;
+    };
+    // SAFETY: the view was mapped in `write_own` and is removed from `OWN`
+    // before this, so nothing else unmaps it.
+    unsafe {
+        mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS {
+            Value: own.base as *mut c_void,
+        })
+    };
+    true
 }
 
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
@@ -494,7 +521,8 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
 }
 
 /// Whether what shaders wrote goes back into title view memory through a
-/// view of our own (`VICTORY_BACK_OWN_VIEW=1`; off by default).
+/// view of our own (on by default; `VICTORY_BACK_OWN_VIEW=0` turns it
+/// off).
 ///
 /// The copy-back writes title memory at the title's address, so it opens
 /// the guard on the 64 KiB block first (and on every other view of the
@@ -517,9 +545,9 @@ pub(crate) fn back_own() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_OWN_VIEW").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
