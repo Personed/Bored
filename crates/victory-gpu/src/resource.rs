@@ -2235,17 +2235,37 @@ fn requested_mip_drop() -> u32 {
         .min(MAX_MIP_DROP)
 }
 
+/// The mip-drop floor for an adapter's dedicated memory and configured
+/// override.
+#[cfg(windows)]
+fn mip_drop_floor_value(dedicated_memory: Option<u64>, configured: Option<u64>) -> u64 {
+    if let Some(configured) = configured {
+        return configured.max(64);
+    }
+    let automatic = match dedicated_memory {
+        Some(memory) if memory > 0 && memory <= (17 << 29) => 512,
+        _ => 1024,
+    };
+    automatic.max(64)
+}
+
 /// Smallest largest-dimension a texture may keep after a drop
-/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default 1024).
+/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default 512 on adapters with at
+/// most 8.5 GiB of dedicated memory, otherwise 1024).
 #[cfg(windows)]
 fn mip_drop_floor() -> u64 {
     static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *FLOOR.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+        let configured = std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
             .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(1024)
-            .max(64)
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if configured.is_some() {
+            return mip_drop_floor_value(None, configured);
+        }
+        mip_drop_floor_value(
+            crate::host::host().and_then(|h| h.dedicated_memory()),
+            configured,
+        )
     })
 }
 
@@ -4461,6 +4481,20 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(eligible(&tex2d(4096, 4096, 0, 28, 0), 2), 2);
         assert_eq!(eligible(&tex2d(2048, 2048, 0, 28, 0), 2), 1);
         assert_eq!(eligible(&tex2d(1024, 1024, 0, 28, 0), 2), 0);
+        assert_eq!(
+            compute_mip_drop_with_floor(&tex2d(2048, 2048, 0, 28, 0), 2, 512),
+            2
+        );
+        assert_eq!(
+            compute_mip_drop_with_floor(&tex2d(1024, 1024, 0, 28, 0), 2, 512),
+            1
+        );
+        let boundary = 17 << 29;
+        assert_eq!(mip_drop_floor_value(Some(boundary), None), 512);
+        assert_eq!(mip_drop_floor_value(Some(boundary + 1), None), 1024);
+        assert_eq!(mip_drop_floor_value(None, None), 1024);
+        assert_eq!(mip_drop_floor_value(Some(boundary), Some(768)), 768);
+        assert_eq!(mip_drop_floor_value(Some(boundary), Some(1)), 64);
         assert_eq!(eligible(&tex2d(1920, 1080, 0, 28, 0), 1), 0);
         assert_eq!(eligible(&tex2d(2048, 2048, 0, 28, 1), 1), 0);
         assert_eq!(eligible(&tex2d(2048, 2048, 1, 28, 0), 1), 0);
