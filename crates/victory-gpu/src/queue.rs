@@ -903,6 +903,16 @@ fn release_held_now(all: bool) {
                             if joined.conflicts(&lists, &order) {
                                 drop(held);
                                 send_joined(&mut joined);
+                                // `send_joined` may have taken this queue
+                                // off the waiting list while its next part
+                                // was already taken from the line but not
+                                // yet joined. Put it back before the mark
+                                // below makes the line nonempty again.
+                                let mut waiting = lock(&WAITING);
+                                if !waiting.contains(&q) {
+                                    waiting.push(q);
+                                }
+                                drop(waiting);
                                 held = lock(line);
                             }
                             if !joined.marked.contains(&q) {

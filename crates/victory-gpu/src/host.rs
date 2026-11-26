@@ -3137,7 +3137,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, runs, true, false)
 }
 
 /// With `before` sent in the same host submission ahead of `after`: whether
@@ -3149,13 +3149,18 @@ pub(crate) fn writes_block(before: &[&HostList], after: &[&HostList]) -> bool {
     for (_, ranges) in declared_writes(before) {
         join_ranges(&mut written, ranges.iter().copied());
     }
-    blocked_by(&written, after, false).is_some()
+    blocked_by(&written, after, false, true).is_some()
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    count: bool,
+    strict: bool,
+) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -3171,7 +3176,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !strict && !touches(written, dst, dst + len) && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3189,7 +3194,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if !strict && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3213,6 +3218,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
+                Step::Host(_) if strict => return Some(WHY_RUN),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
@@ -6404,7 +6410,7 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, runs, false, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
