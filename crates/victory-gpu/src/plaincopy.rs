@@ -1,5 +1,5 @@
 //! Copies of title memory made in place, by this process, with a way back
-//! when a page is not there (`VICTORY_COPY_PLAIN=1`; off by default).
+//! when a page is not there (on by default; `VICTORY_COPY_PLAIN=0` turns it off).
 //!
 //! Every copy of title memory into a host buffer goes through the kernel
 //! (`ReadProcessMemory` on our own process, `crate::host::copy_mapped`):
@@ -55,16 +55,16 @@ unsafe extern "C" {
 }
 
 /// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
+/// (on by default; `VICTORY_COPY_PLAIN=0` turns them off).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
+        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_none_or(|v| v != "0");
         if on {
             install();
             tracing::info!(
                 "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=1)"
+                 page that is not there (VICTORY_COPY_PLAIN=0 turns them off)"
             );
         }
         on
@@ -229,7 +229,7 @@ pub(crate) fn line(frames: f64) {
     let [copies, bytes, gone, lately, small] =
         [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
+        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=0 turns them off): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
          faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
         bytes / 1e6
