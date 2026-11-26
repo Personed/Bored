@@ -400,12 +400,10 @@ pub(crate) fn views_gone(at: usize, len: usize) {
                 .map(|(base, _)| *base),
         )
         .collect();
-    let mut sections = std::collections::HashSet::new();
     for base in gone {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
         };
-        sections.insert(section);
         for k in 0..bytes.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
             if let Some(pages) = v.pages.get_mut(&key) {
@@ -417,16 +415,18 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
-    for section in sections {
-        if v.pages.keys().any(|(s, _)| *s == section) {
-            continue;
-        }
-        if unmap_own(section) {
-            tracing::debug!(
-                section,
-                "own view of title pages unmapped: no title view of the section remains"
-            );
-        }
+}
+
+/// The runtime is dropping `section`'s handle: unmap our view of it and
+/// forget what we know of it. Views of the title's hold the section alive,
+/// so none should remain here.
+pub fn title_memory_section_gone(section: usize) {
+    views().sections.retain(|s| s.0 != section);
+    if unmap_own(section) {
+        tracing::debug!(
+            section,
+            "own view of title pages unmapped: the section is gone"
+        );
     }
 }
 
