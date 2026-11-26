@@ -206,6 +206,7 @@ fn sweep() {
     }
     sweep_scratch_chunks();
     sweep_indirect_scratch();
+    sweep_uploads();
     sweep_preludes();
     crate::list::sweep_idle();
     crate::pipeline::trim_library();
@@ -1873,6 +1874,99 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// A mapped upload buffer shared between command lists after its list is
+/// reset. `data` is stable while the resource lives.
+struct Upload {
+    buffer: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: D3D12 resources are free-threaded, and the mapping is read or
+// written only through the list that holds the upload.
+unsafe impl Send for Upload {}
+
+/// Upload buffers no list holds, exact-size as the copies ask for them.
+static UPLOAD_SPARE: Mutex<Spare<Upload>> = Mutex::new(Spare::new());
+
+/// At most this much upload memory is kept for reuse.
+const UPLOAD_SPARE_MOST: u64 = 128 << 20;
+
+fn upload_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_none_or(|v| v != "0"))
+}
+
+fn count_upload(size: u64, add: bool) {
+    if add {
+        ALIVE[6].fetch_add(1, Ordering::Relaxed);
+        ALIVE[7].fetch_add(size, Ordering::Relaxed);
+    } else {
+        ALIVE[6].fetch_sub(1, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(size, Ordering::Relaxed);
+    }
+}
+
+fn take_upload(host: &Host, size: u64) -> Option<Upload> {
+    if upload_pool()
+        && let Some(upload) = UPLOAD_SPARE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(size)
+    {
+        return Some(upload);
+    }
+    let (buffer, data) = host.upload_buffer(size)?;
+    name(&buffer, || format!("list upload {size:#x}"));
+    count_upload(size, true);
+    Some(Upload {
+        buffer,
+        data: data as usize,
+    })
+}
+
+fn give_upload(upload: Upload) {
+    let size = upload_size(&upload.buffer);
+    let back = if upload_pool() {
+        UPLOAD_SPARE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give(upload, size, UPLOAD_SPARE_MOST)
+    } else {
+        Some(upload)
+    };
+    if let Some(upload) = back {
+        count_upload(size, false);
+        drop(upload);
+    }
+}
+
+fn upload_size(buffer: &ID3D12Resource) -> u64 {
+    // SAFETY: a live buffer.
+    unsafe { buffer.GetDesc() }.Width
+}
+
+/// Lets go of spare upload buffers no list has reused lately.
+fn sweep_uploads() {
+    const IDLE_FRAMES: u64 = 4;
+    let idle_ms = ram_idle_ms(available_physical_ram());
+    let (count, bytes, expired) = {
+        let mut spare = UPLOAD_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.sweep(idle_ms, IDLE_FRAMES)
+    };
+    if count == 0 {
+        return;
+    }
+    ALIVE[6].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[7].fetch_sub(bytes, Ordering::Relaxed);
+    drop(expired);
+    trail(|| {
+        format!(
+            "sweep: {count} spare list upload buffers let go ({} KiB)",
+            bytes >> 10
+        )
+    });
+}
+
 /// Bytes in one gathered-indirect scratch buffer.
 const fn gather_scratch_bytes() -> u64 {
     crate::indirect::GATHER_MOST as u64 * crate::indirect::GATHER_STRIDE as u64
@@ -2365,9 +2459,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
-    /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
-    upload_bytes: u64,
+    uploads: Vec<Upload>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -2396,20 +2488,17 @@ struct Deferred {
 }
 
 impl Deferred {
-    /// Holds `buffer` (`size` bytes of upload memory) until the list is
-    /// reset.
-    fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
-        ALIVE[6].fetch_add(1, Ordering::Relaxed);
-        ALIVE[7].fetch_add(size, Ordering::Relaxed);
-        self.upload_bytes += size;
-        self.uploads.push(buffer);
+    /// Holds `upload` until the list is reset.
+    fn hold_upload(&mut self, upload: Upload) {
+        self.uploads.push(upload);
     }
 }
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
-        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        for upload in std::mem::take(&mut self.uploads) {
+            give_upload(upload);
+        }
     }
 }
 
@@ -7829,13 +7918,13 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset. Exact-size buffers are shared between lists after reset and
+    /// swept when idle: texture copies otherwise make and free the same
+    /// upload buffers frame after frame.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        let upload = take_upload(host, size)?;
+        let (buffer, data) = (upload.buffer.clone(), upload.data as *mut u8);
+        self.deferred().hold_upload(upload);
         Some((buffer, data))
     }
 
@@ -7846,11 +7935,11 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
+            let upload = take_upload(host, len)?;
             // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
+            let gpu = unsafe { upload.buffer.GetGPUVirtualAddress() };
+            let data = upload.data as *mut u8;
+            self.deferred().hold_upload(upload);
             return Some((gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
